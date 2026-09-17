@@ -1,0 +1,12 @@
+{
+  "display_name": "heartlink（心率 · 触觉）",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "kcgoofee-jpg",
+  "version": "0.11.0",
+  "homePage": "https://github.com/kcgoofee-jpg/heartlink-extension",
+  "auto_update": true
+}
