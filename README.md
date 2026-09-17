@@ -96,6 +96,11 @@ https://github.com/kcgoofee-jpg/heartlink-extension
 
 每轮注入的 `<bio_context>` 里有一行 `haptics(heartlink): on | cap 100% | profile frenzy`，卡片和预设可以据此决定要不要写动作。
 
+## 兼容提示
+
+- 读法世界书靠酒馆的“世界书扫描深度”触发（默认 2）。设成 0 时，模型收得到数据，但收不到读法说明。
+- 用 Claude、Gemini 时，酒馆会把对话中间的系统消息改成用户消息发送。注入块内容不变，只是不算系统指令。
+
 ## 安全
 
 - 剧情联动默认关，你打开才会动。
