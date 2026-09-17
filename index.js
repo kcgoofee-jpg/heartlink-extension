@@ -1,4 +1,4 @@
-// heartlink v0.16.1 — SillyTavern 扩展：心率注入 + 触觉输出（Tavern Bio-Context 参考实现）。构建产物。
+// heartlink v0.17.0 — SillyTavern 扩展：心率注入 + 触觉输出（Tavern Bio-Context 参考实现）。构建产物。
 // https://github.com/kcgoofee-jpg/heartlink-extension
 // heartlink core — 纯函数层。没有 DOM、没有蓝牙、没有酒馆 API，Node 和浏览器都能跑。
 // 运行时（runtime.js）和单元测试共用这一份。构建时与 runtime.js 拼成 dist/heartlink.js。
@@ -262,15 +262,15 @@ const HeartlinkCore = (() => {
   // 固定英文键，每行一个字段，缺失写 n/a；块内不解释。
   const SPEC_VERSION = '0.3';
   const SOURCE = 'heartlink';
-  const MODES = ['author', 'character'];
-  // TBC 0.3：块与变量里写新名字；内部仍用 author / character
-  const WIRE_MODE = { author: 'backstage', character: 'in-story' };
+  const MODES = ['author', 'character', 'aware'];
+  // TBC 0.3：块与变量里写新名字；内部名 author / character / aware
+  const WIRE_MODE = { author: 'backstage', character: 'in-story', aware: 'device-aware' };
   const SCOPE_LINE = 'scope: gen, read = previous reply; write, send = this message';
   const fmtS = (ms) => `${Math.round(ms / 1000)}s`;
   const fmtRange = (st) => (st ? `hr ${st.first}→${st.last} [${st.min}–${st.max}]` : 'hr n/a');
   const rrLoss = (st) => (st ? ` | rr-loss ${Math.round(st.rrDropout * 100)}%` : '');
 
-  // { samples, events, activityLog?, now, mode: 'author'|'character', baselineOverride?: {bpm, hrv}, history?: [turnSummary...],
+  // { samples, events, activityLog?, now, mode: 'author'|'character'|'aware', baselineOverride?: {bpm, hrv}, history?: [turnSummary...],
   //   replyMeta?: {chars, paragraphOffsets, cjkRatio}, cpsOverride?: {cps, source} }
   // → { text, turn, baseline, summary }。activityLog 是跨聊天保留的活动记录，给自动基线用；缺省用 events
   // ---------- 0.8：其它信号种类与设备状态行（协议 device-interface-zh.md §2–§4；v0.1 读者忽略不认识的行） ----------
@@ -389,11 +389,11 @@ const HeartlinkCore = (() => {
   }
 
   // TBC v0.3 §1.2 卡片声明：data.extensions.tbc = { mode_hint, perceiver }
-  // 实现内部仍用 author / character 两档；device-aware 暂按 character 处理
   function normalizeMode(v) {
     const m = String(v == null ? '' : v).trim().toLowerCase();
     if (m === 'author' || m === 'backstage') return 'author';
-    if (m === 'character' || m === 'in-story' || m === 'device-aware') return 'character';
+    if (m === 'character' || m === 'in-story') return 'character';
+    if (m === 'aware' || m === 'device-aware') return 'aware';
     return null;
   }
   function readCardHints(card) {
@@ -985,7 +985,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
 //   version / spec                       字符串
 //   getState()                           { connected, bpm, fresh, baseline, mode, chatId, events, samples, device, battery, lastSignal }
 //   preview()                            当前时刻会注入的 <bio_context> 文本（不注入）
-//   getMode() / setMode(m) / toggleMode()  'author' | 'character'，按聊天记忆；没选过时用角色卡 data.extensions.tbc.mode_hint（TBC v0.3 §1.2）
+//   getMode() / setMode(m) / toggleMode()  'author' | 'character' | 'aware'，按聊天记忆；没选过时用角色卡 data.extensions.tbc.mode_hint（TBC v0.3 §1.2）
 //   connect() / disconnect()             connect 必须由真人点击触发（浏览器规定）
 //   setManualBaseline() / clearManualBaseline()
 //   getHistory()                         本聊天最近 20 轮摘要（也在聊天变量 bio.turns）
@@ -996,7 +996,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
 (function heartlinkRuntime() {
   'use strict';
 
-  const VERSION = '0.16.1';
+  const VERSION = '0.17.0';
   const CONFIG = {
     RUNTIME_KEY: '__HEARTLINK_RUNTIME__',
     PUBLIC_KEY: 'heartlink',
@@ -1032,8 +1032,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     LAB_URL: 'http://127.0.0.1:12346/lab/',   // 设备实验室（~/dev/tbc/device-lab，npm run sim）
   };
   const LOG = '[heartlink]';
-  const GUIDE_BOOK = [{"name":"00 bio_context 读法（常驻）","enabled":true,"content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。块首行可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，author 模式下角色不知道，character 模式下只允许角色察觉由它引起的可观察反应，不点名设备。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","strategy":{"type":"constant","keys":[]},"position":{"type":"after_character_definition","order":100},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.16.1"}},{"name":"10 mode=backstage 幕后（旧 author）","enabled":true,"content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","strategy":{"type":"selective","keys":["mode=\"backstage\"","mode=\"author\""]},"position":{"type":"at_depth","role":"system","depth":2,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.16.1"}},{"name":"11 mode=in-story 入戏（旧 character）","enabled":true,"content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","strategy":{"type":"selective","keys":["mode=\"in-story\"","mode=\"character\""]},"position":{"type":"at_depth","role":"system","depth":2,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.16.1"}}];
-  const GUIDE_BOOK_NATIVE = [{"uid":0,"key":[],"keysecondary":[],"comment":"00 bio_context 读法（常驻）","content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。块首行可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，author 模式下角色不知道，character 模式下只允许角色察觉由它引起的可观察反应，不点名设备。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","constant":true,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":100,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":0},{"uid":1,"key":["mode=\"backstage\"","mode=\"author\""],"keysecondary":[],"comment":"10 mode=backstage 幕后（旧 author）","content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":2,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":1},{"uid":2,"key":["mode=\"in-story\"","mode=\"character\""],"keysecondary":[],"comment":"11 mode=in-story 入戏（旧 character）","content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":2,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":2}];
+  const GUIDE_BOOK = [{"name":"00 bio_context 读法（常驻）","enabled":true,"content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。块首行可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","strategy":{"type":"constant","keys":[]},"position":{"type":"after_character_definition","order":100},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.17.0"}},{"name":"10 mode=backstage 幕后（旧 author）","enabled":true,"content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","strategy":{"type":"selective","keys":["mode=\"backstage\"","mode=\"author\""]},"position":{"type":"at_depth","role":"system","depth":2,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.17.0"}},{"name":"11 mode=in-story 入戏（旧 character）","enabled":true,"content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","strategy":{"type":"selective","keys":["mode=\"in-story\"","mode=\"character\""]},"position":{"type":"at_depth","role":"system","depth":2,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.17.0"}},{"name":"12 mode=device-aware 知情","enabled":true,"content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","strategy":{"type":"selective","keys":["mode=\"device-aware\""]},"position":{"type":"at_depth","role":"system","depth":2,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.17.0"}}];
+  const GUIDE_BOOK_NATIVE = [{"uid":0,"key":[],"keysecondary":[],"comment":"00 bio_context 读法（常驻）","content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。块首行可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","constant":true,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":100,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":0},{"uid":1,"key":["mode=\"backstage\"","mode=\"author\""],"keysecondary":[],"comment":"10 mode=backstage 幕后（旧 author）","content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":2,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":1},{"uid":2,"key":["mode=\"in-story\"","mode=\"character\""],"keysecondary":[],"comment":"11 mode=in-story 入戏（旧 character）","content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":2,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":2},{"uid":3,"key":["mode=\"device-aware\""],"keysecondary":[],"comment":"12 mode=device-aware 知情","content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":2,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":3}];
   // 1.0：同一份源码构建两种形态——'script' 酒馆助手全局脚本（旧），'extension' 酒馆扩展
   const FORM = 'extension';
   // 开发者工具（设备模拟器按钮等）：发布版关闭
@@ -1091,6 +1091,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       if (s.privacyAck) state.privacyAck = true;
       if (s.badgePos && Number.isFinite(s.badgePos.right) && Number.isFinite(s.badgePos.top)) state.badgePos = s.badgePos;
       if (typeof s.badgeHidden === 'boolean') state.badgeHidden = s.badgeHidden;
+      if (typeof s.settingsFolded === 'boolean') state.settingsFolded = s.settingsFolded;
+      if (s.playSeen) state.playSeen = true;
       if (s.haptics && typeof s.haptics === 'object') state.haptics = normalizeHaptics(s.haptics);
     } catch (err) { console.warn(LOG, 'loadSettings failed', err); }
   }
@@ -1114,7 +1116,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     return sw.words.some((w) => w && t.includes(w));
   }
   function saveSettings() {
-    try { host.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify({ manualBaseline: state.manualBaseline, modes: state.modes, deviceName: state.deviceName, prior: state.prior || null, injectEnabled: state.injectEnabled !== false, privacyAck: !!state.privacyAck, haptics: state.haptics, badgePos: state.badgePos || null, badgeHidden: !!state.badgeHidden })); }
+    try { host.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify({ manualBaseline: state.manualBaseline, modes: state.modes, deviceName: state.deviceName, prior: state.prior || null, injectEnabled: state.injectEnabled !== false, privacyAck: !!state.privacyAck, haptics: state.haptics, badgePos: state.badgePos || null, badgeHidden: !!state.badgeHidden, settingsFolded: !!state.settingsFolded, playSeen: !!state.playSeen })); }
     catch (err) { console.warn(LOG, 'saveSettings failed', err); }
   }
   function toast(kind, text) {
@@ -1855,18 +1857,20 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
   function modeSource() { return state.modes[chatId()] ? 'user' : ((cardHints() || {}).mode ? 'card' : 'default'); }
   function getMode() {
     const own = state.modes[chatId()];
-    if (own) return own === 'character' ? 'character' : 'author';
+    if (own) return HeartlinkCore.MODES.includes(own) ? own : 'author';
     const h = cardHints();
     return h && h.mode ? h.mode : 'author';
   }
   function setMode(mode) {
     mode = HeartlinkCore.normalizeMode(mode) || mode;
-    if (!HeartlinkCore.MODES.includes(mode)) throw new Error('mode must be backstage | in-story (or author | character)');
+    if (!HeartlinkCore.MODES.includes(mode)) throw new Error('mode must be backstage | in-story | device-aware (or author | character | aware)');
     state.modes[chatId()] = mode; saveSettings(); render(); emit('bio:state', getState());
-    toast('info', mode === 'author' ? '模式：幕后（角色不知道，只影响写法）' : '模式：入戏（角色能察觉你的身体状态）');
+    toast('info', `模式：${MODE_ZH[mode]}。${MODE_HINT[mode]}`);
     return mode;
   }
-  function toggleMode() { return setMode(getMode() === 'author' ? 'character' : 'author'); }
+  function toggleMode() { const m = getMode(); return setMode(m === 'author' ? 'character' : m === 'character' ? 'aware' : 'author'); }
+  const MODE_ZH = { author: '幕后', character: '入戏', aware: '知情' };
+  const MODE_HINT = { author: '角色不知道，只影响写法', character: '角色能察觉你的身体表现', aware: '角色知道你戴着设备，可以看数据、指导你' };
 
   // ---------- 跨轮历史：内存 + 聊天变量 bio + 消息 extra.bio ----------
   function history() { const id = chatId(); if (!state.history[id]) state.history[id] = []; return state.history[id]; }
@@ -2126,183 +2130,176 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
   // ---------- 悬浮窗（Shadow DOM，底色取酒馆主题变量；强调色固定，避免主题色是灰色时看不出状态） ----------
   // ST 1.18 的 style.css 给 html 加了 transform:translateZ(0) 且 html 高度为 0，fixed 元素改以 html 为包含块，
   // 用 bottom 定位会跑到屏幕上方外面；所以用视口单位算 top（2026-09-17 本地实测 top:-118px）。
+  // 配色：底色 / 正文取酒馆主题变量，其它按正文颜色的明暗切深浅两套（:host(.light)，见 syncTone）；青绿 --on 固定，不跟随主题强调色
   const CSS = `
 :host{all:initial;position:fixed;right:14px;top:calc(100vh - 122px);top:calc(100dvh - 122px);z-index:9999;
   --font:var(--mainFontFamily,-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",system-ui,sans-serif);
   --mono:var(--monoFontFamily,ui-monospace,"SF Mono",Menlo,monospace);
-  --ink:var(--SmartThemeBodyColor,#e8e6ee);
-  --surface:var(--SmartThemeBlurTintColor,rgba(22,22,28,.94));
-  --raise:rgba(255,255,255,.055);--raise2:rgba(255,255,255,.09);--hair:rgba(255,255,255,.09);
-  --muted:rgba(232,230,238,.58);
-  --heart:#ef5a55;--teal:#2bb8a8;--teal-soft:rgba(43,184,168,.16);--pink:#ff6fa3;--pink-soft:rgba(255,111,163,.16);--amber:#e8a23c;
-  font-family:var(--font);color:var(--ink)}
+  --bg:var(--SmartThemeBlurTintColor,#141517);--ink:var(--SmartThemeBodyColor,#E9E7E3);
+  --raise:#1C1D20;--hair:#2A2B2F;--muted:#8E8C88;--faint:#5C5B58;
+  --heart:#E0564E;--on:#2E9E91;--stop:#D24B43;--warn:#D39A3C;--toy:#D0668C;
+  --gen:#6E8BA8;--read:#C98A4B;--write:#B87A95;--shadow:0 12px 32px rgba(0,0,0,.28);
+  font-family:var(--font);color:var(--ink);font-variant-numeric:tabular-nums}
+:host(.light){--raise:#FFFFFF;--hair:#E4E1DB;--muted:#6F6C66;--faint:#A3A09A;
+  --heart:#C8423A;--on:#1E8378;--stop:#C0392F;--warn:#A86F12;--toy:#B34D73;
+  --gen:#56718E;--read:#A56A2C;--write:#985A76;--shadow:0 8px 24px rgba(0,0,0,.10)}
 *{box-sizing:border-box}
 button{font:inherit;color:inherit}
-button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
+button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
 [hidden]{display:none!important}
+@keyframes br{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.7)}}
 /* 胶囊 */
-.pill{display:inline-flex;align-items:center;gap:8px;height:36px;padding:0 12px 0 5px;border-radius:999px;background:var(--surface);border:1px solid var(--hair);
-  box-shadow:0 8px 28px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.06);backdrop-filter:blur(16px) saturate(1.2);cursor:pointer;white-space:nowrap;user-select:none;transition:transform .15s ease}
+.pill{display:inline-flex;align-items:center;gap:8px;height:44px;padding:0 12px 0 6px;border-radius:999px;background:var(--bg);border:1px solid var(--hair);
+  box-shadow:var(--shadow);backdrop-filter:blur(16px) saturate(1.2);cursor:pointer;white-space:nowrap;user-select:none;transition:transform .15s ease}
 .pill:hover{transform:translateY(-1px)}
-.seg{display:inline-flex;align-items:center;gap:7px}
-.segsep{width:1px;height:16px;background:var(--hair)}
-.dot{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;flex:0 0 auto}
-.heart{background:var(--heart);box-shadow:0 0 0 0 rgba(239,90,85,.45)}
+.seg{display:inline-flex;align-items:center;gap:8px}
+.segsep{width:1px;height:20px;background:var(--hair);margin:0 2px}
+.dot{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;flex:0 0 auto}
+.heart{background:var(--heart);box-shadow:0 0 0 0 color-mix(in srgb,var(--heart) 45%,transparent)}
 .heart.on{animation:pulse var(--beat,1s) infinite}
-.heart.stale{background:var(--amber)}
-.heart.off{background:rgba(255,255,255,.14)}
-.heart svg{width:13px;height:13px;fill:#fff}
-.toyd{background:var(--pink-soft);color:var(--pink)}
-.toyd svg{width:15px;height:15px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(239,90,85,.45)}70%{box-shadow:0 0 0 8px rgba(239,90,85,0)}100%{box-shadow:0 0 0 0 rgba(239,90,85,0)}}
-.bpm{font:700 15px/1 var(--mono);font-variant-numeric:tabular-nums;min-width:24px}
-.spark{width:46px;height:16px;flex:0 0 auto}
-.spark path{fill:none;stroke:var(--heart);stroke-width:1.6;stroke-linejoin:round;stroke-linecap:round}
-.spark line{stroke:currentColor;opacity:.35;stroke-dasharray:2 2}
-.delta{font:600 11px/1 var(--mono);color:var(--teal)}
-.delta.up{color:var(--amber)}
+.heart.stale{background:var(--warn)}
+.heart.off{background:color-mix(in srgb,var(--muted) 40%,transparent)}
+.heart svg{width:14px;height:14px;fill:#fff}
+.toyd{background:color-mix(in srgb,var(--toy) 18%,transparent);color:var(--toy)}
+.toyd svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round}
+@keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--heart) 45%,transparent)}70%{box-shadow:0 0 0 8px transparent}100%{box-shadow:0 0 0 0 transparent}}
+.bpm{font:600 17px/1 var(--font);min-width:22px}
+.spark{width:40px;height:16px;flex:0 0 auto}
+.spark path{fill:none;stroke:var(--heart);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round}
+.spark line{stroke:var(--faint);stroke-dasharray:2 2}
+.delta{font:600 12px/1 var(--font);color:var(--on)}
+.delta.up{color:var(--read)}
 .tag{font-size:12px;color:var(--muted)}
-.tag.ch{color:var(--pink)}
-.tn{font:700 13px/1 var(--mono)}
-.live{width:7px;height:7px;border-radius:50%;background:var(--pink);box-shadow:0 0 0 3px var(--pink-soft);display:none}
-.live.on{display:inline-block;animation:blink 1.2s infinite}
-@keyframes blink{50%{opacity:.35}}
-/* 面板 */
-.card{display:none;position:absolute;right:0;bottom:46px;width:304px;max-height:560px;overflow:auto;overscroll-behavior:contain;background:var(--surface);border:1px solid var(--hair);border-radius:18px;padding:10px;
-  box-shadow:0 18px 48px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.05);backdrop-filter:blur(20px) saturate(1.2);font-size:12.5px;line-height:1.45}
-:host(.open) .card{display:block;animation:rise .16s ease-out}
-:host(.below) .card{bottom:auto;top:46px}
+.tag.ch{color:var(--toy)}
+.tn{font:600 14px/1 var(--font)}
+.live{width:8px;height:8px;border-radius:50%;background:var(--toy);display:none}
+.live.on{display:inline-block;animation:br 1.6s ease-in-out infinite}
+/* 面板：固定头部 + 中间滚动 + 固定页脚 */
+.card{display:none;position:absolute;right:0;bottom:52px;width:320px;max-height:560px;flex-direction:column;overscroll-behavior:contain;
+  background:var(--bg);border:1px solid var(--hair);border-radius:14px;padding:0 12px;box-shadow:var(--shadow);backdrop-filter:blur(20px) saturate(1.2);
+  font-size:13px;line-height:19px;text-align:left}
+:host(.open) .card{display:flex;animation:rise .16s ease-out}
+:host(.below) .card{bottom:auto;top:52px}
 :host(.dragging) .pill{cursor:grabbing}
 :host(.hidden){display:none!important}
 @keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-@media (prefers-reduced-motion:reduce){.heart.on,.live.on,:host(.open) .card{animation:none}.pill{transition:none}}
-.head{display:flex;gap:8px;align-items:center;margin-bottom:10px}
-.tabs{flex:1;display:grid;grid-template-columns:1fr 1fr;padding:3px;border-radius:12px;background:var(--raise)}
-.tabs button{border:0;background:transparent;border-radius:9px;padding:7px 4px;font-size:12.5px;font-weight:600;color:var(--muted);cursor:pointer;display:flex;gap:6px;justify-content:center;align-items:center}
-.tabs button[aria-selected="true"]{background:var(--raise2);color:var(--ink);box-shadow:0 1px 3px rgba(0,0,0,.25)}
-.tabs i{font-style:normal;font:600 10px/1 var(--mono);padding:3px 6px;border-radius:999px;background:var(--teal-soft);color:var(--teal)}
-.tabs i:empty{display:none}
-.tabs i.warn{background:rgba(232,162,60,.16);color:var(--amber)}
-.tabs i.pk{background:var(--pink-soft);color:var(--pink)}
-.x{width:30px;height:30px;border-radius:10px;border:0;background:var(--raise);cursor:pointer;font-size:16px;line-height:1;color:var(--muted)}
-.x:hover{color:var(--ink);background:var(--raise2)}
-.block{background:var(--raise);border-radius:14px;padding:10px 12px;margin-bottom:8px}
-.status{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
-.status b{color:var(--ink);font-weight:600}
-.sdot{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.25)}
-.sdot.ok{background:var(--teal);box-shadow:0 0 0 3px var(--teal-soft)}
-.sdot.warn{background:var(--amber)}
-.batt{margin-left:auto;font:600 10.5px/1 var(--mono);padding:3px 7px;border-radius:999px;background:var(--raise2);color:var(--muted)}
-.chip:empty{display:none}
-.big{display:flex;align-items:baseline;gap:6px;margin:6px 0 2px}
-.big .n{font:700 34px/1 var(--mono);font-variant-numeric:tabular-nums;letter-spacing:-.02em}
-.big .u{color:var(--muted);font-size:12px}
-.big .d{margin-left:auto;font:600 12px/1 var(--mono);color:var(--teal)}
-.big .d.up{color:var(--amber)}
-.wide{width:100%;height:38px;display:block}
-.wide path{fill:none;stroke:var(--heart);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
-.wide path.area{fill:rgba(239,90,85,.12);stroke:none}
-.wide .ref{stroke:rgba(255,255,255,.35);stroke-width:1;stroke-dasharray:3 3;vector-effect:non-scaling-stroke}
-.reflab{fill:rgba(255,255,255,.5);font:9px var(--mono)}
-.empty{color:var(--muted);font-size:12.5px;line-height:1.55;margin:2px 0 10px}
-.trend{display:block;width:100%;height:auto;margin-top:8px;border-radius:8px}
-.trend .ln{fill:none;stroke:var(--heart);stroke-width:2;stroke-linejoin:round;stroke-linecap:round}
-.trend .ref{stroke:rgba(255,255,255,.45);stroke-width:1;stroke-dasharray:3 3}
-.trend .pk{fill:#fff}
-.trend .pkt{fill:var(--ink);font:600 8.5px var(--mono);text-anchor:middle}
-.trend .cur{fill:var(--heart)}
-.trend .cur.live{fill:var(--pink);animation:blink 1.2s infinite}
-.pseg{display:grid;gap:4px;margin-top:5px}
-.sg{min-width:0;display:flex;gap:1px;height:5px;border-radius:3px;overflow:hidden;opacity:.75}
-.sg.on{opacity:1}
-.sg i.on{background-image:repeating-linear-gradient(90deg,rgba(255,255,255,.4) 0 4px,transparent 4px 8px)!important;animation:blink 1.4s infinite}
-.plist{margin-top:8px;display:grid;gap:3px}
-.pr{display:grid;grid-template-columns:8px auto auto 1fr;align-items:center;gap:6px;font-size:11.5px;min-width:0}
-.pr i{width:8px;height:8px;border-radius:2px}
-.pr b{font-weight:600}
-.pr em{font:10.5px var(--mono);font-style:normal;color:var(--muted)}
-.pr.on em{color:var(--pink)}
-.pr span{font:10.5px var(--mono);color:var(--muted);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.pnote{color:var(--muted);font-size:11.5px;margin:6px 0 0}
-.sees{margin-bottom:8px;background:var(--raise);border-radius:12px;padding:8px 10px}
-.sh{display:flex;justify-content:space-between;align-items:center;font-size:11px;color:var(--muted);margin-bottom:3px}
-.sh button{border:0;background:transparent;color:var(--teal);font-size:11px;cursor:pointer;padding:0}
-.sh em{font-style:normal;color:var(--pink);font-size:11px}
-.sees p{margin:0;font-size:12px;line-height:1.5}
-.sees p i{color:var(--amber);font-style:normal}
-.ptext{margin:6px 0 0;max-height:12em;overflow:auto;white-space:pre-wrap;word-break:break-all;font:10px/1.45 var(--mono);color:var(--muted);background:rgba(0,0,0,.25);border-radius:8px;padding:6px 8px}
-.acts-last{margin-bottom:8px;background:var(--raise);border-radius:12px;padding:8px 10px}
-.chips{display:flex;flex-wrap:wrap;gap:5px;justify-content:flex-start;text-align:left}
-.chip{font:11px/1.2 var(--mono);padding:4px 8px;border-radius:999px;background:var(--raise2);color:var(--ink)}
-.chip.ok{background:var(--teal-soft);color:var(--teal)}
-.chip.no{background:rgba(232,162,60,.14);color:var(--amber)}
-.chip.idle{color:var(--muted);font-family:var(--font)}
-.chip i{font-style:normal}
-.howto{margin-bottom:8px;border:1px dashed var(--hair);border-radius:12px;padding:8px 10px;font-size:12px;line-height:1.55}
-.howto b{display:block;font-size:12px;margin-bottom:2px}
-.howto p{margin:0}
-.howto q{quotes:"「" "」";color:var(--pink);margin:0 1px}
-.muted2{color:var(--muted);font-size:11px;margin-top:3px!important}
-.baselab{display:flex;align-items:center;gap:6px;width:100%;margin-top:8px;border:0;background:transparent;padding:2px 0;cursor:pointer;font-size:11.5px;color:var(--muted);text-align:left}
-.baselab i{width:18px;border-top:1px dashed rgba(255,255,255,.6)}
-.baselab span{font:600 11.5px var(--mono);color:var(--ink)}
-.baselab em{margin-left:auto;font-style:normal;color:var(--teal)}
-.baselab:hover em{text-decoration:underline}
-.basemenu{display:flex;gap:6px;margin-top:8px}
-.basemenu button{flex:1;border:1px solid var(--hair);background:var(--raise2);border-radius:9px;padding:6px;font-size:12px;cursor:pointer}
-.basemenu button:hover{border-color:var(--teal);color:var(--teal)}
-.tiles{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px}
-.tile{background:var(--raise);border-radius:12px;padding:8px 10px;min-width:0}
-.tile span{display:block;font-size:11px;color:var(--muted);margin-bottom:3px}
-.tile b{display:block;font:600 13px/1.25 var(--mono);font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tile b i{font-style:normal;color:var(--muted);font-weight:400;font-size:11px}
-.quote{border-left:2px solid var(--pink);padding:6px 10px;margin-bottom:8px;background:var(--pink-soft);border-radius:0 12px 12px 0;font-size:12px;max-height:5.6em;overflow:auto}
-.quote span{display:block;font-size:10.5px;color:var(--pink);font-weight:600;margin-bottom:2px}
-.list{background:var(--raise);border-radius:14px;padding:2px 12px;margin-bottom:8px}
-.item{display:flex;align-items:center;justify-content:space-between;gap:10px;min-height:40px;border-bottom:1px solid var(--hair)}
-.item:last-child{border-bottom:0}
-.item .lab{display:flex;flex-direction:column}
-.item .lab small{color:var(--muted);font-size:10.5px}
-.switch{width:40px;height:24px;border-radius:999px;border:0;background:rgba(255,255,255,.18);position:relative;cursor:pointer;flex:0 0 auto;transition:background .15s}
-.switch::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.35);transition:left .15s}
-.switch[aria-checked="true"]{background:var(--teal)}
-.switch[aria-checked="true"]::after{left:19px}
-.segctl{display:inline-grid;grid-auto-flow:column;padding:2px;border-radius:9px;background:rgba(0,0,0,.22)}
-.segctl button{border:0;background:transparent;border-radius:7px;padding:4px 9px;font-size:11.5px;font-weight:600;color:var(--muted);cursor:pointer}
-.segctl button.on{background:var(--teal);color:#fff}
-.row2{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px}
-.btn{border:1px solid var(--hair);background:var(--raise);border-radius:11px;padding:9px 8px;font-size:12.5px;font-weight:600;cursor:pointer;text-align:center;transition:background .12s}
-.btn:hover{background:var(--raise2)}
-.btn.primary{background:var(--teal);border-color:var(--teal);color:#fff}
-.btn.primary:hover{filter:brightness(1.08)}
-.btn.on{border-color:var(--teal);color:var(--teal);background:var(--teal-soft)}
-.btn.full{grid-column:1/-1;width:100%}
-.btn small{display:block;font-weight:400;font-size:10.5px;color:var(--muted);margin-top:1px}
-.btn.on small{color:var(--teal)}
-.stop{width:100%;border:0;border-radius:14px;padding:12px;margin-bottom:8px;background:linear-gradient(180deg,#f0625d,#d9463f);color:#fff;font-size:14px;font-weight:700;letter-spacing:.08em;cursor:pointer;box-shadow:0 6px 18px rgba(217,70,63,.35)}
+@media (prefers-reduced-motion:reduce){.heart.on,.live.on,.pulse::before,:host(.open) .card{animation:none!important}.pill{transition:none}}
+.head{flex:none}
+.tabs{display:flex;align-items:center;height:40px;gap:18px;border-bottom:1px solid var(--hair)}
+.tabs button[role="tab"]{position:relative;height:40px;display:flex;align-items:center;gap:6px;border:0;background:none;padding:0;cursor:pointer;font:600 13px/18px var(--font);color:var(--muted)}
+.tabs button[aria-selected="true"]{color:var(--ink)}
+.tabs button[aria-selected="true"]::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--ink);border-radius:2px}
+.d6{width:6px;height:6px;border-radius:50%;display:inline-block;flex:none;background:var(--on)}
+.d6.warn{background:var(--warn)}
+.d6.toy{background:var(--toy)}
+.x{margin-left:auto;width:24px;height:24px;display:grid;place-items:center;border:0;background:none;padding:0;cursor:pointer;color:var(--muted);font-size:16px;line-height:1}
+.x:hover{color:var(--ink)}
+.stop{display:block;width:100%;height:36px;margin:12px 0;border:0;border-radius:10px;background:var(--stop);color:#fff;font:600 13px/1 var(--font);cursor:pointer}
+:host(.busy) .stop{box-shadow:0 0 0 3px color-mix(in srgb,var(--stop) 25%,transparent)}
 .stop:hover{filter:brightness(1.06)}
 .stop:active{transform:translateY(1px)}
-.expander{width:100%;display:flex;justify-content:space-between;align-items:center;border:0;background:var(--raise);border-radius:12px;padding:9px 12px;font-size:12.5px;font-weight:600;cursor:pointer;margin-bottom:8px}
-.expander::after{content:"›";color:var(--muted);font-size:16px;transition:transform .15s}
-:host(.devs) .expander::after{transform:rotate(90deg)}
-.devs{display:none;background:var(--raise);border-radius:12px;padding:6px 12px 8px;margin:-4px 0 8px;max-height:15em;overflow:auto}
+.body{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;margin:0 -12px;padding:0 12px}
+.body.more{-webkit-mask-image:linear-gradient(#000 calc(100% - 16px),transparent);mask-image:linear-gradient(#000 calc(100% - 16px),transparent)}
+.sec{padding:12px 0;border-top:1px solid var(--hair)}
+.sec.first{border-top:0}
+.sh{font:500 11px/14px var(--font);color:var(--muted);margin:0 0 8px;display:flex;align-items:center}
+.sh em{margin-left:auto;font-style:normal;color:var(--toy)}
+.status{display:flex;align-items:center;gap:6px;height:24px}
+.status b{font-weight:600}
+.status .st{color:var(--muted);display:inline-flex;align-items:center;font-size:12px}
+.sdot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--faint)}
+.sdot.ok{background:var(--on)}
+.sdot.warn{background:var(--warn)}
+.batt{margin-left:auto;font:500 11px/14px var(--font);color:var(--muted)}
+.batt em{font-style:normal;color:var(--ink)}
+.empty{color:var(--muted);margin:0 0 12px}
+.link{border:0;background:none;padding:0;cursor:pointer;color:var(--on);font:12px/16px var(--font);margin-left:auto}
+.link:hover{text-decoration:underline}
+/* 时间线 */
+.tl{position:relative;padding-left:20px}
+.tl::before{content:"";position:absolute;left:3.5px;top:10px;bottom:12px;width:1px;background:var(--hair)}
+.node{position:relative;padding:6px 0;--c:var(--faint)}
+.node::before{content:"";position:absolute;left:-20px;top:11px;width:8px;height:8px;border-radius:50%;background:var(--c)}
+.node.hol::before{background:var(--bg);box-shadow:inset 0 0 0 1.5px var(--c)}
+.node.bare::before{display:none}
+.node.pulse::before{animation:br 1.6s ease-in-out infinite}
+.node.pulse.toy::before{box-shadow:0 0 0 4px color-mix(in srgb,var(--toy) 25%,transparent)}
+.th{display:flex;align-items:baseline;gap:8px;font-size:13px;line-height:18px;min-width:0}
+.th b{font-weight:600;white-space:nowrap}
+.th .d{color:var(--ink);white-space:nowrap}
+.th .m{color:var(--muted);font-size:12px;white-space:nowrap}
+.th .m.w{color:var(--write)}
+.th .m.t{color:var(--toy)}
+.th .m.no{color:var(--warn);white-space:normal}
+.th .r{margin-left:auto;display:flex;align-items:baseline;gap:4px}
+.big{font:600 20px/24px var(--font);color:var(--ink)}
+.tsub{font-size:12px;line-height:16px;color:var(--muted);margin-top:4px}
+.chart{display:block;margin-top:6px;width:100%;overflow:visible}
+.hatch{display:inline-block;width:10px;height:8px;vertical-align:-1px;margin-right:4px;background:repeating-linear-gradient(45deg,var(--muted) 0 1px,transparent 1px 3px);opacity:.7}
+.node p{margin:2px 0 0;font-size:13px;line-height:19px}
+.quote{color:var(--ink);max-height:5.7em;overflow:auto}
+.sees b{font-weight:600}
+.sees i{font-style:normal;color:var(--warn)}
+.sees .mut{color:var(--muted);font-size:12px}
+.sh .x{width:16px;height:14px;font-size:14px}
+.ptext{margin:6px 0 0;max-height:12em;overflow:auto;white-space:pre-wrap;word-break:break-all;font:10px/1.5 var(--mono);color:var(--muted);background:var(--raise);border:1px solid var(--hair);border-radius:8px;padding:6px 8px}
+.base{display:flex;align-items:center;gap:8px;font-size:12px;line-height:16px;padding-top:8px;border-top:1px solid var(--hair)}
+.base b{font-weight:600}
+.dash{width:14px;border-top:1px dashed var(--faint);flex:none}
+.small{font:500 11px/14px var(--font);color:var(--muted);margin-top:4px}
+.small em{font-style:normal;color:var(--ink)}
+.basemenu{display:flex;gap:8px;margin-top:8px}
+.basemenu button{flex:1;height:28px;border:1px solid var(--hair);background:none;border-radius:8px;font-size:12px;cursor:pointer}
+.basemenu button:hover{border-color:var(--on);color:var(--on)}
+.play{margin:0}
+.play q{quotes:"「" "」";color:var(--toy)}
+/* 设置与连接 */
+.fold{display:flex;align-items:center;width:100%;height:36px;border:0;background:none;padding:0;cursor:pointer;font:600 13px/18px var(--font);text-align:left}
+.chev{margin-left:auto;color:var(--muted);font-size:15px;line-height:1;transition:transform .15s}
+.fold[aria-expanded="true"] .chev{transform:rotate(90deg)}
+.set{display:flex;align-items:center;min-height:36px;gap:8px}
+.set>:last-child{margin-left:auto}
+.meaning{font-size:12px;line-height:16px;color:var(--muted);margin:-4px 0 4px}
+.segctl{display:inline-flex;height:28px;border:1px solid var(--hair);border-radius:8px;padding:2px;gap:2px}
+.segctl button{border:0;background:none;padding:0 10px;border-radius:6px;font-size:12px;color:var(--muted);cursor:pointer}
+.segctl button.on{background:var(--on);color:#fff;font-weight:600}
+.switch{width:32px;height:18px;border-radius:999px;border:0;padding:0;background:color-mix(in srgb,var(--muted) 45%,transparent);position:relative;cursor:pointer;flex:none;transition:background .15s}
+.switch::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:left .15s}
+.switch[aria-checked="true"]{background:var(--on)}
+.switch[aria-checked="true"]::after{left:16px}
+.textbtn{display:block;border:0;background:none;padding:0;margin-top:4px;cursor:pointer;font:13px/19px var(--font);color:var(--muted)}
+.textbtn:hover{color:var(--stop)}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0}
+.btn{min-height:36px;border:1px solid var(--hair);background:none;border-radius:8px;padding:6px 8px;font-size:13px;line-height:18px;font-weight:600;cursor:pointer;text-align:center}
+.btn:hover{border-color:var(--on)}
+.btn.primary{background:var(--on);border-color:var(--on);color:#fff}
+.btn.on{border-color:var(--on);color:var(--on)}
+.btn.full{grid-column:1/-1;width:100%}
+.btn small{display:block;font-weight:400;font-size:11px;line-height:14px;color:var(--muted)}
+.btn.on small{color:var(--on)}
+.conn{display:flex;align-items:center;width:100%;min-height:36px;gap:8px;border:0;background:none;padding:0;cursor:pointer;font:13px/19px var(--font);text-align:left}
+.conn .r{margin-left:auto;color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px}
+.conn .chev{margin-left:0}
+:host(.devs) .conn .chev{transform:rotate(90deg)}
+.devs{display:none;max-height:15em;overflow:auto;padding:0 0 4px}
 :host(.devs) .devs{display:block}
 .devs b{display:block;margin:6px 0 2px;font-size:12px}
-.devs label{display:flex;gap:8px;align-items:center;cursor:pointer;padding:3px 0;font-size:12px}
-.devs label i{font-style:normal;color:var(--muted);font:10.5px var(--mono)}
-.devs input{accent-color:var(--teal);margin:0;width:15px;height:15px}
-.help{display:none;margin:0 0 8px;padding:8px 12px 8px 26px;border-radius:12px;background:var(--raise);font-size:12px;max-height:14em;overflow:auto}
+.devs label{display:flex;gap:8px;align-items:center;cursor:pointer;min-height:24px;font-size:12px}
+.devs label i{font-style:normal;color:var(--muted);font-size:11px}
+.devs input{accent-color:var(--on);margin:0;width:14px;height:14px}
+.help{display:none;margin:12px 0 0;padding:8px 12px 8px 24px;border-radius:10px;background:var(--raise);border:1px solid var(--hair);font-size:12px;line-height:16px;max-height:14em;overflow:auto}
 :host(.help) .help{display:block}
-.help li{margin:3px 0}
-.help li.error b{color:var(--heart)}
-.help li.warn b{color:var(--amber)}
-.foot{display:flex;flex-wrap:wrap;gap:4px 12px;align-items:center;padding:4px 4px 0;color:var(--muted);font-size:11.5px}
-.foot button{border:0;background:transparent;padding:0;cursor:pointer;color:var(--muted);font-size:11.5px}
+.help li{margin:4px 0}
+.help li.error b{color:var(--stop)}
+.help li.warn b{color:var(--warn)}
+.foot{flex:none;display:flex;gap:4px 14px;flex-wrap:wrap;align-items:center;border-top:1px solid var(--hair);padding:8px 4px 10px;font:500 11px/14px var(--font);color:var(--muted)}
+.foot button{border:0;background:none;padding:0;cursor:pointer;color:var(--muted);font:500 11px/14px var(--font)}
 .foot button:hover{color:var(--ink)}
-.foot .ver{margin-left:auto;font:10.5px var(--mono);opacity:.7}
-.foot .warn{color:var(--amber)}`;
+.foot .ver{margin-left:auto}
+.foot .warn{color:var(--warn)}`;
   const HEART_SVG = '<svg viewBox="0 0 24 24"><path d="M12 21s-7-4.6-9.3-8.6C.6 8.7 2.6 4.5 6.6 4.5c2 0 3.4 1.1 4.1 2.2.7-1.1 2.1-2.2 4.1-2.2 4 0 6 4.2 3.9 7.9C19 16.4 12 21 12 21z"/></svg>';
   const WAVE_SVG = '<svg viewBox="0 0 24 24"><path d="M3 12c2-4 4-4 6 0s4 4 6 0 4-4 6 0"/></svg>';
+  const IBI_SVG = '<svg width="14" height="12" viewBox="0 0 14 12" aria-hidden="true"><path d="M0 7h3l1.5-4 2.5 8 2-6 1 2h4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/></svg>';
 
   let hostEl = null, root = null, el = {};
   function mountBadge() {
@@ -2313,79 +2310,88 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
 <div class="card" part="card" role="dialog" aria-label="heartlink 悬浮窗">
   <div class="head">
     <div class="tabs" role="tablist">
-      <button role="tab" data-tab="hr">健康设备<i data-f="hrBadge"></i></button>
-      <button role="tab" data-tab="toy">玩具<i data-f="toyBadge" class="pk"></i></button>
+      <button role="tab" data-tab="hr">健康设备<i class="d6" data-f="hrBadge"></i></button>
+      <button role="tab" data-tab="toy">玩具<i class="d6" data-f="toyBadge"></i></button>
+      <button class="x" data-close title="收起" aria-label="收起">×</button>
     </div>
-    <button class="x" data-close title="收起" aria-label="收起">×</button>
+    <div data-pane="toy"><button class="stop" data-act="halt">全部停止</button></div>
   </div>
+  <div class="body" data-f="body">
+  <ul class="help" data-f="help"></ul>
 
   <section data-pane="hr">
-    <div data-f="hrEmpty">
+    <div class="sec first" data-f="hrEmpty">
       <p class="empty">还没连接设备。手环 / 心率带要先打开“心率广播”，并用桌面版 Chrome 或 Edge。</p>
-      <div class="row2"><button class="btn primary full" data-act="hr">连接设备</button></div>
+      <button class="btn primary full" data-act="hr">连接设备</button>
     </div>
     <div data-f="hrLive">
-      <div class="block">
-        <div class="status"><span class="sdot" data-f="hrDot"></span><b data-f="dev">--</b><span data-f="hrState"></span><span class="batt" data-f="batt"></span></div>
-        <svg class="trend" viewBox="0 0 260 56" data-f="tsvg" aria-label="本轮心率走势，底色为相位"></svg>
-        <div class="pseg" data-f="pseg"></div>
-        <div class="plist" data-f="plist"></div>
-        <p class="pnote" data-f="pnote" hidden>发出第一条消息后，这里按相位分段显示。</p>
-        <button class="baselab" data-act="basemenu" title="平静心率：虚线的位置；右上角的百分比也是和它比。点一下可以记下或改回自动"><i></i><span data-f="base">平静心率 --</span><em>调整</em></button>
-        <div class="basemenu" data-f="baseMenu" hidden>
-          <button data-act="baseline">记下现在为平静</button><button data-act="clear">改回自动计算</button>
+      <div class="sec first">
+        <div class="status"><span class="sdot" data-f="hrDot"></span><b data-f="dev">--</b><span class="st" data-f="hrState"></span><span class="batt" data-f="batt"></span></div>
+      </div>
+      <div class="sec">
+        <div class="tl">
+          <div data-f="plist"></div>
+          <div class="node hol" data-f="pnote" hidden><div class="th"><span class="m">发出第一条消息后，这里按相位分段显示</span></div></div>
+          <div class="node bare">
+            <div class="base"><i class="dash"></i><span data-f="base">平静心率</span><button class="link" data-act="basemenu" title="虚线是平静心率，胶囊上的百分比也是和它比">调整</button></div>
+            <div class="basemenu" data-f="baseMenu" hidden><button data-act="baseline">记下现在为平静</button><button data-act="clear">改回自动计算</button></div>
+            <div class="small" data-f="hrvLine"><span data-f="hrv"></span><span data-f="last"></span></div>
+          </div>
+          <div class="node hol" style="--c:var(--gen)">
+            <div class="th"><span class="m">下次发送时，模型会收到 ↗</span><button class="link" data-act="preview">看原文</button></div>
+            <p class="sees" data-f="sees">--</p>
+            <pre class="ptext" data-f="ptext" hidden></pre>
+          </div>
+          <div class="node" style="--c:var(--read)" data-f="sigBox">
+            <div class="th"><span class="m">模型上一轮的判断 ↘</span></div>
+            <p class="quote" data-f="sig">--</p>
+          </div>
         </div>
       </div>
-      <div class="tiles">
-        <div class="tile"><span>心率变异</span><b data-f="hrv">--</b></div>
-        <div class="tile"><span>最近几轮峰值</span><b data-f="last">--</b></div>
+    </div>
+    <div class="sec">
+      <button class="fold" data-act="fold" aria-expanded="true">设置与连接<span class="chev">›</span></button>
+      <div data-f="hrFold">
+        <div class="set"><span>模式</span><div class="segctl"><button data-set="mode:author">幕后</button><button data-set="mode:character">入戏</button><button data-set="mode:aware">知情</button></div></div>
+        <div class="meaning" data-f="modeHint"></div>
+        <div class="set"><span>发给模型</span><button class="switch" role="switch" data-act="inject" aria-label="发给模型"></button></div>
+        <div data-f="hrTools"><button class="textbtn" data-act="disconnect">断开设备</button></div>
       </div>
-      <div class="sees">
-        <div class="sh"><span>下次发送时，模型会收到</span><button data-act="preview">看原文</button></div>
-        <p data-f="sees">--</p>
-        <pre class="ptext" data-f="ptext" hidden></pre>
-      </div>
-      <div class="quote" data-f="sigBox"><span>模型上一轮的判断</span><div data-f="sig">--</div></div>
     </div>
-    <div class="list">
-      <div class="item"><div class="lab">模式<small data-f="modeHint">角色能察觉你的身体状态</small></div>
-        <div class="segctl"><button data-set="mode:author">幕后</button><button data-set="mode:character">入戏</button></div></div>
-      <div class="item"><div class="lab">发给模型</div><button class="switch" role="switch" data-act="inject" aria-label="发给模型"></button></div>
-    </div>
-    <div class="row2" data-f="hrTools">
-      <button class="btn full" data-act="disconnect">断开设备</button>
-    </div>
-    <ul class="help" data-f="help"></ul>
   </section>
 
   <section data-pane="toy">
-    <button class="stop" data-act="halt">全部停止</button>
-    <p class="empty" data-f="toyEmpty">还没连玩具：打开“剧情联动”，再选一种连接方式。</p>
-    <div class="acts-last" data-f="toyTiles">
-      <div class="sh"><span>上一条回复的动作</span><em data-f="now"></em></div>
-      <div class="chips" data-f="lastact"></div>
+    <div class="sec" data-f="toyEmpty"><p class="empty" style="margin:0">还没连玩具：打开“剧情联动”，再选一种连接方式。</p></div>
+    <div class="sec" data-f="toyTiles">
+      <div class="sh">上一条回复的动作<em data-f="now"></em></div>
+      <div class="tl" data-f="lastact"></div>
     </div>
-    <div class="howto">
-      <b>在对话里这样玩</b>
-      <p>角色在回复里写动作，回复写完就动。也可以直接对角色说<q>轻一点</q><q>再强点</q><q>像心跳那样</q>。</p>
+    <div class="sec" data-f="play">
+      <div class="sh">在对话里这样玩<button class="x" data-act="playClose" title="收起玩法说明" aria-label="收起玩法说明">×</button></div>
+      <p class="play">角色在回复里写动作，回复写完就动。也可以直接对角色说<q>轻一点</q><q>再强点</q><q>像心跳那样</q><q>慢慢来</q>。</p>
     </div>
-    <div class="list">
-      <div class="item"><div class="lab">剧情联动</div><button class="switch" role="switch" data-act="vib" aria-label="剧情联动"></button></div>
-      <div class="item"><div class="lab">节奏</div><div class="segctl"><button data-set="profile:slow-burn">慢热</button><button data-set="profile:steady">持久</button><button data-set="profile:frenzy">狂暴</button><button data-set="profile:max">极限</button></div></div>
+    <div class="sec">
+      <button class="fold" data-act="fold" aria-expanded="true">设置与连接<span class="chev">›</span></button>
+      <div data-f="toyFold">
+        <div class="set"><span>剧情联动</span><button class="switch" role="switch" data-act="vib" aria-label="剧情联动"></button></div>
+        <div class="set"><span>节奏</span><div class="segctl"><button data-set="profile:slow-burn">慢热</button><button data-set="profile:steady">持久</button><button data-set="profile:frenzy">狂暴</button><button data-set="profile:max">极限</button></div></div>
+        <button class="conn" data-act="devs" data-f="connRow"><span>连接设备</span><span class="r"><i class="d6"></i><span data-f="connTxt">已连接</span><span class="chev">›</span></span></button>
+        <div class="row2" data-f="connBtns">
+          <button class="btn" data-act="toy" title="先装好 Intiface Central、点 Start Server 并在里面连上玩具">通过 Intiface<small data-f="out">推荐</small></button>
+          <button class="btn" data-act="wasm" title="不装 Intiface：Chrome 直接用蓝牙连玩具（支持的型号与 Intiface 相同）。还没有经过真实设备验证">浏览器直接连<small data-f="wasmState">测试</small></button>
+          ${DEV_TOOLS ? '<button class="btn full" data-act="lab" title="打开设备模拟器小窗口（本机 device-lab，先运行 npm run sim）">设备模拟器</button>' : ''}
+        </div>
+        <div class="devs" data-f="devs"></div>
+      </div>
     </div>
-    <div class="row2">
-      <button class="btn" data-act="toy" title="推荐：先装好 Intiface Central、点 Start Server 并在里面连上玩具">通过 Intiface<small data-f="out">推荐 · 未连接</small></button>
-      <button class="btn" data-act="wasm" title="不装 Intiface：Chrome 直接用蓝牙连玩具（支持的型号与 Intiface 相同）。测试功能，未经真实设备验证">浏览器直接连<small data-f="wasmState">不装软件 · 测试</small></button>
-      ${DEV_TOOLS ? '<button class="btn full" data-act="lab" title="打开设备模拟器小窗口（本机 device-lab，先运行 npm run sim）">设备模拟器</button>' : ''}
-    </div>
-    <button class="expander" data-act="devs">选择设备<span></span></button>
-    <div class="devs" data-f="devs"></div>
   </section>
+  </div>
 
   <div class="foot">
     <button data-act="help" data-f="helpBtn">排查问题</button>
+    <button data-act="play" data-f="playBtn" hidden>玩法</button>
     <button data-act="hide">隐藏悬浮窗</button>
-    <span class="ver">v${VERSION} <span data-f="foot"></span></span>
+    <span class="ver">v${VERSION}<span data-f="foot"></span></span>
   </div>
 </div>
 <div class="pill" part="pill" title="heartlink">
@@ -2402,8 +2408,11 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
 </div>`;
     const q = (s) => root.querySelector(s);
     el = { heart: q('[data-seg="hr"] .heart'), bpm: q('.bpm'), poly: q('.spark path'), sparkRef: q('.spark .ref'), delta: q('.delta'), tag: q('[data-seg="hr"] .tag'), pill: q('.pill'), spark: q('.spark') };
-    ['base', 'read', 'hrv', 'last', 'dev', 'out', 'sig', 'sigBox', 'foot', 'hrBadge', 'toyBadge', 'hrEmpty', 'hrLive', 'hrDot', 'hrState', 'batt', 'tsvg', 'pseg', 'plist', 'pnote', 'baseMenu', 'modeHint', 'hrTools', 'toyEmpty', 'toyTiles', 'now', 'lastact', 'wasmState', 'help', 'devs', 'helpBtn', 'sees', 'ptext']
+    ['base', 'hrv', 'last', 'hrvLine', 'dev', 'out', 'sig', 'sigBox', 'foot', 'hrBadge', 'toyBadge', 'hrEmpty', 'hrLive', 'hrDot', 'hrState', 'batt', 'plist', 'pnote', 'baseMenu', 'modeHint', 'hrTools', 'hrFold', 'toyFold', 'toyEmpty', 'toyTiles', 'now', 'lastact', 'wasmState', 'help', 'devs', 'helpBtn', 'sees', 'ptext', 'body', 'play', 'playBtn', 'connRow', 'connTxt', 'connBtns']
       .forEach((f) => { el[f] = q(`[data-f="${f}"]`); });
+    el.folds = [...root.querySelectorAll('[data-act="fold"]')];
+    el.connDot = q('[data-f="connRow"] .d6');
+    el.body.addEventListener('scroll', () => syncMore(), { passive: true });
     el.seg = { hr: q('[data-seg="hr"]'), toy: q('[data-seg="toy"]'), none: q('[data-seg="none"]') };
     el.segsep = q('.segsep');
     el.tn = q('.tn'); el.live = q('.live');
@@ -2411,7 +2420,7 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
     el.panes = [...root.querySelectorAll('[data-pane]')];
     el.sets = [...root.querySelectorAll('[data-set]')];
     el.injSw = q('[data-act="inject"]'); el.vibSw = q('[data-act="vib"]');
-    el.toyBtn = q('[data-act="toy"]'); el.wasmBtn = q('[data-act="wasm"]'); el.offBtn = q('[data-act="disconnect"]');
+    el.toyBtn = q('[data-act="toy"]'); el.wasmBtn = q('[data-act="wasm"]');
     el.devs.addEventListener('change', (e) => {
       const id = e.target && e.target.getAttribute('data-id');
       if (!id) return;
@@ -2449,6 +2458,9 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
         if (act === 'toy') { const on = !state.haptics.intiface.enabled; setHaptics({ intiface: { enabled: on } }); toast('info', on ? `正在连接 Intiface（${state.haptics.intiface.url}）；先在 Intiface Central 里点 Start Server` : '已断开 Intiface'); return; }
         if (act === 'hide') { setBadgeHidden(true); toast('info', '悬浮窗已隐藏。要恢复：点酒馆左下角的魔杖菜单 → “显示 heartlink 悬浮窗”。'); return; }
         if (act === 'halt') { actuators.stop(); closePanel(); toast('info', '已停止所有设备'); return; }
+        if (act === 'fold') { state.settingsFolded = !state.settingsFolded; saveSettings(); return render(); }
+        if (act === 'playClose') { state.playSeen = true; state.playOpen = false; saveSettings(); return render(); }
+        if (act === 'play') { state.playOpen = true; state.badgeTab = 'toy'; return render(); }
         if (act === 'preview') { el.ptext.hidden = !el.ptext.hidden; btn.textContent = el.ptext.hidden ? '看原文' : '收起'; if (!el.ptext.hidden) { el.ptext.textContent = compose().text; console.log(LOG, 'preview:\n' + el.ptext.textContent); } return; }
         if (act === 'basemenu') { el.baseMenu.hidden = !el.baseMenu.hidden; return; }
         if (act === 'baseline') { el.baseMenu.hidden = true; return setManualBaseline(); }
@@ -2561,7 +2573,24 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
     const above = r.top - 16; const below = host.innerHeight - r.bottom - 16;
     const down = below > above;
     hostEl.classList.toggle('below', down);
-    card.style.maxHeight = `${Math.max(180, Math.floor(down ? below : above) - 44)}px`;
+    card.style.maxHeight = `${Math.max(180, Math.floor(down ? below : above) - 8)}px`;
+  }
+  // 中间区域还能往下滚时，底边淡出提示
+  function syncMore() {
+    const b = el.body; if (!b) return;
+    b.classList.toggle('more', b.scrollHeight - b.scrollTop - b.clientHeight > 2);
+  }
+  // 深浅配色跟着酒馆正文颜色走：正文偏暗 = 浅色主题
+  let toneKey = '';
+  function syncTone() {
+    try {
+      const c = host.getComputedStyle(hostEl).color;
+      if (c === toneKey) return;
+      toneKey = c;
+      const m = (c.match(/[\d.]+/g) || []).map(Number);
+      const lum = m.length >= 3 ? (0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2]) / 255 : 1;
+      hostEl.classList.toggle('light', lum < 0.5);
+    } catch (_) {}
   }
   // 胶囊与面板里的走势线：虚线是平静心率，曲线相对它上下浮动（百分比也是和它比）
   function sparkPath(ref) {
@@ -2572,9 +2601,10 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
   }
   // 本轮相位（与注入块同一套边界，HeartlinkCore.buildTurn）：
   //   看生成 = 等首字 → 思维链 → 正文（非流式时只有一段）；读回复；写消息；离开（页面切走 / 长时间没操作）不计
+  //   颜色是 CSS 变量；看生成的三小段只用顶部线条的透明度区分
   const PH = {
-    wait: { name: '等首字', color: '#5e6bb8' }, think: { name: '思维链', color: '#9a86f0' }, body: { name: '正文', color: '#7c8cf0' }, gen: { name: '看生成', color: '#7c8cf0' },
-    read: { name: '读回复', color: '#ef5a55' }, write: { name: '写消息', color: '#ff6fa3' },
+    wait: { name: '等首字', c: 'gen', o: 0.55 }, think: { name: '思考', c: 'gen', o: 0.75 }, body: { name: '正文', c: 'gen', o: 1 }, gen: { name: '看生成', c: 'gen', o: 1 },
+    read: { name: '读回复', c: 'read', o: 1 }, write: { name: '写消息', c: 'write', o: 1 },
   };
   function phaseModel(now) {
     const t = HeartlinkCore.buildTurn(state.events, now);
@@ -2600,68 +2630,84 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
     }
     return { groups: groups.filter((g) => g.b > g.a), away: t.away || [] };
   }
+  // 时间线：每个相位一个节点；看生成、读回复各带一张小走势图，所有小图纵向比例相同、以底边为准对齐，平静心率虚线在同一高度
+  const CHART_W = 274;
   function renderPhases(base, now) {
     const { groups, away } = phaseModel(now);
-    const t0 = groups.length ? groups[0].a : now - 180000;
-    const t1 = groups.length ? groups[groups.length - 1].b : now;
-    const span = Math.max(1000, t1 - t0);
-    const pts = state.samples.filter((x) => x.t >= t0 && x.t <= t1);
-    const W = 260, H = 56, N = 52;
-    const buckets = Array.from({ length: N }, () => []);
-    for (const x of pts) buckets[Math.min(N - 1, Math.floor((x.t - t0) / span * N))].push(x.bpm);
-    const vals = buckets.map((b) => (b.length ? b.reduce((m, v) => m + v, 0) / b.length : null));
-    const nums = vals.filter((v) => v != null).concat(base ? [base.bpm] : []);
-    let lo = nums.length ? Math.min(...nums) : 60; let hi = nums.length ? Math.max(...nums) : 100;
-    if (hi - lo < 12) lo -= (12 - (hi - lo)) / 2, hi = lo + 12;
-    hi += (hi - lo) * 0.18;   // 顶部留出峰值标注的位置
-    const X = (tt) => Math.max(0, Math.min(W, (tt - t0) / span * W));
-    // 自己画线（和纵轴一致，给峰值留头部空间）
-    const d = HeartlinkCore.sparkPath(vals.concat([]), W, H, 12, base ? base.bpm : null) && (() => {
-      const xy = vals.map((v, i) => (v == null ? null : [(i + 0.5) * W / N, H - 1.5 - (v - lo) / (hi - lo) * (H - 3)]));
-      let out = ''; let pen = false;
-      for (const q of xy) { if (!q) { pen = false; continue; } out += `${pen ? 'L' : 'M'}${q[0].toFixed(1)},${q[1].toFixed(1)}`; pen = true; }
-      return out;
-    })();
-    const refY = base ? +(H - 1.5 - (base.bpm - lo) / (hi - lo) * (H - 3)).toFixed(1) : null;
-    const Y = (v) => H - 1.5 - (v - lo) / (hi - lo) * (H - 3);
-    let svg = '<defs><pattern id="hlaway" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="2" height="5" fill="rgba(255,255,255,.14)"/></pattern></defs>';
-    for (const g of groups) for (const sb of g.subs) svg += `<rect x="${X(sb.a).toFixed(1)}" y="0" width="${Math.max(1, X(sb.b) - X(sb.a)).toFixed(1)}" height="${H}" fill="${PH[sb.k].color}" fill-opacity="${sb.live ? 0.2 : 0.11}"/>`;
-    for (const [a, b] of away) if (b > t0 && a < t1) svg += `<rect x="${X(a).toFixed(1)}" y="0" width="${Math.max(1, X(b) - X(a)).toFixed(1)}" height="${H}" fill="url(#hlaway)"/>`;
-    if (refY != null) svg += `<line x1="0" x2="${W}" y1="${refY}" y2="${refY}" class="ref"/>`;
-    if (d) svg += `<path d="${d}" class="ln"/>`;
-    const rd = groups.find((g) => g.k === 'read');
-    let peak = null;
-    if (rd) for (const x of pts) if (x.t >= rd.a && x.t <= rd.b && (!peak || x.bpm > peak.bpm)) peak = x;
-    if (peak && d) svg += `<circle cx="${X(peak.t).toFixed(1)}" cy="${Y(peak.bpm).toFixed(1)}" r="3" class="pk"/><text x="${Math.min(W - 9, Math.max(9, X(peak.t))).toFixed(1)}" y="${Math.max(8, Y(peak.bpm) - 5).toFixed(1)}" class="pkt">${peak.bpm}</text>`;
-    const liveNow = groups.some((g) => g.live);
-    if (state.lastSample && d && state.lastSample.t >= t0) svg += `<circle cx="${Math.min(W - 3, X(state.lastSample.t)).toFixed(1)}" cy="${Y(state.lastSample.bpm).toFixed(1)}" r="3" class="cur${liveNow ? ' live' : ''}"/>`;
-    el.tsvg.innerHTML = svg;
-    el.pnote.hidden = groups.length > 0;
+    const t0 = groups.length ? groups[0].a : now;
+    const pts = state.samples.filter((x) => x.t >= t0 && x.t <= now);
     const fmt = (sec) => (sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}` : `${sec}s`);
     const secs = (a, b) => Math.round((b - a) / 1000);
     const awayIn = (g) => away.reduce((m, [a, b]) => m + Math.max(0, Math.min(b, g.b) - Math.max(a, g.a)), 0);
-    el.pseg.style.gridTemplateColumns = groups.map((g) => `${Math.max(26, X(g.b) - X(g.a)).toFixed(0)}fr`).join(' ') || '1fr';
-    el.pseg.innerHTML = groups.map((g) => `<div class="sg${g.live ? ' on' : ''}">${g.subs.map((sb) => `<i style="flex:${Math.max(1, sb.b - sb.a)};background:${PH[sb.k].color}"${sb.live ? ' class="on"' : ''}></i>`).join('')}</div>`).join('');
-    el.plist.innerHTML = groups.map((g) => {
-      let detail = '';
-      const SHORT = { wait: '首字', think: '思考', body: '正文' };
-      if (g.k === 'gen' && g.subs.length > 1) detail = g.subs.map((sb) => `${SHORT[sb.k]} ${fmt(secs(sb.a, sb.b))}`).join(' · ');
-      else if (g.k === 'gen' && g.live) detail = '等待中';
+    // 每张图先分桶取均值
+    const charts = groups.map((g) => {
+      const h = g.k === 'gen' ? 28 : g.k === 'read' ? 40 : 0;
+      if (!h) return null;
+      const span = Math.max(1000, g.b - g.a); const N = Math.max(8, Math.min(Math.round(CHART_W / 4), Math.floor(span / 1000)));   // 约每秒一桶，最细 4px
+      const buckets = Array.from({ length: N }, () => []);
+      for (const x of pts) if (x.t >= g.a && x.t <= g.b) buckets[Math.min(N - 1, Math.floor((x.t - g.a) / span * N))].push(x.bpm);
+      const vals = buckets.map((b) => (b.length ? b.reduce((m, v) => m + v, 0) / b.length : null));
+      return { g, h, N, span, vals };
+    });
+    const all = charts.flatMap((c) => (c ? c.vals.filter((v) => v != null) : [])).concat(base ? [base.bpm] : []);
+    const lo = all.length ? Math.min(...all) - 1 : 60;
+    let k = 3;   // 每 bpm 多少像素：取能让每张图都放得下的最大值
+    for (const c of charts) {
+      if (!c) continue;
+      const hi = Math.max(lo + 6, ...c.vals.filter((v) => v != null), base ? base.bpm : lo);
+      k = Math.min(k, (c.h - 8) / (hi - lo));
+    }
+    k = Math.max(0.3, k);
+    let peak = null;
+    const rd = groups.find((g) => g.k === 'read');
+    if (rd) for (const x of pts) if (x.t >= rd.a && x.t <= rd.b && (!peak || x.bpm > peak.bpm)) peak = x;
+    const chartSvg = (c, idx) => {
+      const { g, h, N, span, vals } = c;
+      const W = CHART_W;
+      const X = (tt) => Math.max(0, Math.min(W, (tt - g.a) / span * W));
+      const Y = (v) => h - 4 - (v - lo) * k;
+      let s = `<svg class="chart" viewBox="0 0 ${W} ${h}" height="${h}" preserveAspectRatio="none" aria-hidden="true"><defs><pattern id="hlaway${idx}" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="5" style="stroke:var(--muted);stroke-width:1.4;stroke-opacity:.5"/></pattern></defs>`;
+      for (const sb of g.subs) {
+        const x = X(sb.a); const w = Math.max(1, X(sb.b) - x); const inner = sb.a > g.a ? 0.5 : 0;
+        s += `<rect x="${x.toFixed(1)}" y="0" width="${w.toFixed(1)}" height="${h}" style="fill:var(--${PH[sb.k].c});fill-opacity:${sb.live ? 0.24 : 0.14}"/>`;
+        s += `<rect x="${(x + inner).toFixed(1)}" y="0" width="${Math.max(0, w - inner * 2).toFixed(1)}" height="2" style="fill:var(--${PH[sb.k].c});opacity:${PH[sb.k].o}"/>`;
+      }
+      for (const [a, b] of away) if (b > g.a && a < g.b) s += `<rect x="${X(a).toFixed(1)}" y="2" width="${Math.max(1, X(b) - X(a)).toFixed(1)}" height="${h - 2}" fill="url(#hlaway${idx})"><title>离开，不计入</title></rect>`;
+      if (base) { const yb = Y(base.bpm).toFixed(1); s += `<line x1="0" x2="${W}" y1="${yb}" y2="${yb}" style="stroke:var(--faint);stroke-width:1;stroke-dasharray:3 3"/>`; }
+      // 断开超过 3 桶才断线（偶尔漏一两个样本不算中断）
+      let d = ''; let gap = Infinity;
+      vals.forEach((v, i) => { if (v == null) { gap++; return; } d += `${gap > 3 ? 'M' : 'L'}${((i + 0.5) * W / N).toFixed(1)},${Y(v).toFixed(1)}`; gap = 0; });
+      if (d) s += `<path d="${d}" style="fill:none;stroke:var(--heart);stroke-width:1.75;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke"/>`;
+      if (g.k === 'read' && peak && d) s += `<circle cx="${X(peak.t).toFixed(1)}" cy="${Y(peak.bpm).toFixed(1)}" r="3" style="fill:var(--heart);stroke:var(--bg);stroke-width:1.5"/>`;
+      return s + '</svg>';
+    };
+    const SHORT = { wait: '首字', think: '思考', body: '正文' };
+    el.plist.innerHTML = groups.map((g, i) => {
+      const c = charts[i];
+      const dur = fmt(secs(g.a, g.b));
+      let arrow = ''; let right = ''; let sub = '';
+      if (g.k === 'gen') {
+        if (g.subs.length > 1) sub = g.subs.map((sb) => `${SHORT[sb.k]} ${fmt(secs(sb.a, sb.b))}`).join(' · ');
+        else if (g.live && g.subs[0] && g.subs[0].k === 'wait') sub = '等首字';
+      }
       if (g.k === 'read' && peak) {
         const fl = pts.filter((x) => x.t >= g.a && x.t <= g.b);
         const up = fl.length ? fl[fl.length - 1].bpm - fl[0].bpm : 0;
-        detail = `峰值 ${peak.bpm}${up >= 3 ? ' ↑' : up <= -3 ? ' ↓' : ''}`;
+        arrow = up >= 3 ? ' ↑' : up <= -3 ? ' ↓' : '';
+        right = `<span class="r"><span class="m">峰值</span><span class="big">${peak.bpm}</span></span>`;
       }
-      if (g.k === 'write' && state.lastSample) detail = `现在 ${state.lastSample.bpm}`;
       const aw = awayIn(g);
-      if (aw >= 1000) detail += `${detail ? ' · ' : ''}离开 ${fmt(Math.round(aw / 1000))}（不计）`;
-      return `<div class="pr${g.live ? ' on' : ''}"><i style="background:${PH[g.k].color}"></i><b>${PH[g.k].name}</b><em>${g.live ? '进行中 ' : ''}${fmt(secs(g.a, g.b))}</em><span>${detail}</span></div>`;
+      if (aw >= 1000) sub += `${sub ? ' · ' : ''}<i class="hatch" title="离开的时段不计入"></i>离开 ${fmt(Math.round(aw / 1000))}`;
+      const liveTag = g.live ? `<span class="m${g.k === 'write' ? ' w' : ''}">进行中</span>` : '';
+      return `<div class="node${g.live ? ' pulse' : ''}" style="--c:var(--${PH[g.k].c})"><div class="th"><b>${PH[g.k].name}</b><span class="d">${dur}${arrow}</span>${liveTag}${right}</div>`
+        + (c ? chartSvg(c, i) : '') + (sub ? `<div class="tsub">${sub}</div>` : '') + '</div>';
     }).join('');
-    el.base.textContent = base ? `平静心率 ${base.bpm}（${BASE_SHORT[base.method] || base.method}）` : '平静心率：数据还不够，稍后自动算出';
+    el.pnote.hidden = groups.length > 0;
+    const how = base ? { manual: ' · 手动记下', p20: ' · 估算' }[base.method] || '' : '';
+    el.base.innerHTML = base ? `平静心率 <b>${base.bpm}</b>${how}` : '平静心率稍后自动算出';
   }
   const fmtSec = (sec) => (sec >= 60 ? `${Math.floor(sec / 60)} 分 ${sec % 60} 秒` : `${sec} 秒`);
   const esc = (v) => String(v == null ? '' : v).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
-  const BASE_SHORT = { manual: '手动', 'quiet-median': '自动', p20: '估算' };
   function render() {
     if (!root || destroyed) return;
     const now = Date.now();
@@ -2670,6 +2716,7 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
     const mode = getMode();
     const base = state.connected ? baselineInfo() : null;
     const d = on && base ? Math.round((state.lastSample.bpm - base.bpm) / base.bpm * 100) : null;
+    syncTone();
     // 胶囊：心率段
     el.heart.className = 'dot heart ' + (on ? 'on' : state.connected ? 'stale' : 'off');
     if (on) hostEl.style.setProperty('--beat', (60 / Math.max(state.lastSample.bpm, 30)) + 's');
@@ -2683,7 +2730,7 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
       if (sp.refY != null) { el.sparkRef.setAttribute('y1', sp.refY); el.sparkRef.setAttribute('y2', sp.refY); }
     }
     el.delta.textContent = d != null ? `${d >= 0 ? '+' : ''}${d}%` : '';
-    el.delta.title = base ? `现在比平静心率（${base.bpm}）${d >= 0 ? '高' : '低'} ${Math.abs(d || 0)}%` : '';
+    el.delta.title = base ? `现在比平静心率 ${base.bpm} ${d >= 0 ? '高' : '低'} ${Math.abs(d || 0)}%` : '';
     el.delta.className = 'delta' + (d != null && d >= 10 ? ' up' : '');
     let tag;
     if (state.newerVersion) tag = '请刷新';   // 别的页面已装更新版本，优先提示
@@ -2691,9 +2738,9 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
     else if (state.reconnecting) tag = '重连中';
     else if (!state.connected) tag = state.bridgeUp && fresh ? '经本机桥' : '未连接';
     else if (!fresh) tag = `${Math.round((now - (state.lastSample ? state.lastSample.t : now)) / 1000)} 秒无数据`;
-    else tag = (mode === 'author' ? '幕后' : '入戏') + (state.injectEnabled === false ? '（未发送）' : modeSource() === 'card' ? '（卡片设定）' : '');
+    else tag = (MODE_ZH[mode] || '幕后') + (state.injectEnabled === false ? ' · 未发送' : modeSource() === 'card' ? ' · 卡片设定' : '');
     el.tag.textContent = tag;
-    el.tag.className = 'tag' + (state.connected && fresh && mode === 'character' ? ' ch' : '');
+    el.tag.className = 'tag' + (state.connected && fresh && mode !== 'author' ? ' ch' : '');
     // 胶囊：玩具段；只显示正在用的
     const acts = actuators.list();
     const busy = acts.filter((a) => a.busy);
@@ -2707,80 +2754,118 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
     el.segsep.hidden = !(hrActive && toyActive);
     el.tn.textContent = `${nToy} 路`;
     el.live.className = 'live' + (busy.length ? ' on' : '');
+    hostEl.classList.toggle('busy', busy.length > 0);
     const info = state.deviceInfo || {};
     el.pill.title = `heartlink ${VERSION}${state.connected ? ` · ${state.deviceName || ''}${info.firmware ? ' · fw ' + info.firmware : ''}` : ''} · 点一下打开，按住可拖动`;
     if (!hostEl.classList.contains('open')) return;   // 面板收起时不用算后面的
     fitPanel();
-    // 面板：标签页
+    // 面板：标签页（小圆点只表示状态，数字只在胶囊上）
     const tab = state.badgeTab === 'toy' ? 'toy' : 'hr';   // 默认健康设备
     el.tabs.forEach((b) => b.setAttribute('aria-selected', String(b.getAttribute('data-tab') === tab)));
     el.panes.forEach((pn) => { pn.hidden = pn.getAttribute('data-pane') !== tab; });
-    el.hrBadge.textContent = state.connected ? '已连接' : state.reconnecting ? '重连中' : state.waitingForDevice ? '等设备' : '';
-    el.hrBadge.className = state.connected ? '' : 'warn';
-    el.toyBadge.textContent = nToy ? `${nToy} 路` : '';
+    el.hrBadge.hidden = !(state.connected || state.reconnecting || state.waitingForDevice);
+    el.hrBadge.className = 'd6' + (state.connected ? '' : ' warn');
+    el.hrBadge.title = state.connected ? '已连接' : state.reconnecting ? '重连中' : '等设备回来';
+    el.toyBadge.hidden = !toyActive;
+    el.toyBadge.className = 'd6' + (busy.length ? ' toy' : '');
+    el.toyBadge.title = busy.length ? '正在动' : '已连接';
+    // 设置与连接：折叠状态记在设置里
+    const folded = !!state.settingsFolded;
+    el.folds.forEach((b) => b.setAttribute('aria-expanded', String(!folded)));
+    el.hrFold.hidden = folded; el.toyFold.hidden = folded;
     // 健康设备页
     el.hrEmpty.hidden = hrActive;
     el.hrLive.hidden = !hrActive;
-    el.hrTools.hidden = !hrActive;
-    el.offBtn.hidden = !state.connected && !state.reconnecting && !state.waitingForDevice;
+    el.hrTools.hidden = !state.connected && !state.reconnecting && !state.waitingForDevice;
     if (hrActive) {
       const m2 = sourceMeta();
       el.dev.textContent = `${(state.deviceName || '心率设备').split(' ')[0]}${info.model ? ' ' + info.model : ''}`;
       el.hrDot.className = 'sdot ' + (on ? 'ok' : 'warn');
-      el.hrState.textContent = on ? (m2.rr ? '· 含心跳间隔' : '') : `· ${tag}`;
-      el.batt.textContent = state.battery != null ? `电量 ${state.battery}%` : '';
+      if (on) { el.hrState.innerHTML = m2.rr ? IBI_SVG : ''; el.hrState.title = m2.rr ? '含心跳间隔' : ''; }
+      else { el.hrState.textContent = tag; el.hrState.title = ''; }
+      el.batt.innerHTML = state.battery != null ? `电量 <em>${esc(state.battery)}%</em>` : '';
       renderPhases(base, now);
       const hist = history(); const lastTurn = hist[hist.length - 1];
-      el.hrv.innerHTML = lastTurn ? (lastTurn.hrv != null ? `${lastTurn.hrv} <i>ms</i>` : '<i>信号不足</i>') : (base && base.hrv ? `${base.hrv} <i>ms</i>` : '--');
-      el.last.textContent = hist.length ? hist.slice(-5).map((x) => x.readPeak).join(' ') : '--';
-      // 这一轮会注入什么（一句话），让人看懂“按相位切心跳”到底给了模型什么
+      const hrv = lastTurn ? lastTurn.hrv : base && base.hrv;
+      el.hrv.innerHTML = hrv != null ? `心率变异 <em>${esc(hrv)}ms</em>` : lastTurn ? '心率变异信号不足' : '';
+      const peaks = hist.slice(-5).map((x) => x.readPeak).filter((v) => v != null);
+      el.last.innerHTML = peaks.length ? `${el.hrv.innerHTML ? ' · ' : ''}前几轮峰值 ${peaks.map((v) => `<em>${esc(v)}</em>`).join(' · ')}` : '';
+      el.hrvLine.hidden = !el.hrv.innerHTML && !el.last.innerHTML;
+      // 这一轮会注入什么（一句话）；具体时长、峰值在上面的时间线里，这里只说比平静高多少
       if (state.injectEnabled === false) el.sees.innerHTML = '<i>“发给模型”已关，模型收不到这些数据。</i>';
       else {
         const c2 = compose(now);
         const sm = c2.summary;
-        const parts = [];
+        const modeTxt = `按${MODE_ZH[mode] || '幕后'}方式使用`;
         if (sm) {
-          parts.push(`读上一条回复 ${fmtSec(sm.readSec)}，峰值 <b>${sm.readPeak}</b>${base ? `（比平静 ${sm.readPeak >= base.bpm ? '+' : ''}${Math.round((sm.readPeak - base.bpm) / base.bpm * 100)}%）` : ''}`);
-          if (sm.writeSec) parts.push(`写这条 ${fmtSec(sm.writeSec)}`);
-        } else parts.push('还没有“读回复”相位（等角色回复后开始记）');
-        parts.push(`${mode === 'author' ? '幕后：只影响写法，角色不提' : '入戏：角色可以察觉你的身体状态'}`);
-        el.sees.innerHTML = parts.join(' · ');
+          const parts = ['读回复多久'];
+          if (base) { const pct = Math.round((sm.readPeak - base.bpm) / base.bpm * 100); parts.push(`峰值比平静${pct >= 0 ? '高' : '低'} <b>${Math.abs(pct)}%</b>`); }
+          else parts.push('峰值');
+          if (sm.writeSec) parts.push('这条写了多久');
+          el.sees.innerHTML = `${parts.join('、')}，${modeTxt}。`;
+        } else el.sees.innerHTML = '<span class="mut">还没有数据，角色回复后开始记。</span>';
         if (!el.ptext.hidden) el.ptext.textContent = c2.text;
       }
       const sig = lastSignal();
       el.sigBox.hidden = !sig;
-      el.sig.textContent = sig ? sig.text : '';
+      el.sig.textContent = sig ? `“${sig.text}”` : '';
     }
-    el.modeHint.textContent = mode === 'author' ? '角色不知道，只影响写法' : '角色能察觉你的身体状态';
+    el.modeHint.textContent = MODE_HINT[mode] || MODE_HINT.author;
     el.injSw.setAttribute('aria-checked', String(state.injectEnabled !== false));
     // 玩具页
     const pol = hapticsPolicy();
     el.vibSw.setAttribute('aria-checked', String(!!state.haptics.enabled));
     el.sets.forEach((b) => {
       const [key, val] = b.getAttribute('data-set').split(':');
-      const cur = key === 'mode' ? (mode === 'author' ? 'author' : 'character') : key === 'profile' ? pol.profile : String(state.haptics.maxIntensity);
+      const cur = key === 'mode' ? mode : key === 'profile' ? pol.profile : String(state.haptics.maxIntensity);
       b.className = cur === val ? 'on' : '';
     });
-    const nIntiface = [...toyFeatures.values()].filter((f) => f.source === 'intiface').length;
-    const nWasm = [...toyFeatures.values()].filter((f) => f.source === 'wasm').length;
-    el.out.textContent = { idle: '推荐 · 未连接', connecting: '连接中…', connected: `已连接 · ${nIntiface} 路`, disconnected: '已断开', error: '连不上，Intiface 开了吗' }[state.intifaceStatus] || '推荐 · 未连接';
+    const intiOn = state.intifaceStatus === 'connected'; const wasmOn = WASM.status === 'connected';
+    el.out.textContent = { idle: '推荐', connecting: '连接中…', connected: '已连接', disconnected: '已断开', error: '连不上，Intiface 开了吗' }[state.intifaceStatus] || '推荐';
     el.toyBtn.className = 'btn' + (state.haptics.intiface.enabled ? ' on' : '');
-    el.wasmState.textContent = { idle: '不装软件 · 测试', loading: '加载中…', connected: `已连接 · ${nWasm} 路`, error: '连接失败' }[WASM.status] || '不装软件 · 测试';
+    el.wasmState.textContent = { idle: '测试', loading: '加载中…', connected: '已连接', error: '连接失败' }[WASM.status] || '测试';
     el.wasmBtn.className = 'btn' + (WASM.client ? ' on' : '');
+    // 连上以后，连接方式收成一行；点开看连接按钮与选择设备
+    const anyDev = acts.length > 0;
+    el.connRow.hidden = !anyDev;
+    el.connBtns.hidden = anyDev && !hostEl.classList.contains('devs');
+    const via = [intiOn && 'Intiface', wasmOn && '浏览器直接连'].filter(Boolean).join('、');
+    el.connTxt.textContent = via ? `${via} · 已连接` : '已连接';
+    el.connDot.className = 'd6' + (busy.length ? ' toy' : '');
     el.toyEmpty.hidden = nToy > 0;
     el.toyTiles.hidden = nToy === 0;
-    el.now.textContent = busy.length ? `正在动 ${busy.length} 路` : '';
     const lastReply = (state.replyLog || []).filter((x) => x.chatId === chatId()).slice(-1)[0];
     const SKIP_ZH = { disabled: '联动没开', 'replies-off': '回复联动关了', 'no-device': '没有设备', safeword: '安全词拦下' };
     const PAT_ZH = { pulse: '轻点', double: '两下', triple: '三下', long: '持续', heartbeat: '心跳', wave: '波浪' };
-    if (!lastReply) el.lastact.innerHTML = '<span class="chip idle">还没有：角色写出动作后会列在这里</span>';
-    else el.lastact.innerHTML = lastReply.acts.map((a, i) => {
-      const r = lastReply.results[i];
-      const okN = r ? r.results.filter((x) => x.ok).length : 0;
-      const state2 = lastReply.skipped ? `<i>${esc(SKIP_ZH[lastReply.skipped] || lastReply.skipped)}</i>` : r ? (okN ? `✓ ${okN} 路` : '<i>没执行</i>') : '<i>排队中</i>';
-      const clipped = '';
-      return `<span class="chip${lastReply.skipped || (r && !okN) ? ' no' : r ? ' ok' : ''}">${esc(PAT_ZH[a.pattern] || a.pattern)} ${Math.round((a.intensity ?? 0.5) * 100)}%${a.durationMs ? ` ${(a.durationMs / 1000).toFixed(a.durationMs % 1000 ? 1 : 0)}s` : ''} · ${state2}${clipped}</span>`;
-    }).join('') || '<span class="chip idle">这条回复没有动作</span>';
+    // 玩法说明只在刚开始时显示：看到第一条带动作的回复（或点 ×）后收起，底部留“玩法”可再打开
+    if (!state.playSeen && (state.replyLog || []).some((x) => x.acts && x.acts.length)) { state.playSeen = true; saveSettings(); }
+    el.play.hidden = !!state.playSeen && !state.playOpen;
+    el.playBtn.hidden = tab !== 'toy' || !el.play.hidden;
+    let movingShown = false;
+    if (!lastReply) el.lastact.innerHTML = '<div class="node hol"><div class="th"><span class="m">角色写出动作后会列在这里</span></div></div>';
+    else {
+      // 动作按顺序执行：有设备在动时，最后一个已执行的动作就是正在动的那个
+      let movingIdx = -1;
+      if (busy.length && !lastReply.skipped) lastReply.acts.forEach((a, i) => { const r = lastReply.results[i]; if (r && r.results.some((x) => x.ok)) movingIdx = i; });
+      movingShown = movingIdx >= 0;
+      const rows = lastReply.acts.map((a, i) => {
+        const r = lastReply.results[i];
+        const okN = r ? r.results.filter((x) => x.ok).length : 0;
+        const val = `${Math.round((a.intensity ?? 0.5) * 100)}%${a.durationMs ? ` · ${(a.durationMs / 1000).toFixed(a.durationMs % 1000 ? 1 : 0)}s` : ''}`;
+        let cls = 'node'; let c = 'on'; let mid = ''; let right = '';
+        if (lastReply.skipped) { c = 'warn'; right = `<span class="r m no">${esc(SKIP_ZH[lastReply.skipped] || lastReply.skipped)}</span>`; }
+        else if (!r) { cls += ' hol'; c = 'faint'; right = '<span class="r m">排队中</span>'; }
+        else if (!okN) { c = 'warn'; right = '<span class="r m no">没执行</span>'; }
+        else {
+          right = `<span class="r m">${okN} 路</span>`;
+          if (i === movingIdx) { cls += ' pulse toy'; c = 'toy'; mid = '<span class="m t">正在动</span>'; }
+        }
+        return `<div class="${cls}" style="--c:var(--${c})"><div class="th"><b>${esc(PAT_ZH[a.pattern] || a.pattern)}</b><span class="d">${val}</span>${mid}${right}</div></div>`;
+      });
+      el.lastact.innerHTML = '<div class="node hol"><div class="th"><span class="m">回复写完</span></div></div>'
+        + (rows.join('') || '<div class="node hol"><div class="th"><span class="m">这条回复没有动作</span></div></div>');
+    }
+    el.now.textContent = busy.length && !movingShown ? '正在动' : '';
     if (hostEl.classList.contains('devs')) {
       const OUT_ZH = { Vibrate: '振动', Oscillate: '往复', Rotate: '旋转', Constrict: '收缩', HwPositionWithDuration: '抽动', Position: '位置', Estim: '电刺激', Temperature: '加热' };
       const groups = {};
@@ -2799,6 +2884,7 @@ button:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
     const nctx = Object.keys(contextSources()).length; const nk = Object.keys(kinds()).length;
     el.foot.textContent = '';
     el.foot.title = `${state.samples.length} 个样本${nk ? ` · 另有 ${nk} 类信号` : ''}${nctx ? ` · ${nctx} 条设备状态` : ''}`;
+    syncMore();
   }
 
   // ---------- 公开接口与生命周期 ----------

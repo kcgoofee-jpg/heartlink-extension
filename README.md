@@ -36,13 +36,20 @@ https://github.com/kcgoofee-jpg/heartlink-extension
 
 点悬浮窗打开面板，分两个标签页；只用哪一类，悬浮窗就只显示哪一类。
 
-![悬浮窗](docs/panel-health.png) ![玩具](docs/panel-toys.png)
+<img src="docs/panel-health.png" alt="健康设备页" width="260"> <img src="docs/panel-toys.png" alt="玩具页" width="260">
 
 ### 健康设备（心率）
 
 1. 手环 / 心率带打开“心率广播”（WHOOP、Polar、多数心率带；部分手表在运动健康 App 里开）。
 2. 用**桌面版 Chrome 或 Edge**打开酒馆（Safari、iPhone 不支持网页蓝牙）。
 3. 悬浮窗 → 健康设备 → **连接设备**，在弹窗里选设备。
+4. 在“设置与连接”里选模式：
+
+| 模式 | 角色知道什么 |
+|---|---|
+| **幕后**（默认） | 什么都不知道，心率只影响写法 |
+| **入戏** | 能察觉你的身体表现（呼吸、脸色），不提数字和设备 |
+| **知情** | 知道你戴着设备，可以看数据、指导你，也可以明说是自己让玩具动的 |
 
 ### 哪些手环 / 手表能用
 
@@ -85,7 +92,7 @@ https://github.com/kcgoofee-jpg/heartlink-extension
 <bio_act pattern="wave" intensity="0.6" ms="5000"/>
 ```
 
-回复生成完后，heartlink 按你选的节奏执行。模式有 `pulse` `double` `triple` `long` `heartbeat` `wave`。不写 `output` 时驱动所有普通输出；加热、电刺激这类有风险的输出必须写明。详见 TBC 协议 §5。
+回复生成完后，heartlink 按你选的节奏执行。动作有 `pulse` `double` `triple` `long` `heartbeat` `wave`。不写 `output` 时驱动所有普通输出；加热、电刺激这类有风险的输出必须写明。详见 TBC 协议 §5。
 
 每轮注入的 `<bio_context>` 里有一行 `haptics(heartlink): on | cap 100% | profile frenzy`，卡片和预设可以据此决定要不要写动作。
 
