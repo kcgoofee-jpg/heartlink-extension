@@ -41,7 +41,7 @@ https://github.com/kcgoofee-jpg/heartlink-extension
 ### 健康设备（心率）
 
 1. 手环 / 心率带打开“心率广播”（WHOOP、Polar、多数心率带；部分手表在运动健康 App 里开）。
-2. 用**桌面版 Chrome 或 Edge**打开酒馆（Safari、iPhone 不支持网页蓝牙）。
+2. 用电脑或安卓手机上的 **Chrome / Edge** 打开酒馆（iPhone 和 Safari 暂不支持网页蓝牙）。
 3. 悬浮窗 → 健康设备 → **连接设备**，在弹窗里选设备。
 4. 在“设置与连接”里选模式：
 
@@ -80,7 +80,19 @@ https://github.com/kcgoofee-jpg/heartlink-extension
 1. 安装并打开 [Intiface Central](https://intiface.com/central/)，点 **Start Server**，在里面连上玩具（支持的型号见 buttplug 设备库）。
 2. 悬浮窗 → 玩具 → 打开 **剧情联动**，第一次会让你选节奏：**慢热**（从轻开始）、**持久**（中等强度、动得久）、**狂暴**（高触发、高功率）或 **极限**（几乎一直开满）。
 3. 点 **通过 Intiface**。显示“已连接 · N 路”即成功。
-4. 任何时候点 **全部停止**。页面关闭、Intiface 断开也会立即停。
+4. 任何时候点 **全部停止**，或者不打开面板直接停：输入 `/hl-stop`，或按 **Alt+Shift+S**。页面关闭、Intiface 断开也会立即停。
+
+玩具页最上面还有四个按钮，按一下立刻改设备，同时记下来告诉模型：
+
+| 按钮 | 做什么 |
+|---|---|
+| **弱一点 / 强一点** | 正在动的动作强度 −20 / +20 个百分点（最低到 0，0 就停下这一个）；这条回复里还没开始的动作也按这个量执行 |
+| **再来一次** | 重放最后执行的那个动作（照常受开关和间隔限制，太快会提示稍等） |
+| **跳过** | 停掉正在动的动作，排队的下一个在间隔允许时马上开始 |
+
+没有动作在动时只剩“再来一次”；按完会显示“✓ 已调强”之类约 2 秒，动作列表上会标出“强 +20%”“已跳过”。
+
+面板里的“设备”一节每台设备一张卡，每一路（振动、往复、旋转、加热……）跟着 heartlink 发出的档位实时动，显示当前档位。它画的是发出的指令，不代表设备真的执行了。超过两台时每台收成一行，点开看每一路。
 
 **浏览器直接连（测试）**：不装 Intiface，由 Chrome 直接用蓝牙连玩具。它运行的是 buttplug 官方的 WebAssembly 版本，能连的型号与 Intiface 相同；还没有经过真实设备测试，首次使用会加载约数 MB 的组件。
 
@@ -96,6 +108,19 @@ https://github.com/kcgoofee-jpg/heartlink-extension
 
 每轮注入的 `<bio_context>` 里有一行 `haptics(heartlink): on | cap 100% | profile frenzy`，卡片和预设可以据此决定要不要写动作。
 
+### 模型会收到你的反馈
+
+上一轮有动作执行过，或者你按过上面的按钮、全部停止、换过节奏，下一次发送时块里会多一行（TBC 协议 §5.12）：
+
+```
+feedback(heartlink): acts 3 sent, 1 done, 1 cut, 1 pending | stronger +20% read @41s (reply -1, act 2, 2.4s in) | skip read @55s (reply -1, act 3)
+```
+
+- `acts …`：上一条回复里的动作结局——走完 / 被停或被打断 / 发送时还在排队 / 被拒。
+- 后面每段是一次操作：谁（你、安全词、设备自己）、做了什么、在哪个阶段（`gen` 看生成、`read` 读回复、`write` 写消息、`send` 发送那一刻）第几秒、对应哪条回复的第几个动作。设备断开、到时自动停这类技术原因写成 `stop by device (disconnected)`。
+- 读法世界书会告诉模型：停止、跳过是“这一下不对”，调强、再来一次是“对了”，调弱是“方向对、力度过了”，设备原因不代表喜好。
+- 反馈只是记录，**不会自己触发新动作**；新的动作只来自模型的下一条回复。重新生成（swipe）时这一行照常带上，正常发送后清空。聊天变量 `bio.feedback.turn` 里也有同样的内容。
+
 ## 兼容提示
 
 - 读法世界书靠酒馆的“世界书扫描深度”触发（默认 2）。设成 0 时，模型收得到数据，但收不到读法说明。
@@ -104,7 +129,7 @@ https://github.com/kcgoofee-jpg/heartlink-extension
 ## 安全
 
 - 剧情联动默认关，你打开才会动。
-- “全部停止”随时可用；停止不经过模型。
+- “全部停止”随时可用；停止不经过模型。面板被别的插件盖住时，用 `/hl-stop` 或 Alt+Shift+S。
 - 安全词（消息里出现就全停）是可选功能，默认关。
 
 ## 隐私
@@ -113,7 +138,7 @@ https://github.com/kcgoofee-jpg/heartlink-extension
 
 ## 开发者接口
 
-页面上有 `window.tbc`（TBC 总线）与 `window.heartlink`。给角色助手 / 卡片用的只读接口：`tbc.outputState()`、`tbc.replyActs()`，事件 `bio:output-state`、`bio:reply-acts`。
+页面上有 `window.tbc`（TBC 总线）与 `window.heartlink`。给角色助手 / 卡片用的只读接口：`tbc.outputState()`、`tbc.replyActs()`（每条记录带 `feedback`）、`tbc.feedbackLog()`，事件 `bio:output-state`、`bio:reply-acts`、`bio:feedback`。遥控器、玩具 App 桥等可以用 `tbc.feedback({ t, from, type, … })` 报反馈（格式见协议 §5.12，不合规会被拒收）。
 
 ## 反馈
 

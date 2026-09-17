@@ -1,4 +1,4 @@
-// heartlink v0.17.3 — SillyTavern 扩展：心率注入 + 触觉输出（Tavern Bio-Context 参考实现）。构建产物。
+// heartlink v0.18.0 — SillyTavern 扩展：心率注入 + 触觉输出（Tavern Bio-Context 参考实现）。构建产物。
 // https://github.com/kcgoofee-jpg/heartlink-extension
 // heartlink core — 纯函数层。没有 DOM、没有蓝牙、没有酒馆 API，Node 和浏览器都能跑。
 // 运行时（runtime.js）和单元测试共用这一份。构建时与 runtime.js 拼成 dist/heartlink.js。
@@ -491,7 +491,7 @@ const HeartlinkCore = (() => {
   function buildDiagnostics(f) {
     const problems = [];
     const add = (code, severity, message, hint) => problems.push({ code, severity, message, hint });
-    if (!f.bluetooth && f.transport !== 'bridge' && f.transport !== 'bus') add('NO_BLUETOOTH', 'error', '这个浏览器不支持 Web Bluetooth', '用桌面版 Chrome 或 Edge 打开酒馆；手机和 Safari 暂不支持');
+    if (!f.bluetooth && f.transport !== 'bridge' && f.transport !== 'bus') add('NO_BLUETOOTH', 'error', '这个浏览器不支持网页蓝牙', '用电脑或安卓上的 Chrome / Edge 打开酒馆；iPhone 和 Safari 暂不支持');
     if (f.bluetooth && f.secureContext === false) add('INSECURE_CONTEXT', 'error', '页面不是安全上下文，蓝牙不可用', '用 https 或 localhost 打开酒馆');
     const hasData = f.lastSampleAgeMs != null;
     if (!f.connected && !hasData) add('NO_DEVICE', 'warn', '没有连接健康设备', '点悬浮窗 → 健康设备 → 连接设备；手环 / 心率带要先打开心率广播');
@@ -802,8 +802,150 @@ const HeartlinkCore = (() => {
     return { request, onVisible, stats: st };
   }
 
+  // ---------- v0.3 §5.12 设备反馈 ----------
+  // 事件发生时读者在哪个相位、相位开始后几秒（与块的相位边界一致：gen = 发送 → 回复出完；read = 回复出完 / 换页 → 开始打字；write = 开始打字 → 现在）
+  function phaseAt(events, t) {
+    let send = null, reply = null, chat = null;
+    for (const e of events || []) {
+      if (!e || e.t > t) continue;
+      if (e.type === 'send' && (send == null || e.t > send)) send = e.t;
+      else if ((e.type === 'reply_end') && (reply == null || e.t > reply)) reply = e.t;
+      else if ((e.type === 'chat_changed') && (chat == null || e.t > chat)) chat = e.t;
+    }
+    if (send != null && (reply == null || reply < send)) return { phase: 'gen', since: send, atSec: Math.max(0, Math.round((t - send) / 1000)) };
+    let readFrom = reply;
+    let typeFrom = null;
+    for (const e of events || []) {
+      if (!e || e.t > t) continue;
+      if (e.type === 'swipe' && readFrom != null && e.t > readFrom) readFrom = e.t;
+    }
+    const after = readFrom != null ? readFrom : (send != null ? send : -Infinity);
+    for (const e of events || []) if (e && e.type === 'type' && e.t > after && e.t <= t && (typeFrom == null || e.t < typeFrom)) typeFrom = e.t;
+    const at = (from) => Math.max(0, Math.round((t - from) / 1000));
+    if (typeFrom != null) return { phase: 'write', since: typeFrom, atSec: at(typeFrom) };
+    if (readFrom != null) return { phase: 'read', since: readFrom, atSec: at(readFrom) };
+    const from = chat != null ? chat : t;
+    return { phase: 'read', since: from, atSec: at(from) };
+  }
+  const FEEDBACK_FROM = ['reader', 'safeword', 'device'];
+  const FEEDBACK_TYPES = ['stop', 'stronger', 'weaker', 'pace', 'replay', 'skip'];
+  const FEEDBACK_REASONS = ['disconnected', 'deadline', 'heat-limit', 'rate-limit', 'other'];
+  const FEEDBACK_PACES = ['slow-burn', 'steady', 'frenzy', 'max'];
+  const FEEDBACK_KEYS = new Set(['t', 'from', 'type', 'value', 'target', 'act', 'reason']);
+  const FEEDBACK_MAX_EVENTS = 8;
+  // 按 spec/schema/feedback.schema.json 校验 tbc.feedback() 的参数：合规返回规整后的对象，否则 { error: 字段名 }
+  function validateFeedback(ev) {
+    const bad = (f) => ({ error: f });
+    if (!ev || typeof ev !== 'object' || Array.isArray(ev)) return bad('event');
+    for (const k of Object.keys(ev)) if (!FEEDBACK_KEYS.has(k)) return bad(k);
+    if (!Number.isInteger(ev.t) || ev.t < 0) return bad('t');
+    if (!FEEDBACK_FROM.includes(ev.from)) return bad('from');
+    if (!FEEDBACK_TYPES.includes(ev.type)) return bad('type');
+    const out = { t: ev.t, from: ev.from, type: ev.type };
+    const v = ev.value;
+    if (v !== undefined && v !== null && typeof v !== 'string' && !Number.isInteger(v)) return bad('value');
+    if (ev.type === 'stronger' || ev.type === 'weaker') { if (!Number.isInteger(v) || v < 1 || v > 100) return bad('value'); }
+    if (ev.type === 'pace' && !FEEDBACK_PACES.includes(v)) return bad('value');
+    if (v !== undefined) out.value = v;
+    if (ev.target !== undefined) {
+      if (ev.target !== null && (typeof ev.target !== 'string' || ev.target.length > 64)) return bad('target');
+      out.target = ev.target;
+    }
+    if (ev.act !== undefined) {
+      const a = ev.act;
+      if (a !== null) {
+        if (typeof a !== 'object' || Array.isArray(a)) return bad('act');
+        for (const k of Object.keys(a)) if (!['key', 'i', 'afterMs'].includes(k)) return bad('act.' + k);
+        if (typeof a.key !== 'string' || a.key.length > 64) return bad('act.key');
+        if (a.i !== undefined && (!Number.isInteger(a.i) || a.i < 0)) return bad('act.i');
+        if (a.afterMs !== undefined && (!Number.isInteger(a.afterMs) || a.afterMs < 0)) return bad('act.afterMs');
+        out.act = Object.assign({ key: a.key }, a.i !== undefined ? { i: a.i } : {}, a.afterMs !== undefined ? { afterMs: a.afterMs } : {});
+      } else out.act = null;
+    }
+    if (ev.reason !== undefined && ev.reason !== null && !FEEDBACK_REASONS.includes(ev.reason)) return bad('reason');
+    if (ev.from === 'device' && (typeof ev.reason !== 'string')) return bad('reason');
+    if (ev.reason !== undefined) out.reason = ev.reason;
+    return out;
+  }
+  // 一个事件 → feedback 行的一段；写不出合规的段时返回 null
+  //   e：validateFeedback 的结果，另带 phase / atSec（记录时算好）与 reply（reply -N 的 N，查不到为 null）
+  function feedbackSegment(e) {
+    let action;
+    if (e.type === 'stop') action = `stop by ${e.from}`;
+    else if (e.type === 'stronger') action = `stronger +${e.value}%`;
+    else if (e.type === 'weaker') action = `weaker -${e.value}%`;
+    else if (e.type === 'pace') action = `pace ${e.value}`;
+    else if (e.type === 'replay') { if (typeof e.value !== 'string' || !/^[a-z]+$/.test(e.value)) return null; action = `replay ${e.value}`; }
+    else if (e.type === 'skip') action = 'skip';
+    else return null;
+    const phase = ['gen', 'read', 'write', 'send'].includes(e.phase) ? e.phase : 'read';
+    const at = phase === 'send' ? 0 : Math.max(0, Math.round(Number(e.atSec) || 0));
+    const note = [];
+    if (e.type === 'stop' && e.from === 'device' && FEEDBACK_REASONS.includes(e.reason)) note.push(e.reason);
+    if (Number.isInteger(e.reply) && e.reply >= 1) {
+      let ref = `reply -${e.reply}`;
+      if (e.act && Number.isInteger(e.act.i)) {
+        ref += `, act ${e.act.i + 1}`;
+        if (Number.isInteger(e.act.afterMs)) {
+          const full = `${ref}, ${(Math.round(e.act.afterMs / 100) / 10).toFixed(1).replace(/\.0$/, '')}s in`;
+          if ([...note, full].join(', ').length <= 40) ref = full;
+        }
+      }
+      if ([...note, ref].join(', ').length <= 40) note.push(ref);
+    }
+    return `${action} ${phase} @${at}s${note.length ? ` (${note.join(', ')})` : ''}`;
+  }
+  // feedback 行（§5.12.2）：acts = { sent, done, cut, pending, refused } 或 null；events 按时间顺序；dropped = 缓冲区外已丢的事件数
+  // 既没有动作也没有事件时返回 null（不出现这一行）
+  function feedbackLine({ acts, events, dropped, source }) {
+    const segs = [];
+    if (acts && acts.sent > 0) {
+      const n = (k) => Math.max(0, Math.round(acts[k] || 0));
+      const sent = n('done') + n('cut') + n('pending') + n('refused');
+      let s = `acts ${sent} sent, ${n('done')} done`;
+      if (n('cut')) s += `, ${n('cut')} cut`;
+      if (n('pending')) s += `, ${n('pending')} pending`;
+      if (n('refused')) s += `, ${n('refused')} refused`;
+      segs.push(s);
+    }
+    const evSegs = (events || []).slice().sort((a, b) => a.t - b.t).map(feedbackSegment).filter(Boolean);
+    const more = Math.max(0, evSegs.length - FEEDBACK_MAX_EVENTS) + Math.max(0, Math.round(dropped || 0));
+    segs.push(...evSegs.slice(-FEEDBACK_MAX_EVENTS));
+    if (!segs.length) return null;
+    if (more) segs.push(`+${more} more`);
+    return `feedback(${isIdent(source) ? source : SOURCE}): ${segs.join(' | ')}`;
+  }
+
+  // 拖动悬浮窗：移动超过阈值才算拖动；每帧最多改一次位移（transform），松手时才提交位置
+  //   schedule(fn) / cancel(id)：requestAnimationFrame；apply(dx, dy)：写 transform；start()：开始拖动（收起面板、关模糊）；commit(dx, dy)：松手提交
+  function dragController({ schedule, cancel, apply, start, commit, threshold }) {
+    const th = threshold == null ? 5 : threshold;
+    let s = null;
+    const clampD = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+    function down(x, y, bounds) { s = { x, y, dx: 0, dy: 0, moving: false, raf: null, b: bounds || null, frames: 0 }; }
+    function flush() { if (!s) return; s.raf = null; s.frames++; apply(s.dx, s.dy); }
+    function move(x, y) {
+      if (!s) return false;
+      let dx = x - s.x; let dy = y - s.y;
+      if (!s.moving) { if (Math.hypot(dx, dy) < th) return false; s.moving = true; if (start) start(); }
+      if (s.b) { dx = clampD(dx, s.b.minX, s.b.maxX); dy = clampD(dy, s.b.minY, s.b.maxY); }
+      s.dx = dx; s.dy = dy;
+      if (s.raf == null) s.raf = schedule(flush);
+      return true;
+    }
+    function up() {
+      if (!s) return false;
+      const cur = s; s = null;
+      if (cur.raf != null && cancel) cancel(cur.raf);
+      if (!cur.moving) return false;
+      commit(cur.dx, cur.dy);
+      return true;
+    }
+    return { down, move, up, active: () => !!s, moving: () => !!(s && s.moving), frames: () => (s ? s.frames : 0) };
+  }
+
   return {
-    guideEntriesUpToDate, frameCoalescer,
+    guideEntriesUpToDate, frameCoalescer, phaseAt, validateFeedback, feedbackSegment, feedbackLine, dragController, FEEDBACK_MAX_EVENTS,
     CONFIG, SPEC_VERSION, SOURCE, MODES,
     parseHeartRate, inWin, stats, series, isFresh, fmtClock, fmtDur,
     collectRR, rmssd, hrvInWindow,
@@ -989,30 +1131,47 @@ const HeartlinkHaptics = (() => {
   }
 
   // 执行器登记表：register / unregister / list / actuate / stop / runReplyActs
-  function createRegistry({ timers, now, emit, policy, log }) {
+  // 0.18：每个动作的结局经 onAct 报出（§5.12 acts 段）；adjust 改正在动的强度、skip 跳到下一个、running 列出正在动的
+  //   onAct({ type: 'start' | 'end' | 'refused', source, act, t, how: 'done' | 'cut', reason, ids, heatLimit })
+  //   reason（cut 时）：stop 读者全部停止 | skip | weaker（调到 0）| superseded（被新动作打断）| deadline（看门狗）| disconnected | other
+  function createRegistry({ timers, now, emit, policy, log, onAct }) {
     const T = timers;
     const items = new Map();   // id → { caps, handler, lastAt, run }
-    const queued = new Set();  // 回复里排队、还没开始的动作（timer id）；全部停止时一并取消
+    const queue = [];          // 回复里排队、还没开始的动作：{ tid, at, act, idx, source }；全部停止时一并取消
+    const deltas = new Map();  // source → 读者对这条回复的强度调整（加在安全闸门之后，§5.12）
     let last = null;
     let lastOk = null;   // 块里的 device 行用最近一次成功的触发
+    let groupSeq = 0;
+    const report = (ev) => { if (typeof onAct === 'function') { try { onAct(ev); } catch (err) { log('onAct failed', err && err.message); } } };
+    const clamp01 = (v) => Math.min(1, Math.max(0, v));
 
     function register(id, caps, handler) {
       if (!id || !caps || !Array.isArray(caps.outputs) || !caps.outputs.length) throw new Error('tbc.registerActuator: need (id, { outputs: [...] }, handler)');
       if (typeof handler !== 'function') throw new Error('tbc.registerActuator: handler must be a function');
       const prev = items.get(id);
-      if (prev && prev.run) prev.run.cancel();
+      if (prev && prev.run) prev.run.cancel('other');
       items.set(String(id), { caps: Object.assign({ patterns: PATTERNS.slice(), levels: true, minIntervalMs: DEFAULT_MIN_INTERVAL_MS }, caps), handler, lastAt: prev ? prev.lastAt : null, run: null });
       emit('bio:actuators', list());
     }
     function unregister(id) {
       const it = items.get(String(id));
       if (!it) return;
-      stopOne(String(id), it);
+      stopOne(String(id), it, 'disconnected');
       items.delete(String(id));
+      if (!items.size) for (const q of queue.slice()) dropQueued(q, 'disconnected');   // 设备都没了：排队的也作废
       emit('bio:actuators', list());
     }
     function list() {
       return [...items.entries()].map(([id, it]) => Object.assign({ id }, it.caps, { busy: !!it.run }));
+    }
+    // 正在动的：{ id, source, act, intensity, base, startedAt, spanMs, output }
+    function running() {
+      const out = [];
+      for (const [id, it] of items) {
+        const r = it.run; if (!r) continue;
+        out.push({ id, source: r.source, act: r.act, intensity: r.cur, base: r.base, startedAt: r.startedAt, spanMs: r.span, output: r.output });
+      }
+      return out;
     }
     // 用户关掉的执行器（policy().off）不参与匹配
     function matches(target, output) {
@@ -1020,55 +1179,119 @@ const HeartlinkHaptics = (() => {
       if (target && target !== '*') { const it = items.get(target); return it && !off.has(target) ? [[target, it]] : []; }
       return [...items.entries()].filter(([id, it]) => !off.has(id) && ((output === '*' || !output) ? !onlyRisky(it.caps) : it.caps.outputs.includes(output)));
     }
-    function stopOne(id, it) {
-      if (it.run) { it.run.cancel(); it.run = null; }
+    function stopOne(id, it, reason) {
+      if (it.run) { it.run.cancel(reason || 'stop'); it.run = null; }
       try { const r = it.handler({ stop: true }); if (r && r.catch) r.catch(() => {}); } catch (_) {}
     }
-    function stop(id) {
-      if (id) { const it = items.get(String(id)); if (it) stopOne(String(id), it); }
+    function dropQueued(q, reason) {
+      T.clearTimeout(q.tid);
+      const k = queue.indexOf(q); if (k >= 0) queue.splice(k, 1);
+      report({ type: 'end', source: q.source, act: q.idx, t: now(), how: 'cut', reason, queued: true });
+    }
+    // reason 缺省 stop（读者全部停止）；设备侧停止由调用方写 disconnected 等
+    function stop(id, reason) {
+      if (id) { const it = items.get(String(id)); if (it) stopOne(String(id), it, reason); }
       else {
-        for (const x of queued) T.clearTimeout(x);
-        queued.clear();
-        for (const [k, it] of items) stopOne(k, it);
+        for (const q of queue.slice()) dropQueued(q, reason || 'stop');
+        for (const [k, it] of items) stopOne(k, it, reason);
       }
       emit('bio:actuate', { t: now(), target: id || '*', action: { stop: true }, results: [], source: 'stop' });
     }
 
     async function actuate(target, action, opts) {
       const a = Object.assign({ output: '*', pattern: 'pulse' }, action || {});
-      const source = (opts && opts.source) || 'api';
+      const o = opts || {};
+      const source = o.source || 'api';
+      const actIdx = Number.isInteger(o.act) ? o.act : null;
+      const delta = Number.isFinite(o.delta) ? o.delta : (deltas.get(source) || 0);
       const hits = matches(target || '*', a.output);
-      if (!hits.length) return { ok: false, refused: 'unknown-target' };
+      if (!hits.length) {
+        if (actIdx != null) report({ type: 'refused', source, act: actIdx, t: now(), reason: 'unknown-target' });
+        return { ok: false, refused: 'unknown-target' };
+      }
       const t = now();
+      const pol = policy() || {};
       const results = [];
+      const group = { id: ++groupSeq, source, act: actIdx, live: 0, how: 'done', reason: null, heatLimit: false, ids: [] };
+      const endRun = (how, reason, heat) => {
+        group.live--;
+        if (how === 'cut' && group.how !== 'cut') { group.how = 'cut'; group.reason = reason || 'other'; }
+        if (heat) group.heatLimit = true;
+        if (group.live === 0 && actIdx != null) report({ type: 'end', source, act: actIdx, t: now(), how: group.how, reason: group.reason, ids: group.ids, heatLimit: group.heatLimit });
+      };
       for (const [id, it] of hits) {
-        const g = gate({ now: t, policy: policy(), caps: it.caps, lastAt: it.lastAt, action: a });
+        const g = gate({ now: t, policy: pol, caps: it.caps, lastAt: it.lastAt, action: a });
         if (g.refused) { results.push({ id, ok: false, refused: g.refused, retryInMs: g.retryInMs }); continue; }
-        const frames = patternFrames(g.pattern, g.intensity, g.durationMs, { defaultMs: (policy() || {}).defaultMs });
+        const cap = Math.min(it.caps.maxIntensity == null ? 1 : it.caps.maxIntensity, pol.maxIntensity == null ? 1 : pol.maxIntensity);
+        const eff = delta ? Math.round(Math.min(cap, clamp01(g.intensity + delta)) * 1000) / 1000 : g.intensity;
+        const frames = patternFrames(g.pattern, eff, g.durationMs, { defaultMs: pol.defaultMs });
         const span = frames[frames.length - 1][0];
         const deadline = t + span + 1000;
-        if (it.run) it.run.cancel();
+        if (it.run) it.run.cancel('superseded');
         it.lastAt = t;
-        const job = { action: Object.assign({}, a, { pattern: g.pattern, intensity: g.intensity, durationMs: g.durationMs }), frames, deadline };
+        const heat = it.caps.outputs.includes('Temperature') && !!(g.clipped && g.clipped.durationMs);
+        const gainFns = [];
+        const job = { action: Object.assign({}, a, { pattern: g.pattern, intensity: eff, durationMs: g.durationMs }), frames, deadline,
+          gain: () => (run.base > 0 ? run.cur / run.base : 1), onGain: (fn) => { if (typeof fn === 'function') gainFns.push(fn); } };
         let finished = false;
-        const watchdog = T.setTimeout(() => { if (!finished) { log('watchdog stop', id); stopOne(id, it); } }, span + 1000);
         const cancelInner = { cancel() {} };
-        it.run = { cancel() { finished = true; T.clearTimeout(watchdog); cancelInner.cancel(); } };
+        const finish = (how, reason) => {
+          if (finished) return;
+          finished = true; T.clearTimeout(watchdog);
+          if (items.get(id) === it && it.run === run) it.run = null;
+          endRun(how, reason, how === 'done' && heat);
+        };
+        const run = {
+          source, act: actIdx, base: eff, cur: eff, cap, startedAt: t, span, output: a.output,
+          cancel(reason) { if (finished) return; cancelInner.cancel(); finish('cut', reason); },
+          applyGain() { for (const fn of gainFns) { try { fn(job.gain()); } catch (_) {} } },
+        };
+        const watchdog = T.setTimeout(() => { if (!finished) { log('watchdog stop', id); stopOne(id, it, 'deadline'); } }, span + 1000);
+        it.run = run;
+        group.live++; group.ids.push(id);
         Promise.resolve()
           .then(() => it.handler(Object.assign(job, { bindCancel: (fn) => { cancelInner.cancel = fn; } })))
-          .catch((err) => log('actuator failed', id, err && err.message))
-          .then(() => { finished = true; T.clearTimeout(watchdog); if (items.get(id) === it) it.run = null; });
+          .then(() => finish('done'), (err) => { log('actuator failed', id, err && err.message); finish('cut', 'other'); });
         const res = { id, ok: true };
         if (g.clipped) res.clipped = g.clipped;
         if (g.fallback) res.fallback = g.fallback;
+        if (delta) res.adjusted = eff;
         results.push(res);
       }
       const ok = results.some((r) => r.ok);
       last = { t, target: target || '*', action: a, results, source };
-      if (results.some((r) => r.ok)) lastOk = last;
+      if (actIdx != null) last.act = actIdx;
+      if (ok) lastOk = last;
       emit('bio:actuate', last);
+      if (actIdx != null) {
+        if (ok) report({ type: 'start', source, act: actIdx, t, ids: group.ids.slice() });
+        else report({ type: 'refused', source, act: actIdx, t, reason: results[0].refused });
+      }
       if (ok) return { ok: true, results };
       return { ok: false, refused: results[0].refused, results };
+    }
+
+    // 某个动作最早什么时候能开始（各执行器的最小间隔）
+    function readyAt(act) {
+      const pol = policy() || {};
+      const hits = matches(act.target, act.output);
+      if (!hits.length) return now();
+      const gap = Math.max(...hits.map(([, it]) => intervalFor(it.caps, pol)));
+      return Math.max(now(), ...hits.map(([, it]) => (it.lastAt == null ? 0 : it.lastAt + gap + 50)));
+    }
+    function fire(q) {
+      // 读者插进来的重放等占用了执行器：顺延到最小间隔允许时（最多顺延 10 秒，再不行就照常执行、由闸门拒绝）
+      const ready = readyAt(q.act);
+      if (ready > now() + 20 && now() - (q.firstAt || now()) < 10000) { if (!q.firstAt) q.firstAt = now(); schedule(q, ready); return; }
+      const k = queue.indexOf(q); if (k >= 0) queue.splice(k, 1);
+      const d = deltas.get(q.source) || 0;
+      if (d < 0 && liftIntensity(q.act.intensity, (policy() || {}).floor || 0) + d <= 0) { report({ type: 'end', source: q.source, act: q.idx, t: now(), how: 'cut', reason: 'weaker', queued: true }); return; }
+      actuate(q.act.target, q.act, { source: q.source, act: q.idx });
+    }
+    function schedule(q, at) {
+      if (q.tid != null) T.clearTimeout(q.tid);
+      q.at = at;
+      q.tid = T.setTimeout(() => fire(q), Math.max(0, at - now()));
     }
 
     // 回复里的 <bio_act/>：按顺序排队，同一执行器之间等够最小间隔（一条回复最多 3 个，档位或用户可改到 5）
@@ -1079,21 +1302,59 @@ const HeartlinkHaptics = (() => {
       let first = true;
       const pol = policy() || {};
       const limit = Number.isInteger(pol.maxPerReply) ? Math.min(MAX_PER_REPLY_LIMIT, pol.maxPerReply) : MAX_PER_REPLY;
-      for (const act of acts.slice(0, limit)) {
+      const t0 = now();
+      acts.slice(0, limit).forEach((act, idx) => {
         const hits = matches(act.target, act.output);
-        if (!hits.length) continue;
+        if (!hits.length) { report({ type: 'refused', source, act: idx, t: t0, reason: 'unknown-target' }); return; }
         const gap = Math.max(...hits.map(([, it]) => intervalFor(it.caps, pol)));
         const ready = Math.max(0, ...hits.map(([, it]) => (it.lastAt == null ? 0 : it.lastAt + gap - now() + 50)));
         const at = first ? ready : Math.max(ready, prevAt + Math.max(gap, prevSpan + 300) + 50);
         const frames = patternFrames(act.pattern, act.intensity, act.durationMs, { defaultMs: pol.defaultMs });
-        const tid = T.setTimeout(() => { queued.delete(tid); actuate(act.target, act, { source }); }, at);
-        queued.add(tid); ids.push(tid);
+        const q = { tid: null, at: 0, act, idx, source };
+        queue.push(q);
+        schedule(q, t0 + at);
+        ids.push(q);
         prevAt = at; prevSpan = frames[frames.length - 1][0]; first = false;
-      }
-      return { scheduled: ids.length, cancel() { ids.forEach((x) => { T.clearTimeout(x); queued.delete(x); }); } };
+      });
+      return { scheduled: ids.length, cancel() { ids.forEach((q) => { if (queue.includes(q)) dropQueued(q, 'stop'); }); } };
     }
 
-    return { register, unregister, list, actuate, stop, runReplyActs, pending: () => queued.size, last: () => last, lastOk: () => lastOk };
+    // 读者调强 / 调弱（百分点，−1…1）：正在动的立即改；同一回复里还没开始的动作也按这个量执行；调到 0 等于停下这一个
+    function adjust(delta, source) {
+      const d = Number(delta) || 0;
+      let n = 0; let level = null; const cut = [];
+      for (const [id, it] of items) {
+        const r = it.run;
+        if (!r || (source && r.source !== source)) continue;
+        n++;
+        r.cur = Math.round(Math.min(r.cap, clamp01(r.cur + d)) * 1000) / 1000;
+        level = r.cur;
+        if (r.cur <= 0) { cut.push(r.act); stopOne(id, it, 'weaker'); } else r.applyGain();
+      }
+      if (source) deltas.set(source, Math.max(-1, Math.min(1, (deltas.get(source) || 0) + d)));
+      return { running: n, queued: queue.filter((q) => !source || q.source === source).length, level, cut };
+    }
+    // 跳过：停掉正在动的（没有在动时跳过下一个排队的），后面排队的提前到最小间隔允许的时刻
+    function skip(source) {
+      const skipped = [];
+      for (const [id, it] of items) {
+        const r = it.run;
+        if (!r || (source && r.source !== source)) continue;
+        if (!skipped.some((x) => x.source === r.source && x.act === r.act)) skipped.push({ source: r.source, act: r.act });
+        stopOne(id, it, 'skip');
+      }
+      const rest = queue.filter((q) => !source || q.source === source).sort((a, b) => a.at - b.at);
+      if (!skipped.length && rest.length) { const q = rest.shift(); skipped.push({ source: q.source, act: q.idx }); dropQueued(q, 'skip'); }
+      if (rest.length) {
+        const shift = rest[0].at - readyAt(rest[0].act);
+        if (shift > 0) for (const q of rest) schedule(q, q.at - shift);
+      }
+      return { skipped, next: rest.length ? rest[0].idx : null };
+    }
+
+    return { register, unregister, list, actuate, stop, runReplyActs, adjust, skip, running,
+      pending: () => queue.length, queued: () => queue.map((q) => ({ source: q.source, act: q.idx, at: q.at })),
+      delta: (source) => deltas.get(source) || 0, last: () => last, lastOk: () => lastOk };
   }
 
   // ---------- Intiface / buttplug ----------
@@ -1281,12 +1542,13 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
 //   getHistory()                         本聊天最近 20 轮摘要（也在聊天变量 bio.turns）
 //   exportCsv()                          本聊天每轮摘要的 CSV 文本
 //   exportEvents()                       { events, samples } 的 JSON 字符串
+//   haltAll() / quickFeedback('weaker'|'stronger'|'replay'|'skip') / feedbackLine()   0.18：玩具页按钮同一路径；也可用 /hl-stop、Alt+Shift+S
 //   destroy()
-// 页面事件（主窗口 dispatchEvent）：bio:sample { t, bpm, rr }；bio:inject { text, mode, summary }；bio:state getState()
+// 页面事件（主窗口 dispatchEvent）：bio:sample { t, bpm, rr }；bio:inject { text, mode, summary }；bio:state getState()；bio:feedback（TBC v0.3 §5.12）
 (function heartlinkRuntime() {
   'use strict';
 
-  const VERSION = '0.17.3';
+  const VERSION = '0.18.0';
   const CONFIG = {
     RUNTIME_KEY: '__HEARTLINK_RUNTIME__',
     PUBLIC_KEY: 'heartlink',
@@ -1330,8 +1592,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     LAB_URL: 'http://127.0.0.1:12346/lab/',   // 设备实验室（~/dev/tbc/device-lab，npm run sim）
   };
   const LOG = '[heartlink]';
-  const GUIDE_BOOK = [{"name":"00 bio_context 读法","enabled":true,"content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","strategy":{"type":"selective","keys":["<bio_context"]},"position":{"type":"after_character_definition","order":100},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.17.3"}},{"name":"10 view=backstage 幕后（旧 mode=author）","enabled":true,"content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","strategy":{"type":"selective","keys":["view=\"backstage\"","mode=\"author\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.17.3"}},{"name":"11 view=in-story 入戏（旧 mode=character）","enabled":true,"content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","strategy":{"type":"selective","keys":["view=\"in-story\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.17.3"}},{"name":"12 view=device-aware 知情","enabled":true,"content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","strategy":{"type":"selective","keys":["view=\"device-aware\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.17.3"}}];
-  const GUIDE_BOOK_NATIVE = [{"uid":0,"key":["<bio_context"],"keysecondary":[],"comment":"00 bio_context 读法","content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":100,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":0,"heartlink":"0.17.3"},{"uid":1,"key":["view=\"backstage\"","mode=\"author\""],"keysecondary":[],"comment":"10 view=backstage 幕后（旧 mode=author）","content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":1,"heartlink":"0.17.3"},{"uid":2,"key":["view=\"in-story\""],"keysecondary":[],"comment":"11 view=in-story 入戏（旧 mode=character）","content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":2,"heartlink":"0.17.3"},{"uid":3,"key":["view=\"device-aware\""],"keysecondary":[],"comment":"12 view=device-aware 知情","content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":3,"heartlink":"0.17.3"}];
+  const GUIDE_BOOK = [{"name":"00 bio_context 读法","enabled":true,"content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","strategy":{"type":"selective","keys":["<bio_context"]},"position":{"type":"after_character_definition","order":100},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.18.0"}},{"name":"10 view=backstage 幕后（旧 mode=author）","enabled":true,"content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","strategy":{"type":"selective","keys":["view=\"backstage\"","mode=\"author\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.18.0"}},{"name":"11 view=in-story 入戏（旧 mode=character）","enabled":true,"content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","strategy":{"type":"selective","keys":["view=\"in-story\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.18.0"}},{"name":"12 view=device-aware 知情","enabled":true,"content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","strategy":{"type":"selective","keys":["view=\"device-aware\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.18.0"}},{"name":"20 feedback 读法","enabled":true,"content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","strategy":{"type":"selective","keys":["feedback("]},"position":{"type":"after_character_definition","order":101},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.18.0"}}];
+  const GUIDE_BOOK_NATIVE = [{"uid":0,"key":["<bio_context"],"keysecondary":[],"comment":"00 bio_context 读法","content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":100,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":0,"heartlink":"0.18.0"},{"uid":1,"key":["view=\"backstage\"","mode=\"author\""],"keysecondary":[],"comment":"10 view=backstage 幕后（旧 mode=author）","content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":1,"heartlink":"0.18.0"},{"uid":2,"key":["view=\"in-story\""],"keysecondary":[],"comment":"11 view=in-story 入戏（旧 mode=character）","content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":2,"heartlink":"0.18.0"},{"uid":3,"key":["view=\"device-aware\""],"keysecondary":[],"comment":"12 view=device-aware 知情","content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":3,"heartlink":"0.18.0"},{"uid":4,"key":["feedback("],"keysecondary":[],"comment":"20 feedback 读法","content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":101,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":4,"heartlink":"0.18.0"}];
   // 1.0：同一份源码构建两种形态——'script' 酒馆助手全局脚本（旧），'extension' 酒馆扩展
   const FORM = 'extension';
   // 开发者工具（设备模拟器按钮等）：发布版关闭
@@ -1422,9 +1684,30 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     try { host.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify({ manualBaseline: state.manualBaseline, modes: state.modes, deviceName: state.deviceName, prior: state.prior || null, injectEnabled: state.injectEnabled !== false, privacyAck: !!state.privacyAck, haptics: state.haptics, badgePos: state.badgePos || null, badgeHidden: !!state.badgeHidden, settingsFolded: !!state.settingsFolded, playSeen: !!state.playSeen, guideWrote: state.guideWrote || null })); }
     catch (err) { console.warn(LOG, 'saveSettings failed', err); }
   }
+  // 提示合并（0.18，手机上一串提示会盖住面板）：4 秒内的新提示替换上一条，两条合成一条；同样的话不重复弹
+  const TOAST_MERGE_MS = 4000;
+  const TOAST_RANK = { success: 0, info: 1, warning: 2, error: 3 };
+  let lastToast = null;
   function toast(kind, text) {
-    try { if (typeof toastr !== 'undefined' && toastr[kind]) { toastr[kind](text, 'heartlink'); return; } } catch (_) {}
-    console.log(LOG, kind, text);
+    const msg = String(text == null ? '' : text);
+    const now = Date.now();
+    try {
+      if (typeof toastr !== 'undefined' && toastr[kind]) {
+        let show = msg; let k = kind;
+        const prev = lastToast && now - lastToast.at < TOAST_MERGE_MS ? lastToast : null;
+        if (prev) {
+          if (prev.text === msg || prev.shown.includes(msg)) { prev.at = now; return; }
+          try { if (prev.el && typeof toastr.clear === 'function') toastr.clear(prev.el, { force: true }); } catch (_) {}
+          const merged = `${prev.text}；${msg}`;
+          if (merged.length <= 90) show = merged;
+          if ((TOAST_RANK[prev.kind] || 0) > (TOAST_RANK[k] || 0) && show === merged) k = prev.kind;
+        }
+        const el = toastr[k](show, 'heartlink', { preventDuplicates: true, timeOut: show.length > 40 ? 6000 : 3500 });
+        lastToast = { el, kind: k, text: msg, shown: show, at: now };
+        return;
+      }
+    } catch (_) {}
+    console.log(LOG, kind, msg);
   }
   function ctx() { try { return host.SillyTavern.getContext(); } catch (_) { return null; } }
   function chatId() { const c = ctx(); return (c && c.chatId) || 'default'; }
@@ -1853,30 +2136,47 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       bridgeSend({ event: 'bio:actuate', detail });
       const src = String(detail.source || '');
       if (src.startsWith('reply:')) {
-        const e = (state.replyLog || []).find((x) => x.key === src.slice(6));
-        if (e) { e.results.push({ t: detail.t, pattern: detail.action.pattern, results: detail.results }); emit('bio:reply-acts', e); }
+        const e = entryBySource(src);
+        if (e) {
+          const rec = { t: detail.t, pattern: detail.action.pattern, results: detail.results };
+          // 按动作序号放（§5.11 results 与 acts 一一对应；没排上的动作留空）
+          if (Number.isInteger(detail.act)) { while (e.results.length < detail.act) e.results.push(null); e.results[detail.act] = rec; }
+          else e.results.push(rec);
+          emit('bio:reply-acts', e);
+        }
       }
       render();
     },
+    onAct: (ev) => onActEvent(ev),
     log: (...a) => console.warn(LOG, ...a),
   });
   const toyFeatures = new Map();   // key → feature（带 driver：intiface 或 wasm）
+  const toyLevels = new Map();     // key → 最近一次发出的档位（0–1，设备卡的实时动效只画这个，不代表设备真的执行了）
   let intiface = null;
   // 每个来源（intiface / wasm）各自同步自己的特性，互不影响
   function syncToys(source, driver, features) {
     const keep = new Set(features.map((f) => f.key));
-    for (const [key, f] of [...toyFeatures.entries()]) if (f.source === source && !keep.has(key)) { toyFeatures.delete(key); actuators.unregister(key); }
+    for (const [key, f] of [...toyFeatures.entries()]) if (f.source === source && !keep.has(key)) { toyFeatures.delete(key); toyLevels.delete(key); actuators.unregister(key); }
     for (const f0 of features) {
       if (toyFeatures.has(f0.key)) continue;
       const f = Object.assign({ source }, f0);
       toyFeatures.set(f.key, f);
       // 按位置控制的抽动类用抽动器把强度换成往返速度；其余直接按强度设值
       const stroker = f.mode === 'position' ? HeartlinkHaptics.createStroker({ move: (pos, ms) => driver.alive() && driver.setPosition(f, pos, ms), timers: hTimers }) : null;
-      const setLevel = (lv) => { if (!driver.alive()) return; if (stroker) stroker.setLevel(lv); else driver.setLevel(f, lv); };
+      const setLevel = (lv) => {
+        if (!driver.alive()) return;
+        const L = Math.max(0, Math.min(1, Number(lv) || 0));
+        toyLevels.set(f.key, L); devKick();
+        if (stroker) stroker.setLevel(L); else driver.setLevel(f, L);
+      };
       actuators.register(f.key, Object.assign({ outputs: [f.output], device: `${f.name}${f.feature ? ' ' + f.feature : ''}`.slice(0, 64) }, CONFIG.TOY_CAPS, { via: source === 'wasm' ? 'page' : 'intiface' }), (job) => {
         if (!driver.alive()) return;
-        if (job.stop) { if (stroker) stroker.stop(); driver.stop(f); return; }
-        const run = HeartlinkHaptics.playFrames(job.frames, setLevel, hTimers);
+        if (job.stop) { toyLevels.set(f.key, 0); devKick(); if (stroker) stroker.stop(); driver.stop(f); return; }
+        // 读者调强调弱（§5.12）：帧按比例缩放，改动立即作用到当前档位
+        let cur = 0;
+        const gain = () => (typeof job.gain === 'function' ? job.gain() : 1);
+        const run = HeartlinkHaptics.playFrames(job.frames, (lv) => { cur = lv; setLevel(lv * gain()); }, hTimers);
+        if (typeof job.onGain === 'function') job.onGain((g) => { if (cur > 0) setLevel(cur * g); });
         job.bindCancel(() => { run.cancel(); setLevel(0); });
         return run.done;
       });
@@ -1892,7 +2192,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       onStatus: (st, detail) => {
         const was = state.intifaceStatus; state.intifaceStatus = st; state.intifaceDetail = detail || null;
         if (st === 'connected' && was !== 'connected') toast('success', `已连上 Intiface（协议 v${detail && detail.version}）`);
-        if (st === 'disconnected' && was === 'connected') { actuators.stop(); toast('warning', 'Intiface 断开了，设备已停；会自动重连'); }
+        if (st === 'disconnected' && was === 'connected') { actuators.stop(undefined, 'disconnected'); toast('warning', 'Intiface 断开了，设备已停，正在重连'); }
         render();
       },
       log: (...a) => console.warn(LOG, ...a),
@@ -1908,7 +2208,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
   }
 
   // ---------- 实验：浏览器内直连（buttplug-wasm，不用装 Intiface） ----------
-  // 未经真实设备测试。设备库与 Intiface 相同；需要桌面 Chrome / Edge；必须由用户点击触发。
+  // 未经真实设备测试。设备库与 Intiface 相同；需要电脑或安卓上的 Chrome / Edge；必须由用户点击触发。
   const WASM = { client: null, lib: null, devices: new Map(), status: 'idle' };
   const OUT_TYPES = ['Vibrate', 'Rotate', 'Oscillate', 'Constrict', 'HwPositionWithDuration', 'Position'];
   const wasmDriver = {
@@ -1937,7 +2237,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     return out;
   }
   async function startWasm() {
-    if (!host.navigator || !host.navigator.bluetooth) { toast('error', '这个浏览器不支持网页蓝牙，请用桌面 Chrome / Edge'); return; }
+    if (!host.navigator || !host.navigator.bluetooth) { toast('error', NO_BT_TEXT); return; }
     try {
       WASM.status = 'loading'; render();
       if (!WASM.lib) {
@@ -1947,8 +2247,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       if (!WASM.client) {
         const client = new WASM.lib.ButtplugClient(`heartlink ${VERSION}`);
         client.addListener('deviceadded', (d) => { WASM.devices.set(d.index, d); syncToys('wasm', wasmDriver, wasmFeatures()); toast('success', `已直连：${d.displayName || d.name}`); });
-        client.addListener('deviceremoved', (d) => { WASM.devices.delete(d.index); actuators.stop(); syncToys('wasm', wasmDriver, wasmFeatures()); });
-        client.addListener('disconnect', () => { WASM.devices.clear(); actuators.stop(); syncToys('wasm', wasmDriver, []); WASM.status = 'idle'; render(); });
+        client.addListener('deviceremoved', (d) => { WASM.devices.delete(d.index); actuators.stop(undefined, 'disconnected'); syncToys('wasm', wasmDriver, wasmFeatures()); });
+        client.addListener('disconnect', () => { WASM.devices.clear(); actuators.stop(undefined, 'disconnected'); syncToys('wasm', wasmDriver, []); WASM.status = 'idle'; render(); });
         await client.connect(new WASM.lib.WasmConnector());
         WASM.client = client;
       }
@@ -1956,7 +2256,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       await WASM.client.startScanning();   // 浏览器弹出选设备窗口
     } catch (err) {
       WASM.status = 'error'; render();
-      toast('error', '直连失败：' + (err && err.message || err) + '。可以改用 Intiface。');
+      toast('error', `直连失败：${err && err.message || err}。可改用 Intiface`);
     }
   }
   async function stopWasm() {
@@ -2009,14 +2309,16 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       const c = ctx();
       if (c && typeof c.callGenericPopup === 'function') {
         const html = '<h3>选一个节奏</h3><p><b>慢热</b>：从轻开始，逐步升温。<br><b>持久</b>：中等强度，每次动得久。<br><b>狂暴</b>：高触发、高功率。<br><b>极限</b>：几乎一直开满。</p><p>之后可在玩具页随时切换。</p>';
-        const r = await c.callGenericPopup(html, (c.POPUP_TYPE && c.POPUP_TYPE.TEXT) || 1, '', { okButton: '慢热', customButtons: [{ text: '持久', result: 11 }, { text: '狂暴', result: 12 }, { text: '极限', result: 13 }] });
+        // 自定义按钮排在确定按钮前面（ST popup.js insertBefore okButton），所以四档都用自定义按钮、隐藏确定，顺序才是 慢热 持久 狂暴 极限
+        const r = await c.callGenericPopup(html, (c.POPUP_TYPE && c.POPUP_TYPE.TEXT) || 1, '', { okButton: false, customButtons: PACE_BUTTONS });
         pick = { 11: 'steady', 12: 'frenzy', 13: 'max' }[r] || 'slow-burn';
       }
     } catch (_) {}
     setHaptics({ profile: pick });
-    toast('info', `节奏：${PROFILE_ZH[pick]}（之后可在玩具页切换）`);
+    toast('info', `节奏：${PROFILE_ZH[pick]}，可在玩具页切换`);
   }
   const PROFILE_ZH = { 'slow-burn': '慢热', steady: '持久', frenzy: '狂暴', max: '极限' };
+  const PACE_BUTTONS = [{ text: '慢热', result: 10 }, { text: '持久', result: 11 }, { text: '狂暴', result: 12 }, { text: '极限', result: 13 }];
   // 块里的 device 行：最近一次触发（§5.1）
   function actuationLine() {
     const last = actuators.lastOk();
@@ -2031,13 +2333,132 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
   }
   // 用户可见生成结束后：执行最新回复里的 <bio_act/>
   // replyLog：每条回复里的 <bio_act/> 与执行结果，给美化层显示（“在哪里看”）
-  function replyEntry(key, index, acts, errors, skipped) {
+  // key：r<消息序号>s<滑动页>[c<续写起点>]n<流水号>（§5.12 act.key 最长 64；同一条记录不变）
+  // 不可枚举的字段只给界面和 feedback 行用，不进 replyActs()：base（同一条消息同一滑动页）、outcome（每个动作的结局）、adj / tagT / skipIdx（读者调整）
+  function replyEntry(key, index, acts, errors, skipped, base) {
     const log = state.replyLog || (state.replyLog = []);
-    const e = { key, chatId: chatId(), index, t: Date.now(), acts, errors: errors.map((x) => x.code), skipped: skipped || null, results: [] };
+    const e = { key, chatId: chatId(), index, t: Date.now(), acts, errors: errors.map((x) => x.code), skipped: skipped || null, results: [], feedback: [] };
+    const hidden = { base, src: `reply:${key}`, outcome: acts.map(() => (skipped ? null : 'pending')), adj: acts.map(() => 0), tagT: acts.map(() => 0), skipIdx: new Set() };
+    for (const [k, v] of Object.entries(hidden)) Object.defineProperty(e, k, { value: v, enumerable: false, writable: true });
     log.push(e);
     if (log.length > 60) log.splice(0, log.length - 60);
     emit('bio:reply-acts', e);
     return e;
+  }
+  function chatEntries() { return (state.replyLog || []).filter((x) => x.chatId === chatId()); }
+  // 'reply:<key>' / 'replay:<key>#<序号>' → 记录
+  function entryBySource(src) {
+    const m = /^(?:reply|replay):([^#]+)/.exec(String(src || ''));
+    return m ? (state.replyLog || []).find((x) => x.key === m[1]) || null : null;
+  }
+  function actIndexOfSource(src, fallback) {
+    const m = /#(\d+)$/.exec(String(src || ''));
+    return m ? Number(m[1]) : fallback;
+  }
+
+  // ---------- 0.18：设备反馈（TBC v0.3 §5.12）：读者的操作与动作结局，下一次发送时写成 feedback 行 ----------
+  // 只记录，不解释；反馈本身不会触发新的动作
+  const FEEDBACK_LOG_MAX = 20;
+  const REF_REASONS = { deadline: 1, disconnected: 1, other: 1 };
+  function fbState() {
+    const id = chatId();
+    if (!state.fb || state.fb.chatId !== id) state.fb = { chatId: id, log: [], dropped: 0, since: state.lastSendT || 0, clearedFor: null, lastDevice: {} };
+    if (!state.fbTurn) state.fbTurn = {};
+    return state.fb;
+  }
+  const publicFeedback = (r) => JSON.parse(JSON.stringify(r));
+  // opts.phase：直接指定相位（安全词在发送那一刻：send @0s）
+  function recordFeedback(raw, opts) {
+    const v = HeartlinkCore.validateFeedback(raw);
+    if (v.error) return rejectInput('tbc.feedback', v.error);
+    const o = opts || {};
+    const ph = o.phase ? { phase: o.phase, atSec: 0 } : HeartlinkCore.phaseAt(state.events, Math.min(v.t, Date.now()));
+    const rec = Object.assign({}, v);
+    Object.defineProperty(rec, 'ph', { value: { phase: ph.phase, atSec: ph.atSec }, enumerable: false });
+    const fb = fbState();
+    fb.log.push(rec);
+    if (fb.log.length > FEEDBACK_LOG_MAX) { fb.log.splice(0, fb.log.length - FEEDBACK_LOG_MAX); fb.dropped++; }
+    if (v.act && v.act.key) {
+      const e = (state.replyLog || []).find((x) => x.key === v.act.key);
+      if (e) { e.feedback.push(publicFeedback(v)); if (e.feedback.length > FEEDBACK_LOG_MAX) e.feedback.shift(); emit('bio:reply-acts', e); }
+    }
+    emit('bio:feedback', publicFeedback(v));
+    render();
+    return true;
+  }
+  // 正在动的那个动作（最近开始的）：{ run, entry, i, ref }
+  function activeAct() {
+    const runs = actuators.running().sort((a, b) => b.startedAt - a.startedAt);
+    const run = runs.find((r) => entryBySource(r.source)) || runs[0] || null;
+    if (!run) return null;
+    const entry = entryBySource(run.source);
+    const i = actIndexOfSource(run.source, run.act);
+    const ref = entry && Number.isInteger(i) ? { key: entry.key, i, afterMs: Math.max(0, Math.round(Date.now() - run.startedAt)) } : null;
+    return { run, entry, i, ref };
+  }
+  function recordDeviceStop(reason, ev) {
+    const fb = fbState(); const t = Date.now();
+    if (fb.lastDevice[reason] && t - fb.lastDevice[reason] < 1500) return;   // 一次断开会停掉好几个动作，只记一条
+    fb.lastDevice[reason] = t;
+    const e = ev && entryBySource(ev.source);
+    const i = ev ? actIndexOfSource(ev.source, ev.act) : null;
+    const act = e && Number.isInteger(i) ? { key: e.key, i } : undefined;
+    recordFeedback(Object.assign({ t, from: 'device', type: 'stop', reason }, act ? { act } : {}));
+  }
+  // 登记表报来的动作结局 → 回复记录的 outcome；设备侧的停止记成反馈
+  function onActEvent(ev) {
+    const e = entryBySource(ev.source);
+    const own = e && String(ev.source).startsWith('reply:') && Number.isInteger(ev.act) && e.outcome && ev.act < e.outcome.length;
+    if (own) {
+      if (ev.type === 'start') e.outcome[ev.act] = 'running';
+      else if (ev.type === 'refused') e.outcome[ev.act] = 'refused';
+      else if (ev.type === 'end') e.outcome[ev.act] = ev.how === 'done' ? 'done' : 'cut';
+    }
+    if (ev.type === 'end' && ev.how === 'cut' && REF_REASONS[ev.reason]) recordDeviceStop(ev.reason, ev);
+    else if (ev.type === 'end' && ev.how === 'done' && ev.heatLimit) recordDeviceStop('heat-limit', ev);
+    else if (ev.type === 'refused' && ev.reason === 'rate-limit' && own) recordDeviceStop('rate-limit', ev);
+    render();
+  }
+  // reply -1 的动作结局（§5.12.2 acts 段）：发送时最新一条 AI 消息上、上次发送之后执行的那批
+  function feedbackActs() {
+    const chat = ((ctx() || {}).chat) || [];
+    let li = -1;
+    for (let k = chat.length - 1; k >= 0; k--) if (chat[k] && !chat[k].is_user && !chat[k].is_system) { li = k; break; }
+    if (li < 0) return null;
+    const since = fbState().since || 0;
+    const mine = chatEntries().filter((x) => x.index === li && x.t >= since && !x.skipped && x.acts.length);
+    if (!mine.length) return null;
+    const base = mine[mine.length - 1].base;
+    const c = { sent: 0, done: 0, cut: 0, pending: 0, refused: 0 };
+    for (const x of mine.filter((y) => y.base === base)) {
+      x.outcome.forEach((o) => { c.sent++; if (o === 'done' || o === 'cut' || o === 'refused') c[o]++; else c.pending++; });
+    }
+    return c;
+  }
+  function feedbackLineNow() {
+    const fb = fbState();
+    const chat = ((ctx() || {}).chat) || [];
+    const ai = [];
+    chat.forEach((m, k) => { if (m && !m.is_user && !m.is_system) ai.push(k); });
+    const replyN = (key) => {
+      const e = (state.replyLog || []).find((x) => x.key === key);
+      if (!e || e.chatId !== chatId() || !chat[e.index] || chat[e.index].is_user) return null;
+      return ai.filter((k) => k > e.index).length + 1;
+    };
+    const events = fb.log.map((r) => Object.assign({}, r, r.ph || {}, { reply: r.act && r.act.key ? replyN(r.act.key) : null }));
+    return HeartlinkCore.feedbackLine({ acts: feedbackActs(), events, dropped: fb.dropped, source: 'heartlink' });
+  }
+  // 普通发送时（块已写好）：本轮反馈进聊天变量 bio.feedback，缓冲区清空（swipe / regenerate 不清空）
+  function endFeedbackTurn(sendT) {
+    const fb = fbState();
+    if (fb.clearedFor === sendT) return false;
+    fb.clearedFor = sendT;
+    const id = chatId();
+    const prev = state.fbTurn[id];
+    const turn = fb.log.map(publicFeedback);
+    state.fbTurn[id] = { turn };
+    fb.log = []; fb.dropped = 0; fb.since = sendT; fb.lastDevice = {};
+    return Boolean(turn.length || (prev && prev.turn && prev.turn.length));
   }
   // 宿主推理模板的前后缀（没开自动解析时，思维链留在正文里，用它包着）
   function reasoningMarkers() {
@@ -2064,12 +2485,14 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     if (!acts.length && !errors.length) return;
     const end = Math.max(upTo, ...parsed.actOffsets.map((x) => x[1]), ...parsed.errorOffsets.map((x) => x[1]));
     state.lastActedReply = { key, upTo: end };
-    const entryKey = upTo >= 0 ? `${key}@${upTo}` : key;
+    state.replySeq = (state.replySeq || 0) + 1;
+    const base = `r${i}s${msg.swipe_id || 0}`;
+    const entryKey = `${base}${upTo >= 0 ? `c${upTo}` : ''}n${state.replySeq}`;
     let prevUser = null;
     for (let k = i - 1; k >= 0; k--) if (chat[k].is_user) { prevUser = chat[k]; break; }
     const safe = prevUser && safeWordHit(prevUser.mes);
     const skipped = safe ? 'safeword' : !state.haptics.enabled ? 'disabled' : !state.haptics.fromReplies ? 'replies-off' : !actuators.list().length ? 'no-device' : null;
-    replyEntry(entryKey, i, acts, errors, skipped);
+    replyEntry(entryKey, i, acts, errors, skipped, base);
     if (skipped || !acts.length) { render(); return; }
     actuators.runReplyActs(acts, `reply:${entryKey}`);
   }
@@ -2182,7 +2605,10 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       registerActuator: actuators.register, unregisterActuator: actuators.unregister,
       actuate: (target, action, opts) => actuators.actuate(target, action, opts),
       stop: (id) => actuators.stop(id), actuators: actuators.list,
-      outputState, replyActs: () => JSON.parse(JSON.stringify((state.replyLog || []).filter((x) => x.chatId === chatId()))),
+      outputState, replyActs: () => JSON.parse(JSON.stringify(chatEntries())),
+      // §5.12：第三方（遥控器、玩具 App 桥）也可以报反馈；不合规返回 false
+      feedback: (ev) => recordFeedback(ev),
+      feedbackLog: () => fbState().log.map(publicFeedback),
     };
     host.tbc = tbc;
     disposers.push(() => { try { if (host.tbc === tbc) delete host.tbc; } catch (_) {} });
@@ -2304,10 +2730,11 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       try { state.device.gatt.disconnect(); } catch (_) {}
     }
   }
-  const CONNECT_HELP = '没有选择设备。列表里找不到时请检查：① 设备打开了“心率广播”（华为/小米/荣耀在运动健康 App 里开，WHOOP 在 App 的心率广播里开）；② 手环没被其他电脑或网页占着；③ 离电脑近一些；④ 用桌面版 Chrome / Edge。';
+  const CONNECT_HELP = '没有选择设备。列表里找不到时请检查：① 设备打开了“心率广播”（华为/小米/荣耀在运动健康 App 里开，WHOOP 在 App 的心率广播里开）；② 手环没被其他电脑或网页占着；③ 离电脑近一些；④ 用电脑或安卓上的 Chrome / Edge，iPhone 暂不支持。';
+  const NO_BT_TEXT = '这个浏览器不支持网页蓝牙：请用电脑或安卓上的 Chrome / Edge，iPhone 暂不支持';
   async function connect() {
     const bt = bluetooth();
-    if (!bt) { toast('error', '这个浏览器不支持 Web Bluetooth。请用桌面版 Chrome 或 Edge。'); return false; }
+    if (!bt) { toast('error', NO_BT_TEXT); return false; }
     try {
       const device = await bt.requestDevice({ filters: [{ services: ['heart_rate'] }], optionalServices: ['battery_service', 'device_information'] });
       await subscribe(device);
@@ -2403,7 +2830,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
   // B-5 / v0.3 §1.1：对外只写旧名 mode（author / character）与新名 view，不暴露内部名 aware
   function modeFields() { const m = getMode(); return { mode: HeartlinkCore.LEGACY_MODE[m], view: HeartlinkCore.WIRE_MODE[m] }; }
   function saveChatVariable(extra) {
-    const value = Object.assign({ v: HeartlinkCore.SPEC_VERSION, source: HeartlinkCore.SOURCE, updatedAt: Date.now() }, modeFields(), { baseline: (baselineInfo() || {}).bpm || null, turns: history(), lastSignal: lastSignal() }, extra || {});
+    const value = Object.assign({ v: HeartlinkCore.SPEC_VERSION, source: HeartlinkCore.SOURCE, updatedAt: Date.now() }, modeFields(), { baseline: (baselineInfo() || {}).bpm || null, turns: history(), lastSignal: lastSignal(), feedback: (state.fbTurn && state.fbTurn[chatId()]) || { turn: [] } }, extra || {});
     try {
       if (typeof insertOrAssignVariables === 'function') { insertOrAssignVariables({ bio: value }, { type: 'chat' }); return; }
       const c = ctx(); if (!c || !c.chatMetadata) return;               // 核心回退：只改元数据，保存交给宿主紧接着的那次保存
@@ -2541,8 +2968,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     const defaultCps = cjk ? HeartlinkCore.CONFIG.READ_CPS_CJK : HeartlinkCore.CONFIG.READ_CPS_LATIN;
     const cpsOverride = HeartlinkCore.estimateCps({ history: history(), defaultCps });
     const meta = Object.assign(sourceMeta(), { trigger: trigger || 'normal' });
-    return HeartlinkCore.composeContext({ samples: state.samples, events: state.events, activityLog: state.activityLog, now: now || Date.now(), mode: getMode(), baselineOverride: state.manualBaseline, history: history(), replyMeta, cpsOverride, kinds: kinds(), deviceLines: deviceLines(), extraLines: [hapticsLine()].filter(Boolean), meta, prior: state.prior || null, baseline });
+    return HeartlinkCore.composeContext({ samples: state.samples, events: state.events, activityLog: state.activityLog, now: now || Date.now(), mode: getMode(), baselineOverride: state.manualBaseline, history: history(), replyMeta, cpsOverride, kinds: kinds(), deviceLines: deviceLines(), extraLines: [hapticsLine(), safeFeedbackLine()].filter(Boolean), meta, prior: state.prior || null, baseline });
   }
+  function safeFeedbackLine() { try { return feedbackLineNow(); } catch (err) { console.warn(LOG, 'feedback line failed', err); return null; } }
   // 酒馆助手的 injectPrompts 优先；不可用时退回酒馆核心的 setExtensionPrompt（同一条 in_chat 注入）
   function doInject(text) {
     if (typeof injectPrompts === 'function') {
@@ -2581,13 +3009,20 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       h.push(summary); if (h.length > CONFIG.HISTORY_MAX) h.splice(0, h.length - CONFIG.HISTORY_MAX);
       saveChatVariable({ last: summary });
       attachSummaryToMessage(summary);
+      return true;
     }
+    return false;
+  }
+  // 不注入时也按普通发送结束本轮反馈（§5.12：只有 normal 发送才清空）
+  function closeFeedbackWithoutBlock(kind, sendT) {
+    if (kind !== 'normal' || !sendT) return;
+    if (endFeedbackTurn(sendT)) saveChatVariable();
   }
   function injectContext(sendT) {
-    if (state.injectEnabled === false) { clearInject(); return; }
-    // 没有生理数据时，只有触觉状态值得告诉模型（TBC v0.3 §5.8）：开着触觉或连着设备就照常注入，其余行为 n/a
-    if (!state.samples.length && !hapticsLine()) { console.log(LOG, 'no heart-rate data; nothing injected'); return; }
     const kind = state.genKind || 'normal';
+    if (state.injectEnabled === false) { clearInject(); closeFeedbackWithoutBlock(kind, sendT); return; }
+    // 没有生理数据时，只有触觉状态与设备反馈值得告诉模型（TBC v0.3 §5.8、§5.12）：开着触觉或连着设备就照常注入，其余行为 n/a
+    if (!state.samples.length && !hapticsLine() && !safeFeedbackLine()) { console.log(LOG, 'no heart-rate data; nothing injected'); closeFeedbackWithoutBlock(kind, sendT); return; }
     let text; let fresh = false;
     if (kind === 'continue' || kind === 'group' || kind === 'tool') {
       const b = state.turnBlock;
@@ -2604,20 +3039,38 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
         const block = composeTurnBlock(now, kind);
         block.chatId = chatId();
         state.turnBlock = block;
-        recordSummary(block);   // 摘要在 compose 之后才进 history，本轮块里的 history 不含本轮（A-12）
+        const fbChanged = kind === 'normal' ? endFeedbackTurn(now) : false;   // 块里已写上本轮反馈，缓冲区清空
+        const saved = recordSummary(block);   // 摘要在 compose 之后才进 history，本轮块里的 history 不含本轮（A-12）
+        if (fbChanged && !saved) saveChatVariable();
         fresh = true;
       }
       text = state.turnBlock.text;
     }
     const via = doInject(text);
     if (!via) { console.warn(LOG, 'no injection API available'); return; }
-    state.injectedFor = sendT || Date.now(); state.lastInjectAt = Date.now();
+    state.injectedFor = sendT || Date.now(); state.lastInjectAt = Date.now(); state.injectSeq = (state.injectSeq || 0) + 1;
     state.lastInjectText = text;
     if (fresh) {
       bridgeState();
       emit('bio:inject', Object.assign({ text }, modeFields(), { summary: state.turnBlock.summary }));   // 一次发送只广播一次
       console.log(LOG, `injected bio_context via ${via}:\n` + text);
     }
+  }
+
+  // ---------- 注入窗口（0.18）----------
+  // ST 1.18 的 setExtensionPrompt 过滤器实际不起作用（getExtensionPrompt 把 async 函数交给 Array.filter，
+  // Promise 永远为真，script.js:3243-3257），后台请求能不能躲开块，只能靠我们自己及时撤掉。
+  // 所以本轮用户可见生成的提示词一拼好（聊天补全 CHAT_COMPLETION_PROMPT_READY、文本补全 GENERATE_AFTER_DATA）就撤掉注入；
+  // 只认自己的这一轮、且不是试算（dryRun）。continue / 群聊后面的成员 / 工具递归每次生成前都会从缓存的块重新注入（injectContext）。
+  function closeInjectionWindow(dryRun, via) {
+    if (dryRun) return false;
+    const r = state.round;
+    if (!state.generating || !state.userGenActive || state.backgroundGen || !r) return false;
+    if (!state.injectSeq || r.windowClosed === state.injectSeq) return false;
+    r.windowClosed = state.injectSeq;
+    clearInject();
+    state.injectWindow = { closedAt: Date.now(), via };
+    return true;
   }
 
   // 一轮生成开始（v0.3 附录 A）：普通发送 / swipe / regenerate 开新一轮；continue、群聊后面的成员、工具调用递归不开；
@@ -2637,7 +3090,15 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       if (g && !g.started) { g.started = true; g.auto = p.auto; }
     }
     state.toolCallsAt = 0;
-    try { const ch = (ctx() || {}).chat || []; const lu = [...ch].reverse().find((m) => m.is_user); if (lu && safeWordHit(lu.mes) && (actuators.list().some((a) => a.busy) || actuators.pending())) { actuators.stop(); toast('info', '听到了停止的话，设备已停'); } } catch (_) {}
+    try {
+      const ch = (ctx() || {}).chat || []; const lu = [...ch].reverse().find((m) => m.is_user);
+      if (lu && safeWordHit(lu.mes) && (actuators.list().some((a) => a.busy) || actuators.pending())) {
+        const cur = activeAct();
+        actuators.stop(undefined, 'safeword');   // 先停再记录（§5.12）
+        if (NEW_TURN_KINDS.has(kind)) recordFeedback(Object.assign({ t: p.t, from: 'safeword', type: 'stop' }, cur && cur.ref ? { act: cur.ref } : {}), { phase: 'send' });
+        toast('info', '听到了停止的话，设备已停');
+      }
+    } catch (_) {}
     state.generating = true; state.streamStarted = false; state.reasoningEnded = false;
     state.genKind = kind; state.genStartT = p.t;
     state.userGenActive = kind !== 'auto';
@@ -2689,6 +3150,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       if (!events.GENERATION_AFTER_COMMANDS && state.pendingGen) onAfterCommands(state.pendingGen.type, null, false);   // 宿主没有 AFTER_COMMANDS 时在这里开始
       if (!state.backgroundGen && state.userGenActive) injectContext(state.lastSendT);
     }, true);
+    bind(events.CHAT_COMPLETION_PROMPT_READY, (data) => closeInjectionWindow(!!(data && data.dryRun), 'chat-completion'));
+    bind(events.GENERATE_AFTER_DATA, (_data, dryRun) => closeInjectionWindow(!!dryRun, 'text-completion'));
     bind(events.GROUP_WRAPPER_STARTED, () => { state.groupTurn = { started: false, auto: false }; });
     bind(events.GROUP_WRAPPER_FINISHED, () => { state.groupTurn = null; });
     bind(events.TOOL_CALLS_PERFORMED, () => { state.toolCallsAt = Date.now(); });
@@ -2777,7 +3240,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     disposers.push(() => doc.removeEventListener('visibilitychange', onVis));
     if (doc.visibilityState === 'hidden') pushEvent('hidden');
     // 没有 Worker 计时时，后台页的计时会被浏览器压慢，玩具可能停不下来：页面一藏起来就全停
-    const onHideStop = () => { if (doc.visibilityState === 'hidden' && hTimers.kind === 'page') { try { actuators.stop(); } catch (_) {} } };
+    const onHideStop = () => { if (doc.visibilityState === 'hidden' && hTimers.kind === 'page') { try { actuators.stop(undefined, 'other'); } catch (_) {} } };
     doc.addEventListener('visibilitychange', onHideStop);
     disposers.push(() => doc.removeEventListener('visibilitychange', onHideStop));
   }
@@ -2786,200 +3249,335 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
   // ST 1.18 的 style.css 给 html 加了 transform:translateZ(0) 且 html 高度为 0，fixed 元素改以 html 为包含块，
   // 用 bottom 定位会跑到屏幕上方外面；所以用视口单位算 top（2026-09-17 本地实测 top:-118px）。
   // 配色：底色 / 正文取酒馆主题变量，其它按正文颜色的明暗切深浅两套（:host(.light)，见 syncTone）；青绿 --on 固定，不跟随主题强调色
+  // 0.18：第二轮打磨（docs/design-review/ui-round2.md 14 条）、反馈按钮（方案 A）、设备卡（docs/toy-device-card-mockup）。
+  //   z-index 用最大值，手机风格的插件盖不住“全部停止”；动画只动 transform / opacity，面板收起或页面隐藏时不跑
   const CSS = `
-:host{all:initial;position:fixed;right:14px;top:calc(100vh - 122px);top:calc(100dvh - 122px);z-index:9999;
+:host{all:initial;position:fixed;right:14px;top:calc(100vh - 122px);top:calc(100dvh - 122px);z-index:2147483647;
   --font:var(--mainFontFamily,-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",system-ui,sans-serif);
   --mono:var(--monoFontFamily,ui-monospace,"SF Mono",Menlo,monospace);
   --bg:var(--SmartThemeBlurTintColor,#141517);--ink:var(--SmartThemeBodyColor,#E9E7E3);
-  --raise:#1C1D20;--hair:#2A2B2F;--muted:#8E8C88;--faint:#5C5B58;
-  --heart:#E0564E;--on:#2E9E91;--stop:#D24B43;--warn:#D39A3C;--toy:#D0668C;
-  --gen:#6E8BA8;--read:#C98A4B;--write:#B87A95;--shadow:0 12px 32px rgba(0,0,0,.28);
+  --raise:#1C1D20;--hair:#2A2B2F;--line2:#3A3B40;--ink2:#B3B0AB;--muted:#8E8C88;--faint:#6A6965;
+  --track:#222326;--well:#18191C;--hover:rgba(233,231,227,.06);--off:#626368;
+  --heart:#E0564E;--on:#2E9E91;--on-fill:#1E8378;--on-ink:#3DB2A4;--stop:#C4453D;--warn:#D39A3C;--toy:#D0668C;--toy2:#E58BAB;--heat:#E0784E;
+  --gen:#6E8BA8;--read:#C98A4B;--write:#B87A95;--tint:.10;--tint-live:.18;
+  --shadow:0 12px 32px rgba(0,0,0,.32),0 0 0 .5px rgba(0,0,0,.4);
   font-family:var(--font);color:var(--ink);font-variant-numeric:tabular-nums}
-:host(.light){--raise:#FFFFFF;--hair:#E4E1DB;--muted:#6F6C66;--faint:#A3A09A;
-  --heart:#C8423A;--on:#1E8378;--stop:#C0392F;--warn:#A86F12;--toy:#B34D73;
-  --gen:#56718E;--read:#A56A2C;--write:#985A76;--shadow:0 8px 24px rgba(0,0,0,.10)}
+:host(.light){--raise:#FFFFFF;--hair:#E4E1DB;--line2:#D6D2CA;--ink2:#54514C;--muted:#6F6C66;--faint:#8A867F;
+  --track:#E9E7E3;--well:#EDEBE7;--hover:rgba(28,27,25,.05);--off:#8A867F;
+  --heart:#C8423A;--on:#1E8378;--on-fill:#1E8378;--on-ink:#1B7A6F;--stop:#C0392F;--warn:#96590F;--toy:#B34D73;--toy2:#C9658B;--heat:#C4582C;
+  --gen:#56718E;--read:#9A5F24;--write:#985A76;--tint:.09;--tint-live:.16;
+  --shadow:0 8px 24px rgba(0,0,0,.10),0 0 0 .5px rgba(0,0,0,.06)}
+:host(.dragging){will-change:transform}
 *{box-sizing:border-box}
-button{font:inherit;color:inherit}
-button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
+button{font:inherit;color:inherit;-webkit-tap-highlight-color:transparent}
+button:focus-visible{outline:2px solid var(--on-ink);outline-offset:2px}
 [hidden]{display:none!important}
-@keyframes br{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.35;transform:scale(.7)}}
+@keyframes br{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes beat{0%{transform:scale(1);opacity:.3}100%{transform:scale(1.35);opacity:0}}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+@keyframes breathe{0%,100%{opacity:1}50%{opacity:.55}}
 /* 胶囊 */
-.pill{display:inline-flex;align-items:center;gap:8px;height:44px;padding:0 12px 0 6px;border-radius:999px;background:var(--bg);border:1px solid var(--hair);
-  box-shadow:var(--shadow);backdrop-filter:blur(16px) saturate(1.2);cursor:pointer;white-space:nowrap;user-select:none;transition:transform .15s ease}
-.pill:hover{transform:translateY(-1px)}
-.seg{display:inline-flex;align-items:center;gap:8px}
-.segsep{width:1px;height:20px;background:var(--hair);margin:0 2px}
-.dot{width:32px;height:32px;border-radius:50%;display:grid;place-items:center;flex:0 0 auto}
-.heart{position:relative;background:var(--heart)}
-/* 心跳波纹：伪元素只动 transform / opacity（交给合成器），不再每帧重绘 box-shadow；z-index:-1 让它在圆点背后、胶囊背景之上 */
-.heart::after{content:"";position:absolute;inset:0;z-index:-1;border-radius:50%;background:var(--heart);opacity:0;pointer-events:none}
-.heart.on::after{animation:pulse var(--beat,1s) infinite}
-.heart.stale{background:var(--warn)}
-.heart.off{background:color-mix(in srgb,var(--muted) 40%,transparent)}
-.heart svg{width:14px;height:14px;fill:#fff}
-.toyd{background:color-mix(in srgb,var(--toy) 18%,transparent);color:var(--toy)}
-.toyd svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:2.2;stroke-linecap:round}
-@keyframes pulse{0%{transform:scale(1);opacity:.45}70%{transform:scale(1.5);opacity:0}100%{transform:scale(1);opacity:0}}
-.bpm{font:600 17px/1 var(--font);min-width:22px}
-.spark{width:40px;height:16px;flex:0 0 auto}
+.pill{position:relative;isolation:isolate;display:inline-flex;align-items:center;height:44px;padding:0 14px 0 6px;border-radius:999px;background:var(--bg);border:1px solid var(--hair);
+  box-shadow:var(--shadow);backdrop-filter:blur(16px) saturate(1.2);-webkit-backdrop-filter:blur(16px) saturate(1.2);cursor:pointer;white-space:nowrap;user-select:none;-webkit-user-select:none;touch-action:none;transition:border-color .15s,transform .15s}
+.pill:hover{border-color:var(--line2)}
+.pill:active{transform:scale(.985)}
+:host(.dragging) .pill{cursor:grabbing;backdrop-filter:none;-webkit-backdrop-filter:none;transform:none;transition:none}
+.seg{display:inline-flex;align-items:center}
+.psep{width:1px;height:16px;background:var(--line2);margin:0 12px;flex:none}
+.disc{position:relative;width:32px;height:32px;border-radius:50%;display:grid;place-items:center;flex:none}
+.disc.hr{background:var(--heart)}
+.disc.hr svg{width:15px;height:14px;fill:#fff;transform:translateY(.5px)}
+/* 心跳波纹：伪元素只动 transform / opacity；z-index:-1 在圆点背后、胶囊背景之上（胶囊 isolation:isolate） */
+.disc.hr::after{content:"";position:absolute;inset:0;z-index:-1;border-radius:50%;background:var(--heart);opacity:0;pointer-events:none}
+.disc.hr.on::after{animation:beat var(--beat,1s) ease-out infinite}
+.disc.hr.stale{background:var(--warn)}
+:host(:not(.light)) .disc.hr.stale svg{fill:#141517}
+.disc.hr.off{background:var(--track)}
+.disc.hr.off svg{fill:var(--muted)}
+.disc.toy{background:color-mix(in srgb,var(--toy) 18%,transparent);color:var(--toy)}
+.disc.toy svg{width:16px;height:10px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
+.num{font:600 16px/20px var(--font);letter-spacing:-.01em;margin-left:8px;color:var(--ink);min-width:20px}
+.num.dim{color:var(--muted)}
+.unit{font:500 12px/16px var(--font);color:var(--muted);margin-left:2px}
+.spark{width:36px;height:14px;margin-left:6px;flex:none;overflow:visible}
 .spark path{fill:none;stroke:var(--heart);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round}
-.spark line{stroke:var(--faint);stroke-dasharray:2 2}
-.delta{font:600 12px/1 var(--font);color:var(--on)}
+.spark line{stroke:var(--faint);stroke-width:1;stroke-dasharray:2 2}
+.delta{font:600 12px/16px var(--font);color:var(--on-ink);margin-left:6px}
 .delta.up{color:var(--read)}
-.tag{font-size:12px;color:var(--muted)}
-.tag.ch{color:var(--toy)}
-.tn{font:600 14px/1 var(--font)}
-.live{width:8px;height:8px;border-radius:50%;background:var(--toy);display:none}
+.delta:empty{display:none}
+.mode{font:12px/16px var(--font);color:var(--muted);margin-left:8px}
+.mode.ch{color:var(--toy)}
+.mode.warn{color:var(--warn)}
+.act{font:500 13px/20px var(--font);color:var(--ink);margin-left:8px}
+.live{display:none;width:6px;height:6px;border-radius:50%;background:var(--toy);margin-left:8px;box-shadow:0 0 0 2px color-mix(in srgb,var(--toy) 22%,transparent)}
 .live.on{display:inline-block;animation:br 1.6s ease-in-out infinite}
 /* 面板：固定头部 + 中间滚动 + 固定页脚 */
 .card{display:none;position:absolute;right:0;bottom:52px;width:320px;max-height:560px;flex-direction:column;overscroll-behavior:contain;
-  background:var(--bg);border:1px solid var(--hair);border-radius:14px;padding:0 12px;box-shadow:var(--shadow);backdrop-filter:blur(20px) saturate(1.2);
-  font-size:13px;line-height:19px;text-align:left}
+  background:var(--bg);border:1px solid var(--hair);border-radius:14px;padding:0 12px;box-shadow:var(--shadow);backdrop-filter:blur(20px) saturate(1.2);-webkit-backdrop-filter:blur(20px) saturate(1.2);
+  font:13px/20px var(--font);color:var(--ink);text-align:left}
 :host(.open) .card{display:flex;animation:rise .16s ease-out}
 :host(.below) .card{bottom:auto;top:52px}
-:host(.dragging) .pill{cursor:grabbing}
 :host(.hidden){display:none!important}
-@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-@media (prefers-reduced-motion:reduce){.heart.on::after,.live.on,.pulse::before,:host(.open) .card{animation:none!important}.pill{transition:none}}
 .head{flex:none}
-.tabs{display:flex;align-items:center;height:40px;gap:18px;border-bottom:1px solid var(--hair)}
-.tabs button[role="tab"]{position:relative;height:40px;display:flex;align-items:center;gap:6px;border:0;background:none;padding:0;cursor:pointer;font:600 13px/18px var(--font);color:var(--muted)}
+.head.pad{padding-bottom:12px}
+.tabs{display:flex;align-items:center;height:40px;gap:20px;border-bottom:1px solid var(--hair)}
+.tabs button[role="tab"]{height:40px;display:flex;align-items:center;gap:6px;border:0;background:none;padding:0;cursor:pointer;font:600 13px/20px var(--font);color:var(--muted)}
+.tabs .lb{position:relative;height:40px;display:flex;align-items:center}
 .tabs button[aria-selected="true"]{color:var(--ink)}
-.tabs button[aria-selected="true"]::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;background:var(--ink);border-radius:2px}
+.tabs button[aria-selected="true"] .lb::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;border-radius:2px 2px 0 0;background:var(--ink)}
 .d6{width:6px;height:6px;border-radius:50%;display:inline-block;flex:none;background:var(--on)}
 .d6.warn{background:var(--warn)}
 .d6.toy{background:var(--toy)}
-.x{margin-left:auto;width:24px;height:24px;display:grid;place-items:center;border:0;background:none;padding:0;cursor:pointer;color:var(--muted);font-size:16px;line-height:1}
-.x:hover{color:var(--ink)}
-.stop{display:block;width:100%;height:36px;margin:12px 0;border:0;border-radius:10px;background:var(--stop);color:#fff;font:600 13px/1 var(--font);cursor:pointer}
-:host(.busy) .stop{box-shadow:0 0 0 3px color-mix(in srgb,var(--stop) 25%,transparent)}
-.stop:hover{filter:brightness(1.06)}
-.stop:active{transform:translateY(1px)}
-.body{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;margin:0 -12px;padding:0 12px}
+.x{margin-left:auto;margin-right:-6px;width:28px;height:28px;border-radius:6px;display:grid;place-items:center;border:0;background:none;padding:0;cursor:pointer;color:var(--muted)}
+.x:hover{background:var(--hover);color:var(--ink)}
+.x svg{width:10px;height:10px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round}
+.sh .x{width:24px;height:24px;margin-right:-7px}
+.stop{display:block;width:100%;height:36px;margin:12px 0 0;border:0;border-radius:8px;background:var(--stop);color:#fff;font:600 13px/20px var(--font);letter-spacing:.04em;cursor:pointer;transition:filter .15s,box-shadow .15s}
+:host(.busy) .stop{box-shadow:0 0 0 3px color-mix(in srgb,var(--stop) 22%,transparent)}
+.stop:hover{filter:brightness(1.07)}
+.stop:active{transform:translateY(.5px)}
+/* 反馈按钮（方案 A）：比全部停止矮一级，细边无底色；没在动时只剩“再来一次” */
+.fb{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-top:8px}
+.fb.solo{display:flex}
+.fb.solo .fbtn:not(.rp){display:none}
+.fbtn{height:30px;min-width:0;padding:0 4px;border:1px solid var(--line2);border-radius:8px;background:none;color:var(--ink);font:500 12px/16px var(--font);display:flex;align-items:center;justify-content:center;gap:3px;white-space:nowrap;cursor:pointer;transition:background-color .15s,border-color .15s,color .15s}
+.fb.solo .fbtn{padding:0 14px}
+.fbtn:hover{background:var(--hover)}
+.fbtn:active{transform:translateY(.5px)}
+.fbtn.done{color:var(--on-ink);border-color:color-mix(in srgb,var(--on) 50%,transparent);background:color-mix(in srgb,var(--on) 10%,transparent)}
+.fbtn svg{width:10px;height:10px;flex:none;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.body{flex:1 1 auto;min-height:0;overflow:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;margin:0 -12px;padding:0 12px}
 .body.more{-webkit-mask-image:linear-gradient(#000 calc(100% - 16px),transparent);mask-image:linear-gradient(#000 calc(100% - 16px),transparent)}
 .sec{padding:12px 0;border-top:1px solid var(--hair)}
 .sec.first{border-top:0}
-.sh{font:500 11px/14px var(--font);color:var(--muted);margin:0 0 8px;display:flex;align-items:center}
-.sh em{margin-left:auto;font-style:normal;color:var(--toy)}
-.status{display:flex;align-items:center;gap:6px;height:24px}
+.sec.tight{padding:8px 0}
+.sh{display:flex;align-items:center;height:16px;margin:0 0 4px;font:500 11px/16px var(--font);letter-spacing:.02em;color:var(--muted)}
+.sh .r{margin-left:auto;display:flex;align-items:center;gap:6px;color:var(--toy)}
+.status{display:flex;align-items:center;gap:8px;height:20px}
 .status b{font-weight:600}
 .status .st{color:var(--muted);display:inline-flex;align-items:center;font-size:12px}
-.sdot{width:8px;height:8px;border-radius:50%;flex:none;background:var(--faint)}
+.status .st.warn{color:var(--warn)}
+.sdot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--faint)}
 .sdot.ok{background:var(--on)}
 .sdot.warn{background:var(--warn)}
-.batt{margin-left:auto;font:500 11px/14px var(--font);color:var(--muted)}
-.batt em{font-style:normal;color:var(--ink)}
-.empty{color:var(--muted);margin:0 0 12px}
-.link{border:0;background:none;padding:0;cursor:pointer;color:var(--on);font:12px/16px var(--font);margin-left:auto}
-.link:hover{text-decoration:underline}
-/* 时间线 */
+.batt{margin-left:auto;font:12px/16px var(--font);color:var(--muted)}
+.batt em{font-style:normal;font-weight:500;color:var(--ink)}
+.empty{color:var(--muted);margin:0}
+.link{margin-left:auto;margin-right:-2px;border:0;background:none;padding:0 2px;border-radius:4px;cursor:pointer;color:var(--on-ink);font:500 12px/16px var(--font)}
+.link:hover{text-decoration:underline;text-underline-offset:2px}
+/* 时间线：每个节点自己画到下一个节点的竖线，最后一个不画 */
 .tl{position:relative;padding-left:20px}
-.tl::before{content:"";position:absolute;left:3.5px;top:10px;bottom:12px;width:1px;background:var(--hair)}
-.node{position:relative;padding:6px 0;--c:var(--faint)}
-.node::before{content:"";position:absolute;left:-20px;top:11px;width:8px;height:8px;border-radius:50%;background:var(--c)}
+.node{position:relative;padding:4px 0;--c:var(--faint)}
+.node::before{content:"";position:absolute;left:-20px;top:10.5px;width:7px;height:7px;border-radius:50%;background:var(--c)}
+.node::after{content:"";position:absolute;left:-17px;top:19px;bottom:-9px;width:1px;background:var(--hair)}
+.node:last-child::after{display:none}
 .node.hol::before{background:var(--bg);box-shadow:inset 0 0 0 1.5px var(--c)}
 .node.bare::before{display:none}
+.node.bare::after{top:0}
 .node.pulse::before{animation:br 1.6s ease-in-out infinite}
-.node.pulse.toy::before{box-shadow:0 0 0 4px color-mix(in srgb,var(--toy) 25%,transparent)}
-.th{display:flex;align-items:baseline;gap:8px;font-size:13px;line-height:18px;min-width:0}
+.node.pulse.toy::before{box-shadow:0 0 0 3px color-mix(in srgb,var(--toy) 24%,transparent)}
+.th{display:flex;align-items:baseline;gap:8px;min-height:20px;min-width:0}
 .th b{font-weight:600;white-space:nowrap}
-.th .d{color:var(--ink);white-space:nowrap}
+.th .d{white-space:nowrap}
 .th .m{color:var(--muted);font-size:12px;white-space:nowrap}
 .th .m.w{color:var(--write)}
 .th .m.t{color:var(--toy)}
 .th .m.no{color:var(--warn);white-space:normal}
 .th .r{margin-left:auto;display:flex;align-items:baseline;gap:4px}
-.big{font:600 20px/24px var(--font);color:var(--ink)}
-.tsub{font-size:12px;line-height:16px;color:var(--muted);margin-top:4px}
+.big{font:600 20px/20px var(--font);letter-spacing:-.01em}
+.tsub{font:12px/16px var(--font);color:var(--muted);margin-top:4px;display:flex;align-items:center;flex-wrap:wrap}
 .chart{display:block;margin-top:6px;width:100%;overflow:visible}
-.hatch{display:inline-block;width:10px;height:8px;vertical-align:-1px;margin-right:4px;background:repeating-linear-gradient(45deg,var(--muted) 0 1px,transparent 1px 3px);opacity:.7}
-.node p{margin:2px 0 0;font-size:13px;line-height:19px}
-.quote{color:var(--ink);max-height:5.7em;overflow:auto}
+.ghost{margin-top:6px;height:28px;border:1px dashed var(--line2);border-radius:4px;display:grid;place-items:center;font:12px/16px var(--font);color:var(--muted)}
+.hatch{display:inline-block;width:10px;height:8px;margin-right:4px;background:repeating-linear-gradient(135deg,var(--muted) 0 1px,transparent 1px 3px);opacity:.6}
+.node p{margin:2px 0 0}
+.quote{max-height:6em;overflow:auto}
 .sees b{font-weight:600}
 .sees i{font-style:normal;color:var(--warn)}
-.sees .mut{color:var(--muted);font-size:12px}
-.sh .x{width:16px;height:14px;font-size:14px}
+.sees.mut{color:var(--muted);font-size:12px;line-height:16px}
 .ptext{margin:6px 0 0;max-height:12em;overflow:auto;white-space:pre-wrap;word-break:break-all;font:10px/1.5 var(--mono);color:var(--muted);background:var(--raise);border:1px solid var(--hair);border-radius:8px;padding:6px 8px}
-.base{display:flex;align-items:center;gap:8px;font-size:12px;line-height:16px;padding-top:8px;border-top:1px solid var(--hair)}
+.base{display:flex;align-items:center;gap:8px;font:12px/16px var(--font);padding-top:10px;margin-top:2px;border-top:1px solid var(--hair)}
 .base b{font-weight:600}
-.dash{width:14px;border-top:1px dashed var(--faint);flex:none}
-.small{font:500 11px/14px var(--font);color:var(--muted);margin-top:4px}
-.small em{font-style:normal;color:var(--ink)}
+.base svg{width:14px;height:2px;flex:none}
+.small{font:11px/16px var(--font);color:var(--muted);margin-top:2px}
+.small em{font-style:normal;font-weight:500;color:var(--ink)}
 .basemenu{display:flex;gap:8px;margin-top:8px}
-.basemenu button{flex:1;height:28px;border:1px solid var(--hair);background:none;border-radius:8px;font-size:12px;cursor:pointer}
-.basemenu button:hover{border-color:var(--on);color:var(--on)}
+.basemenu button{flex:1;height:28px;border:1px solid var(--line2);background:none;border-radius:8px;font:500 12px/16px var(--font);cursor:pointer;transition:background-color .15s}
+.basemenu button:hover{background:var(--hover)}
+.ntag{display:inline-flex;align-items:center;align-self:center;height:18px;padding:0 5px;border-radius:4px;font:500 11px/1 var(--font);white-space:nowrap}
+.ntag.up{color:var(--toy);background:color-mix(in srgb,var(--toy) 14%,transparent)}
+.ntag.skip{color:var(--muted);background:color-mix(in srgb,var(--muted) 16%,transparent)}
+.ntag.pop{animation:fade .2s ease-out}
+.node.skipped .th b{color:var(--muted)}
+.node.skipped .th .d{color:var(--muted);text-decoration:line-through;text-decoration-color:var(--faint)}
+.fbnote{margin:4px 0 0 20px;font:11px/16px var(--font);color:var(--muted)}
 .play{margin:0}
 .play q{quotes:"「" "」";color:var(--toy)}
 /* 设置与连接 */
-.fold{display:flex;align-items:center;width:100%;height:36px;border:0;background:none;padding:0;cursor:pointer;font:600 13px/18px var(--font);text-align:left}
-.chev{margin-left:auto;color:var(--muted);font-size:15px;line-height:1;transition:transform .15s}
-.fold[aria-expanded="true"] .chev{transform:rotate(90deg)}
-.set{display:flex;align-items:center;min-height:36px;gap:8px}
+.fold{display:flex;align-items:center;gap:8px;width:calc(100% + 16px);height:36px;margin:0 -8px;padding:0 8px;border:0;border-radius:8px;background:none;cursor:pointer;font:600 13px/20px var(--font);color:var(--ink);text-align:left;transition:background-color .15s}
+.fold:hover{background:var(--hover)}
+.cv{margin-left:auto;width:12px;height:12px;flex:none;color:var(--muted);fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round;transition:transform .2s ease}
+.fold[aria-expanded="false"] .cv{transform:rotate(-90deg)}
+.foldbody{margin-top:4px}
+.set{display:flex;align-items:center;min-height:40px;gap:8px}
 .set>:last-child{margin-left:auto}
-.meaning{font-size:12px;line-height:16px;color:var(--muted);margin:-4px 0 4px}
-.segctl{display:inline-flex;height:28px;border:1px solid var(--hair);border-radius:8px;padding:2px;gap:2px}
-.segctl button{border:0;background:none;padding:0 10px;border-radius:6px;font-size:12px;color:var(--muted);cursor:pointer}
-.segctl button.on{background:var(--on);color:#fff;font-weight:600}
-.switch{width:32px;height:18px;border-radius:999px;border:0;padding:0;background:color-mix(in srgb,var(--muted) 45%,transparent);position:relative;cursor:pointer;flex:none;transition:background .15s}
-.switch::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:left .15s}
+.meaning{font:12px/16px var(--font);color:var(--muted);margin:-6px 0 6px}
+.segctl{display:inline-flex;height:28px;padding:2px;border-radius:8px;background:var(--track)}
+.segctl button{min-width:44px;height:24px;padding:0 8px;border:0;border-radius:6px;background:none;font:500 12px/24px var(--font);color:var(--ink2);cursor:pointer;transition:background-color .15s,color .15s}
+.segctl button:hover{color:var(--ink)}
+.segctl button[aria-pressed="true"]{background:var(--on-fill);color:#fff;font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.18)}
+.switch{width:36px;height:20px;border-radius:999px;border:0;padding:0;background:var(--off);position:relative;cursor:pointer;flex:none;transition:background-color .15s}
+.switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.25);transition:transform .15s ease}
 .switch[aria-checked="true"]{background:var(--on)}
-.switch[aria-checked="true"]::after{left:16px}
-.textbtn{display:block;border:0;background:none;padding:0;margin-top:4px;cursor:pointer;font:13px/19px var(--font);color:var(--muted)}
+.switch[aria-checked="true"]::after{transform:translateX(16px)}
+.textbtn{display:inline-flex;align-items:center;height:28px;border:0;background:none;padding:0;cursor:pointer;font:500 12px/16px var(--font);color:var(--muted)}
 .textbtn:hover{color:var(--stop)}
-.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0}
-.btn{min-height:36px;border:1px solid var(--hair);background:none;border-radius:8px;padding:6px 8px;font-size:13px;line-height:18px;font-weight:600;cursor:pointer;text-align:center}
-.btn:hover{border-color:var(--on)}
-.btn.primary{background:var(--on);border-color:var(--on);color:#fff}
-.btn.on{border-color:var(--on);color:var(--on)}
-.btn.full{grid-column:1/-1;width:100%}
-.btn small{display:block;font-weight:400;font-size:11px;line-height:14px;color:var(--muted)}
-.btn.on small{color:var(--on)}
-.conn{display:flex;align-items:center;width:100%;min-height:36px;gap:8px;border:0;background:none;padding:0;cursor:pointer;font:13px/19px var(--font);text-align:left}
-.conn .r{margin-left:auto;color:var(--muted);font-size:12px;display:flex;align-items:center;gap:6px}
-.conn .chev{margin-left:0}
-:host(.devs) .conn .chev{transform:rotate(90deg)}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0 0}
+.btn{min-height:48px;border:1px solid var(--line2);background:none;border-radius:8px;padding:6px 8px;font:600 13px/20px var(--font);color:var(--ink);cursor:pointer;text-align:center;transition:border-color .15s,background-color .15s}
+.btn:hover{background:var(--hover)}
+.btn small{display:block;font:400 11px/16px var(--font);color:var(--muted)}
+.btn small.rec{color:var(--on-ink)}
+.btn.on{border-color:color-mix(in srgb,var(--on) 55%,transparent)}
+.btn.on small{color:var(--on-ink)}
+.btn.primary{min-height:36px;width:100%;margin-top:12px;background:var(--on-fill);border-color:var(--on-fill);color:#fff}
+.btn.primary:hover{background:var(--on-fill);filter:brightness(1.07)}
+.btn.full{grid-column:1/-1;width:100%;min-height:36px}
+.conn{display:flex;align-items:center;width:100%;min-height:40px;gap:8px;border:0;background:none;padding:0;cursor:pointer;font:13px/20px var(--font);color:var(--ink);text-align:left}
+.conn .r{margin-left:auto;display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}
+.conn .cv{margin-left:2px;transform:rotate(-90deg)}
+:host(.devs) .conn .cv{transform:none}
 .devs{display:none;max-height:15em;overflow:auto;padding:0 0 4px}
 :host(.devs) .devs{display:block}
-.devs b{display:block;margin:6px 0 2px;font-size:12px}
+.devs b{display:block;margin:6px 0 2px;font:600 12px/16px var(--font)}
 .devs label{display:flex;gap:8px;align-items:center;cursor:pointer;min-height:24px;font-size:12px}
 .devs label i{font-style:normal;color:var(--muted);font-size:11px}
 .devs input{accent-color:var(--on);margin:0;width:14px;height:14px}
-.help{display:none;margin:12px 0 0;padding:8px 12px 8px 24px;border-radius:10px;background:var(--raise);border:1px solid var(--hair);font-size:12px;line-height:16px;max-height:14em;overflow:auto}
+.help{display:none;margin:12px 0 0;padding:8px 12px 8px 24px;border-radius:10px;background:var(--raise);border:1px solid var(--hair);font:12px/16px var(--font);max-height:14em;overflow:auto}
 :host(.help) .help{display:block}
 .help li{margin:4px 0}
 .help li.error b{color:var(--stop)}
 .help li.warn b{color:var(--warn)}
-.foot{flex:none;display:flex;gap:4px 14px;flex-wrap:wrap;align-items:center;border-top:1px solid var(--hair);padding:8px 4px 10px;font:500 11px/14px var(--font);color:var(--muted)}
-.foot button{border:0;background:none;padding:0;cursor:pointer;color:var(--muted);font:500 11px/14px var(--font)}
+.foot{flex:none;display:flex;align-items:center;gap:16px;height:36px;border-top:1px solid var(--hair);font:500 11px/16px var(--font);color:var(--muted);white-space:nowrap}
+.foot button{border:0;background:none;padding:0;cursor:pointer;color:var(--muted);font:500 11px/16px var(--font);display:inline-flex;align-items:center;gap:5px;border-radius:4px}
 .foot button:hover{color:var(--ink)}
 .foot .ver{margin-left:auto}
-.foot .warn{color:var(--warn)}`;
-  const HEART_SVG = '<svg viewBox="0 0 24 24"><path d="M12 21s-7-4.6-9.3-8.6C.6 8.7 2.6 4.5 6.6 4.5c2 0 3.4 1.1 4.1 2.2.7-1.1 2.1-2.2 4.1-2.2 4 0 6 4.2 3.9 7.9C19 16.4 12 21 12 21z"/></svg>';
-  const WAVE_SVG = '<svg viewBox="0 0 24 24"><path d="M3 12c2-4 4-4 6 0s4 4 6 0 4-4 6 0"/></svg>';
+/* 设备卡：每台设备一张，每一路跟着 heartlink 发出的帧动（只画发出的档位，不代表设备真的执行了） */
+.dcards{display:flex;flex-direction:column;gap:8px}
+.dc{position:relative;isolation:isolate;border-radius:12px;background:var(--raise);border:1px solid var(--hair)}
+.dc::before{content:"";position:absolute;inset:-1px;z-index:-1;border-radius:12px;pointer-events:none;opacity:0;transition:opacity .3s ease;
+  box-shadow:0 0 0 1px color-mix(in srgb,var(--toy) 32%,transparent),0 6px 20px -8px color-mix(in srgb,var(--toy) 45%,transparent)}
+.dc.moving::before{opacity:1}
+.dc.moving.hot::before{box-shadow:0 0 0 1px color-mix(in srgb,var(--heat) 36%,transparent),0 6px 20px -8px color-mix(in srgb,var(--heat) 50%,transparent)}
+.dh{display:flex;align-items:center;gap:10px;height:48px;padding:0 10px 0 8px;width:100%;border:0;background:none;text-align:left;border-radius:12px;color:var(--ink)}
+button.dh{cursor:pointer;transition:background-color .15s}
+button.dh:hover{background:var(--hover)}
+.art{position:relative;width:34px;height:34px;flex:none;border-radius:9px;background:var(--well);display:grid;place-items:center;color:var(--ink2)}
+.art .fig{display:grid;place-items:center;will-change:transform}
+.art svg{width:18px;height:12px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
+.art .warm{position:absolute;inset:0;border-radius:9px;opacity:0;background:radial-gradient(circle at 50% 70%,color-mix(in srgb,var(--heat) 40%,transparent),transparent 70%);will-change:opacity}
+.art .cd{position:absolute;right:-2px;bottom:-2px;width:10px;height:10px;border-radius:50%;background:var(--on);box-shadow:0 0 0 2px var(--raise)}
+.dname{flex:1;min-width:0;font:600 13px/18px var(--font);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.minis{display:flex;align-items:flex-end;gap:2px;height:12px;flex:none}
+.minis i{width:3px;height:12px;border-radius:1.5px;background:var(--faint);transform-origin:50% 100%;transform:scaleY(.35);will-change:transform;transition:background-color .25s}
+.minis i.on{background:var(--toy)}
+.dh .cv{margin-left:0}
+.dh[aria-expanded="false"] .cv{transform:rotate(-90deg)}
+.rows{padding:0 10px 6px}
+.fr{position:relative;display:grid;grid-template-columns:52px minmax(0,1fr) 48px;gap:8px;align-items:center;height:32px;border-top:1px solid var(--hair)}
+.fr::before{content:"";position:absolute;inset:2px -6px;border-radius:7px;z-index:-1;opacity:0;transition:opacity .25s ease;
+  background:linear-gradient(90deg,color-mix(in srgb,var(--toy) 12%,transparent),color-mix(in srgb,var(--toy) 3%,transparent))}
+.fr.on::before{opacity:1;animation:breathe 2.8s ease-in-out infinite}
+.fr.heat.on::before{background:linear-gradient(90deg,color-mix(in srgb,var(--heat) 14%,transparent),color-mix(in srgb,var(--heat) 3%,transparent))}
+.fn{display:flex;align-items:center;gap:4px;font:500 12px/16px var(--font);color:var(--muted);white-space:nowrap;overflow:hidden;transition:color .25s}
+.fr.on .fn{color:var(--ink)}
+.fn svg{width:9px;height:11px;flex:none;fill:none;stroke:var(--heat);stroke-width:1.4;stroke-linejoin:round;opacity:.8}
+.lv{text-align:right;font:500 11px/16px var(--font);color:var(--faint);white-space:nowrap;transition:color .25s}
+.lv b{font:600 13px/16px var(--font);color:var(--muted);transition:color .25s}
+.fr.on .lv{color:var(--muted)}
+.fr.on .lv b{color:var(--ink)}
+.viz{position:relative;height:22px;border-radius:6px;background:var(--well);overflow:hidden}
+.viz canvas{display:block;width:100%;height:100%}
+.viz .say{position:absolute;inset:0;display:flex;align-items:center;gap:5px;padding:0 8px;font:11px/16px var(--font);color:var(--muted);white-space:nowrap;opacity:1;transition:opacity .25s}
+.viz .say svg{width:11px;height:11px;flex:none;fill:none;stroke:currentColor;stroke-width:1.3;stroke-linecap:round}
+.fr.on .viz .say.idle{opacity:0}
+.osc .rail{position:absolute;left:12px;right:12px;top:50%;height:2px;margin-top:-1px;border-radius:1px;background:var(--line2)}
+.osc .range{position:absolute;left:12px;right:12px;top:50%;height:10px;margin-top:-5px;border-radius:5px;background:color-mix(in srgb,var(--toy) 14%,transparent);opacity:0;transition:opacity .3s}
+.fr.on .osc .range{opacity:1}
+.osc .kn{position:absolute;top:50%;left:12px;width:16px;height:10px;margin:-5px 0 0 -8px;border-radius:5px;background:var(--faint);will-change:transform;transition:background-color .25s}
+.fr.on .osc .kn{background:var(--toy)}
+.osc .kn.tr{opacity:0;background:var(--toy)!important}
+.spin .wheel{position:absolute;left:6px;top:3px;width:16px;height:16px;will-change:transform}
+.spin .wheel circle{fill:none;stroke-width:1.6}
+.spin .track{position:absolute;left:28px;right:6px;top:50%;height:2px;margin-top:-1px;overflow:hidden}
+.spin .track i{position:absolute;top:0;bottom:0;left:0;right:-12px;background:radial-gradient(circle,var(--faint) 1px,transparent 1.3px) 0 50%/8px 2px repeat-x;will-change:transform}
+.fr.on .spin .track i{background-image:radial-gradient(circle,var(--toy) 1px,transparent 1.3px)}
+.heatv .fill{position:absolute;left:0;top:0;bottom:0;width:100%;transform-origin:0 50%;transform:scaleX(0);will-change:transform;
+  background:linear-gradient(90deg,color-mix(in srgb,var(--heat) 8%,transparent),color-mix(in srgb,var(--heat) 42%,transparent))}
+.heatv .shim{position:absolute;inset:0;overflow:hidden;opacity:0;transition:opacity .3s}
+.heatv .shim i{position:absolute;top:0;bottom:0;left:0;width:28px;will-change:transform;background:linear-gradient(90deg,transparent,rgba(255,255,255,.22),transparent)}
+:host(.light) .heatv .shim i{background:linear-gradient(90deg,transparent,rgba(255,255,255,.6),transparent)}
+.fr.on .heatv .shim{opacity:1}
+.heatv .end{position:absolute;right:0;top:4px;bottom:4px;width:2px;border-radius:1px;background:var(--heat);opacity:0;transition:opacity .25s}
+.fr.on .heatv .end{opacity:.55}
+.heatv .say.run{justify-content:flex-end;color:var(--ink2);opacity:0;padding-right:10px}
+.heatv .say.run span{text-shadow:0 0 4px var(--well),0 0 2px var(--well)}
+.fr.on .heatv .say.run{opacity:1}
+.heatv .say.run b{font-weight:600;color:var(--ink);margin-right:2px}
+@media (prefers-reduced-motion:reduce){
+  .disc.hr.on::after,.live.on,.node.pulse::before,.ntag.pop,:host(.open) .card,.fr.on::before{animation:none!important}
+  .disc.hr.on::after{opacity:0}
+  .cv,.switch,.switch::after,.fbtn,.segctl button,.stop,.pill,.btn,.fold,.basemenu button,button.dh,.dc::before,.fr::before,.fn,.lv,.lv b,.viz .say,.osc .range,.osc .kn,.heatv .shim,.heatv .end,.minis i{transition:none!important}
+  .heatv .shim{display:none}
+}
+/* 窄屏（手机）：面板占满宽度、左右各留 8，放在酒馆顶栏下面（top 由 fitPanel 算），避开刘海 */
+@media (max-width:479px){
+  .card{position:fixed;left:max(8px,env(safe-area-inset-left));right:max(8px,env(safe-area-inset-right));width:auto;bottom:auto;top:56px}
+  :host(.below) .card{top:56px}
+  .fbtn{height:34px}
+}`;
+  const HEART_SVG = '<svg viewBox="0 0 24 22" aria-hidden="true"><path d="M12 21s-9-5.6-9-12.2A5 5 0 0 1 12 6a5 5 0 0 1 9 2.8C21 15.4 12 21 12 21z"/></svg>';
+  const WAVE_SVG = '<svg viewBox="0 0 16 10" aria-hidden="true"><path d="M1.2 5c1.9-3.6 3-3.6 4.9 0s3 3.6 4.9 0 2.6-3.6 3.8 0"/></svg>';
   const IBI_SVG = '<svg width="14" height="12" viewBox="0 0 14 12" aria-hidden="true"><path d="M0 7h3l1.5-4 2.5 8 2-6 1 2h4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/></svg>';
+  const X_SVG = '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 1l8 8M9 1L1 9"/></svg>';
+  const CV_SVG = '<svg class="cv" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3"/></svg>';
+  const CK_SVG = '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 5.2l2.3 2.3 4.7-5"/></svg>';
+  const DASH_SVG = '<svg viewBox="0 0 14 2" aria-hidden="true"><line x1="0" x2="14" y1="1" y2="1" style="stroke:var(--faint);stroke-width:1;stroke-dasharray:2 3"/></svg>';
+  const RISK_SVG = '<svg viewBox="0 0 9 11" aria-hidden="true"><path d="M4.5 1C5 3 7.8 4.4 7.8 7a3.3 3.3 0 0 1-6.6 0c0-1.3.7-2.1 1.3-2.6.1 1 .6 1.6 1.2 1.8C3.4 4.6 3.9 2.6 4.5 1z"/></svg>';
+  const CLOCK_SVG = '<svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="4.5"/><path d="M6 3.6V6l1.6 1"/></svg>';
+  // 反馈按钮：[类型, 按钮字, 按下后约 2 秒的确认字]
+  const FB_BTNS = [['weaker', '弱一点', '已调弱'], ['stronger', '强一点', '已调强'], ['replay', '再来一次', '已重放'], ['skip', '跳过', '已跳过']];
+  const FB_BY = Object.fromEntries(FB_BTNS.map((b) => [b[0], b]));
+  const FB_STEP = 20;   // 调强 / 调弱一次的百分点
+  const REFUSE_ZH = { disabled: '剧情联动没开', 'unknown-target': '设备不在了', unsupported: '设备不支持', 'not-worn': '没戴着', sleeping: '睡眠中', 'quiet-hours': '勿扰时段', 'rate-limit': '太快了，稍等再按' };
 
   let hostEl = null, root = null, el = {};
+  let dragged = false;
+  let dragStart = null;
   function mountBadge() {
     const old = doc.getElementById(CONFIG.HOST_ID); if (old) old.remove();
     hostEl = doc.createElement('div'); hostEl.id = CONFIG.HOST_ID;
     root = hostEl.attachShadow({ mode: 'open' });
+    const fbBtns = FB_BTNS.map(([k, label]) => `<button class="fbtn${k === 'replay' ? ' rp' : ''}" data-fb="${k}">${label}</button>`).join('');
     root.innerHTML = `<style>${CSS}</style>
 <div class="card" part="card" role="dialog" aria-label="heartlink 悬浮窗">
-  <div class="head">
+  <div class="head" data-f="head">
     <div class="tabs" role="tablist">
-      <button role="tab" data-tab="hr">健康设备<i class="d6" data-f="hrBadge"></i></button>
-      <button role="tab" data-tab="toy">玩具<i class="d6" data-f="toyBadge"></i></button>
-      <button class="x" data-close title="收起" aria-label="收起">×</button>
+      <button role="tab" data-tab="hr"><span class="lb">健康设备</span><i class="d6" data-f="hrBadge"></i></button>
+      <button role="tab" data-tab="toy"><span class="lb">玩具</span><i class="d6" data-f="toyBadge"></i></button>
+      <button class="x" data-close title="收起" aria-label="收起">${X_SVG}</button>
     </div>
-    <div data-pane="toy"><button class="stop" data-act="halt">全部停止</button></div>
+    <div data-pane="toy">
+      <button class="stop" data-act="halt" title="立即停止所有玩具（也可用 /hl-stop 或 Alt+Shift+S）">全部停止</button>
+      <div class="fb" data-f="fb" role="group" aria-label="调整正在动的动作">${fbBtns}</div>
+    </div>
   </div>
   <div class="body" data-f="body">
   <ul class="help" data-f="help"></ul>
 
   <section data-pane="hr">
     <div class="sec first" data-f="hrEmpty">
-      <p class="empty">还没连接设备。手环 / 心率带要先打开“心率广播”，并用桌面版 Chrome 或 Edge。</p>
-      <button class="btn primary full" data-act="hr">连接设备</button>
+      <p class="empty">还没连接设备。手环 / 心率带要先打开“心率广播”；用电脑或安卓上的 Chrome / Edge，iPhone 暂不支持。</p>
+      <button class="btn primary" data-act="hr">连接设备</button>
     </div>
     <div data-f="hrLive">
       <div class="sec first">
@@ -2988,9 +3586,9 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
       <div class="sec">
         <div class="tl">
           <div data-f="plist"></div>
-          <div class="node hol" data-f="pnote" hidden><div class="th"><span class="m">发出第一条消息后，这里按相位分段显示</span></div></div>
+          <div class="node hol" data-f="pnote" hidden><div class="ghost">发出第一条消息后，这里按相位分段显示</div></div>
           <div class="node bare">
-            <div class="base"><i class="dash"></i><span data-f="base">平静心率</span><button class="link" data-act="basemenu" title="虚线是平静心率，胶囊上的百分比也是和它比">调整</button></div>
+            <div class="base">${DASH_SVG}<span data-f="base">平静心率</span><button class="link" data-act="basemenu" title="虚线是平静心率，胶囊上的百分比也是和它比">调整</button></div>
             <div class="basemenu" data-f="baseMenu" hidden><button data-act="baseline">记下现在为平静</button><button data-act="clear">改回自动计算</button></div>
             <div class="small" data-f="hrvLine"><span data-f="hrv"></span><span data-f="last"></span></div>
           </div>
@@ -3006,10 +3604,10 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
         </div>
       </div>
     </div>
-    <div class="sec">
-      <button class="fold" data-act="fold" aria-expanded="true">设置与连接<span class="chev">›</span></button>
-      <div data-f="hrFold">
-        <div class="set"><span>模式</span><div class="segctl"><button data-set="mode:author">幕后</button><button data-set="mode:character">入戏</button><button data-set="mode:aware">知情</button></div></div>
+    <div class="sec" data-f="hrFoldSec">
+      <button class="fold" data-act="fold" aria-expanded="true">设置与连接${CV_SVG}</button>
+      <div class="foldbody" data-f="hrFold">
+        <div class="set"><span>模式</span><div class="segctl" role="group" aria-label="模式"><button data-set="mode:author">幕后</button><button data-set="mode:character">入戏</button><button data-set="mode:aware">知情</button></div></div>
         <div class="meaning" data-f="modeHint"></div>
         <div class="set"><span>发给模型</span><button class="switch" role="switch" data-act="inject" aria-label="发给模型"></button></div>
         <div data-f="hrTools"><button class="textbtn" data-act="disconnect">断开设备</button></div>
@@ -3018,23 +3616,28 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
   </section>
 
   <section data-pane="toy">
-    <div class="sec" data-f="toyEmpty"><p class="empty" style="margin:0">还没连玩具：打开“剧情联动”，再选一种连接方式。</p></div>
+    <div class="sec" data-f="toyEmpty"><p class="empty">还没连玩具：打开“剧情联动”，再选一种连接方式。</p></div>
     <div class="sec" data-f="toyTiles">
-      <div class="sh">上一条回复的动作<em data-f="now"></em></div>
+      <div class="sh">上一条回复的动作<span class="r" data-f="now"></span></div>
       <div class="tl" data-f="lastact"></div>
+      <p class="fbnote" data-f="fbnote" hidden></p>
+    </div>
+    <div class="sec" data-f="devSec" hidden>
+      <div class="sh">设备</div>
+      <div class="dcards" data-f="dcards"></div>
     </div>
     <div class="sec" data-f="play">
-      <div class="sh">在对话里这样玩<button class="x" data-act="playClose" title="收起玩法说明" aria-label="收起玩法说明">×</button></div>
+      <div class="sh">在对话里这样玩<button class="x" data-act="playClose" title="收起玩法说明" aria-label="收起玩法说明">${X_SVG}</button></div>
       <p class="play">角色在回复里写动作，回复写完就动。也可以直接对角色说<q>轻一点</q><q>再强点</q><q>像心跳那样</q><q>慢慢来</q>。</p>
     </div>
-    <div class="sec">
-      <button class="fold" data-act="fold" aria-expanded="true">设置与连接<span class="chev">›</span></button>
-      <div data-f="toyFold">
+    <div class="sec" data-f="toyFoldSec">
+      <button class="fold" data-act="fold" aria-expanded="true">设置与连接${CV_SVG}</button>
+      <div class="foldbody" data-f="toyFold">
         <div class="set"><span>剧情联动</span><button class="switch" role="switch" data-act="vib" aria-label="剧情联动"></button></div>
-        <div class="set"><span>节奏</span><div class="segctl"><button data-set="profile:slow-burn">慢热</button><button data-set="profile:steady">持久</button><button data-set="profile:frenzy">狂暴</button><button data-set="profile:max">极限</button></div></div>
-        <button class="conn" data-act="devs" data-f="connRow"><span>连接设备</span><span class="r"><i class="d6"></i><span data-f="connTxt">已连接</span><span class="chev">›</span></span></button>
+        <div class="set"><span>节奏</span><div class="segctl" role="group" aria-label="节奏"><button data-set="profile:slow-burn">慢热</button><button data-set="profile:steady">持久</button><button data-set="profile:frenzy">狂暴</button><button data-set="profile:max">极限</button></div></div>
+        <button class="conn" data-act="devs" data-f="connRow"><span>连接设备</span><span class="r"><i class="d6"></i><span data-f="connTxt">已连接</span>${CV_SVG}</span></button>
         <div class="row2" data-f="connBtns">
-          <button class="btn" data-act="toy" title="先装好 Intiface Central、点 Start Server 并在里面连上玩具">通过 Intiface<small data-f="out">推荐</small></button>
+          <button class="btn" data-act="toy" title="先装好 Intiface Central、点 Start Server 并在里面连上玩具">通过 Intiface<small class="rec" data-f="out">推荐</small></button>
           <button class="btn" data-act="wasm" title="不装 Intiface：Chrome 直接用蓝牙连玩具（支持的型号与 Intiface 相同）。还没有经过真实设备验证">浏览器直接连<small data-f="wasmState">测试</small></button>
           ${DEV_TOOLS ? '<button class="btn full" data-act="lab" title="打开设备模拟器小窗口（本机 device-lab，先运行 npm run sim）">设备模拟器</button>' : ''}
         </div>
@@ -3053,26 +3656,27 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
 </div>
 <div class="pill" part="pill" title="heartlink">
   <span class="seg" data-seg="hr">
-    <span class="dot heart off">${HEART_SVG}</span>
-    <span class="bpm">--</span>
-    <svg class="spark" viewBox="0 0 44 14"><line class="ref" x1="0" y1="8" x2="44" y2="8"/><path d=""/></svg>
+    <span class="disc hr off">${HEART_SVG}</span>
+    <span class="num" data-f="bpm">--</span>
+    <svg class="spark" viewBox="0 0 36 14" aria-hidden="true"><line class="ref" x1="0" y1="8" x2="36" y2="8"/><path d=""/></svg>
     <span class="delta"></span>
-    <span class="tag">未连接</span>
+    <span class="mode">未连接</span>
   </span>
-  <span class="segsep"></span>
-  <span class="seg" data-seg="toy"><span class="dot toyd">${WAVE_SVG}</span><span class="tn">--</span><span class="live"></span></span>
-  <span class="seg" data-seg="none"><span class="dot heart off">${HEART_SVG}</span><span class="tag">连接设备</span></span>
+  <span class="psep"></span>
+  <span class="seg" data-seg="toy"><span class="disc toy">${WAVE_SVG}</span><span class="num" data-f="tn">--</span><span class="unit">路</span><span class="live" title="正在动"></span></span>
+  <span class="seg" data-seg="none"><span class="disc hr off">${HEART_SVG}</span><span class="act">连接设备</span></span>
 </div>`;
     const q = (s) => root.querySelector(s);
-    el = { heart: q('[data-seg="hr"] .heart'), bpm: q('.bpm'), poly: q('.spark path'), sparkRef: q('.spark .ref'), delta: q('.delta'), tag: q('[data-seg="hr"] .tag'), pill: q('.pill'), spark: q('.spark') };
-    ['base', 'hrv', 'last', 'hrvLine', 'dev', 'out', 'sig', 'sigBox', 'foot', 'hrBadge', 'toyBadge', 'hrEmpty', 'hrLive', 'hrDot', 'hrState', 'batt', 'plist', 'pnote', 'baseMenu', 'modeHint', 'hrTools', 'hrFold', 'toyFold', 'toyEmpty', 'toyTiles', 'now', 'lastact', 'wasmState', 'help', 'devs', 'helpBtn', 'sees', 'ptext', 'body', 'play', 'playBtn', 'connRow', 'connTxt', 'connBtns']
+    el = { heart: q('[data-seg="hr"] .disc'), poly: q('.spark path'), sparkRef: q('.spark .ref'), delta: q('.delta'), tag: q('[data-seg="hr"] .mode'), pill: q('.pill'), spark: q('.spark') };
+    ['bpm', 'tn', 'head', 'fb', 'base', 'hrv', 'last', 'hrvLine', 'dev', 'out', 'sig', 'sigBox', 'foot', 'hrBadge', 'toyBadge', 'hrEmpty', 'hrLive', 'hrDot', 'hrState', 'batt', 'plist', 'pnote', 'baseMenu', 'modeHint', 'hrTools', 'hrFold', 'toyFold', 'hrFoldSec', 'toyFoldSec', 'toyEmpty', 'toyTiles', 'now', 'lastact', 'fbnote', 'devSec', 'dcards', 'wasmState', 'help', 'devs', 'helpBtn', 'sees', 'ptext', 'body', 'play', 'playBtn', 'connRow', 'connTxt', 'connBtns']
       .forEach((f) => { el[f] = q(`[data-f="${f}"]`); });
     el.folds = [...root.querySelectorAll('[data-act="fold"]')];
+    el.fbBtns = [...root.querySelectorAll('[data-fb]')];
     el.connDot = q('[data-f="connRow"] .d6');
     el.body.addEventListener('scroll', () => syncMore(), { passive: true });
     el.seg = { hr: q('[data-seg="hr"]'), toy: q('[data-seg="toy"]'), none: q('[data-seg="none"]') };
-    el.segsep = q('.segsep');
-    el.tn = q('.tn'); el.live = q('.live');
+    el.segsep = q('.psep');
+    el.live = q('.live');
     el.tabs = [...root.querySelectorAll('[data-tab]')];
     el.panes = [...root.querySelectorAll('[data-pane]')];
     el.sets = [...root.querySelectorAll('[data-set]')];
@@ -3090,11 +3694,22 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
       const tabBtn = t.closest && t.closest('[data-tab]');
       if (tabBtn) { state.badgeTab = tabBtn.getAttribute('data-tab'); return render(); }
       if (t.closest && t.closest('[data-close]')) { closePanel(); return; }
+      const fbBtn = t.closest && t.closest('[data-fb]');
+      if (fbBtn) { quickFeedback(fbBtn.getAttribute('data-fb')); return; }
+      const devBtn = t.closest && t.closest('[data-devtoggle]');
+      if (devBtn) { const k = devBtn.getAttribute('data-devtoggle'); if (devOpen.has(k)) devOpen.delete(k); else devOpen.add(k); return render(); }
       const setBtn = t.closest && t.closest('[data-set]');
       if (setBtn) {
         const [key, val] = setBtn.getAttribute('data-set').split(':');
         if (key === 'mode') { if (getMode() !== val) setMode(val); return; }
-        if (key === 'profile') { if (hapticsPolicy().profile !== val) { setHaptics({ profile: val }); toast('info', `节奏：${PROFILE_ZH[val] || val}`); } return; }
+        if (key === 'profile') {
+          if (hapticsPolicy().profile !== val) {
+            setHaptics({ profile: val });
+            recordFeedback({ t: Date.now(), from: 'reader', type: 'pace', value: val });
+            toast('info', `节奏：${PROFILE_ZH[val] || val}`);
+          }
+          return;
+        }
         if (key === 'cap') { setHaptics({ maxIntensity: Number(val) }); return; }
         return;
       }
@@ -3105,16 +3720,16 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
         if (act === 'devs') { hostEl.classList.toggle('devs'); return render(); }
         if (act === 'lab') {
           const win = host.open(CONFIG.LAB_URL, 'tbc-device-lab', 'popup=yes,width=1180,height=820');
-          if (!win) toast('warning', '浏览器拦下了弹出窗口：请允许本站弹窗，或直接打开 ' + CONFIG.LAB_URL);
-          else toast('info', `模拟器已在小窗口打开，页面顶部会显示扩展是否已接入。${hTimers.kind === 'worker' ? '酒馆页被挡住或切到后台时，触觉计时照常。' : '注意：这个浏览器不支持后台计时，切走酒馆页时强度帧会变慢。'}`);
+          if (!win) toast('warning', '浏览器拦下了弹窗：请允许本站弹窗，或直接打开 ' + CONFIG.LAB_URL);
+          else toast('info', hTimers.kind === 'worker' ? '模拟器已在小窗口打开' : '模拟器已打开；这个浏览器切走酒馆页时强度帧会变慢');
           return;
         }
-        if (act === 'wasm') { if (WASM.client) { stopWasm(); toast('info', '已断开浏览器直接连'); } else { toast('info', '测试功能：正在加载直连组件（约数 MB），稍后浏览器会弹出蓝牙设备选择。还没有经过真实设备测试，遇到问题请到仓库反馈。'); startWasm(); } return; }
-        if (act === 'inject') { setExposure({ inject: state.injectEnabled === false }); toast('info', state.injectEnabled === false ? '已停止发给模型：模型收不到设备数据' : '已恢复发给模型'); return; }
+        if (act === 'wasm') { if (WASM.client) { stopWasm(); toast('info', '已断开浏览器直接连'); } else { toast('info', '测试功能：正在加载直连组件，稍后弹出蓝牙设备选择'); startWasm(); } return; }
+        if (act === 'inject') { setExposure({ inject: state.injectEnabled === false }); toast('info', state.injectEnabled === false ? '已停止发给模型' : '已恢复发给模型'); return; }
         if (act === 'vib') { const on = !state.haptics.enabled; setHaptics({ enabled: on }); if (on) askProfile(); toast(on ? 'warning' : 'info', on ? '剧情联动已打开' : '剧情联动已关闭，玩具已停'); return; }
-        if (act === 'toy') { const on = !state.haptics.intiface.enabled; setHaptics({ intiface: { enabled: on } }); toast('info', on ? `正在连接 Intiface（${state.haptics.intiface.url}）；先在 Intiface Central 里点 Start Server` : '已断开 Intiface'); return; }
-        if (act === 'hide') { setBadgeHidden(true); toast('info', '悬浮窗已隐藏。要恢复：点酒馆左下角的魔杖菜单 → “显示 heartlink 悬浮窗”。'); return; }
-        if (act === 'halt') { actuators.stop(); closePanel(); toast('info', '已停止所有设备'); return; }
+        if (act === 'toy') { const on = !state.haptics.intiface.enabled; setHaptics({ intiface: { enabled: on } }); toast('info', on ? '正在连接 Intiface（先在 Intiface Central 里点 Start Server）' : '已断开 Intiface'); return; }
+        if (act === 'hide') { setBadgeHidden(true); toast('info', '悬浮窗已隐藏，可在魔杖菜单里恢复'); return; }
+        if (act === 'halt') { haltAll('button'); return; }
         if (act === 'fold') { state.settingsFolded = !state.settingsFolded; saveSettings(); return render(); }
         if (act === 'playClose') { state.playSeen = true; state.playOpen = false; saveSettings(); return render(); }
         if (act === 'play') { state.playOpen = true; state.badgeTab = 'toy'; return render(); }
@@ -3142,35 +3757,139 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     placeBadge();
     hostEl.classList.toggle('hidden', !!state.badgeHidden);
     syncMenuItem();
-    // 拖动：按住胶囊移动超过 5 像素才算拖动；位置记在设置里（离右边、离上边的像素）
-    let dragged = false;
+    // 拖动（0.18，手机上跟手）：按住移动超过 5 像素才算拖动；拖动中只改 transform、每帧最多一次、关掉毛玻璃；
+    // 指针捕获在胶囊上（手指移出胶囊也跟着走）；松手时才换算成位置写进设置（离右边、离上边的像素）
     const pill = q('.pill');
-    pill.style.touchAction = 'none';
-    pill.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
-      const r = hostEl.getBoundingClientRect();
-      const start = { x: e.clientX, y: e.clientY, right: host.innerWidth - r.right, top: r.top };
-      let moving = false;
-      const move = (ev) => {
-        const dx = ev.clientX - start.x; const dy = ev.clientY - start.y;
-        if (!moving && Math.hypot(dx, dy) < 5) return;
-        if (!moving) { moving = true; hostEl.classList.add('dragging'); hostEl.classList.remove('open'); }
-        state.badgePos = { right: start.right - dx, top: start.top + dy };
-        placeBadge();
-      };
-      const up = () => {
-        host.removeEventListener('pointermove', move); host.removeEventListener('pointerup', up); host.removeEventListener('pointercancel', up);
-        if (moving) { dragged = true; hostEl.classList.remove('dragging'); saveSettings(); host.setTimeout(() => { dragged = false; }, 400); }
-      };
-      host.addEventListener('pointermove', move); host.addEventListener('pointerup', up); host.addEventListener('pointercancel', up);
+    const drag = HeartlinkCore.dragController({
+      schedule: (fn) => (typeof host.requestAnimationFrame === 'function' ? host.requestAnimationFrame(fn) : host.setTimeout(fn, 16)),
+      cancel: (id) => { try { if (typeof host.cancelAnimationFrame === 'function') host.cancelAnimationFrame(id); else host.clearTimeout(id); } catch (_) {} },
+      apply: (dx, dy) => { hostEl.style.transform = `translate3d(${Math.round(dx)}px,${Math.round(dy)}px,0)`; },
+      start: () => { hostEl.classList.add('dragging'); if (hostEl.classList.contains('open')) closePanel(); },
+      commit: (dx, dy) => {
+        const s0 = dragStart || { right: 14, top: 0 };
+        state.badgePos = { right: s0.right - dx, top: s0.top + dy };
+        hostEl.style.removeProperty('transform');
+        hostEl.classList.remove('dragging');
+        placeBadge(); saveSettings();
+        dragged = true; host.setTimeout(() => { dragged = false; }, 400);
+      },
     });
-    const onResize = () => placeBadge();
+    pill.addEventListener('pointerdown', (e) => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      const r = hostEl.getBoundingClientRect();
+      const W = host.innerWidth; const H = host.innerHeight;
+      dragStart = { right: W - r.right, top: r.top };
+      drag.down(e.clientX, e.clientY, { minX: -r.left, maxX: W - r.right, minY: -r.top, maxY: H - r.bottom });
+      try { pill.setPointerCapture(e.pointerId); } catch (_) {}
+    });
+    pill.addEventListener('pointermove', (e) => { if (drag.move(e.clientX, e.clientY) && e.cancelable) e.preventDefault(); });
+    const endDrag = (e) => {
+      if (!drag.active()) return;
+      if (!drag.up()) hostEl.classList.remove('dragging');
+      try { if (e && e.pointerId != null && pill.hasPointerCapture && pill.hasPointerCapture(e.pointerId)) pill.releasePointerCapture(e.pointerId); } catch (_) {}
+    };
+    pill.addEventListener('pointerup', endDrag);
+    pill.addEventListener('pointercancel', endDrag);
+    pill.addEventListener('lostpointercapture', endDrag);
+    const onResize = () => { placeBadge(); render(); };
     host.addEventListener('resize', onResize);
     disposers.push(() => host.removeEventListener('resize', onResize));
     const closeMenu = (event) => { if (hostEl && !hostEl.contains(event.target)) closePanel(); };
     doc.addEventListener('click', closeMenu, true);
     disposers.push(() => doc.removeEventListener('click', closeMenu, true));
   }
+
+  // ---------- 0.18：停止与快速反馈 ----------
+  // 全部停止的唯一入口：按钮、斜杠命令 /hl-stop、快捷键 Alt+Shift+S 都走这里。先停再记录（§5.12）
+  function haltAll(via) {
+    const had = actuators.list().some((a) => a.busy) || actuators.pending() > 0;
+    const cur = had ? activeAct() : null;
+    actuators.stop();
+    if (had) recordFeedback(Object.assign({ t: Date.now(), from: 'reader', type: 'stop' }, cur && cur.ref ? { act: cur.ref } : {}));
+    if (via === 'button') closePanel();
+    toast('info', '已停止所有设备');
+    return had;
+  }
+  function flashDone(kind) {
+    state.fbDone = { kind, until: Date.now() + 2000 };
+    host.setTimeout(() => render(), 2050);
+    render();
+  }
+  // 弱一点 / 强一点：正在动的动作 ±20 个百分点（0–1 之间，调到 0 就停下这一个），同一回复里还没开始的也按这个量执行；
+  // 跳过：停掉正在动的，排队的下一个在最小间隔允许时马上开始；再来一次：重放最后执行的动作（照常过安全闸门）
+  function quickFeedback(kind) {
+    if (!FB_BY[kind]) return false;
+    if (kind === 'replay') { replayLast(); return true; }
+    const now = Date.now();
+    const cur = activeAct();
+    const queued = actuators.queued();
+    const src = cur ? cur.run.source : (queued[0] ? queued[0].source : null);
+    if (!src) { render(); return false; }
+    const entry = cur && cur.entry ? cur.entry : entryBySource(src);
+    const replySrc = entry ? entry.src : src;   // 正在动的是重放时，排队的仍是原回复的
+    if (kind === 'weaker' || kind === 'stronger') {
+      const sign = kind === 'stronger' ? 1 : -1;
+      actuators.adjust(sign * FB_STEP / 100, src);
+      if (replySrc !== src) actuators.adjust(sign * FB_STEP / 100, replySrc);
+      if (entry) {
+        const idx = new Set(queued.filter((x) => x.source === replySrc).map((x) => x.act));
+        if (cur && Number.isInteger(cur.i)) idx.add(cur.i);
+        for (const i of idx) if (Number.isInteger(i) && i < entry.adj.length) { entry.adj[i] += sign * FB_STEP; entry.tagT[i] = now; }
+      }
+      recordFeedback(Object.assign({ t: now, from: 'reader', type: kind, value: FB_STEP }, cur && cur.ref ? { act: cur.ref } : {}));
+    } else if (kind === 'skip') {
+      const r = actuators.skip(src);
+      if (replySrc !== src && !r.skipped.length) r.skipped.push(...actuators.skip(replySrc).skipped);
+      let ref;
+      for (const s of r.skipped) {
+        const e = entryBySource(s.source); const i = actIndexOfSource(s.source, s.act);
+        if (!e || !Number.isInteger(i)) continue;
+        if (i < e.tagT.length) { e.skipIdx.add(i); e.tagT[i] = now; }
+        if (!ref) ref = cur && cur.ref && cur.ref.key === e.key && cur.i === i ? cur.ref : { key: e.key, i };
+      }
+      recordFeedback(Object.assign({ t: now, from: 'reader', type: 'skip' }, ref ? { act: ref } : {}));
+    }
+    flashDone(kind);
+    return true;
+  }
+  async function replayLast() {
+    const last = actuators.lastOk();
+    if (!last || !last.action || last.action.stop) return false;
+    const e = entryBySource(last.source);
+    const i = actIndexOfSource(last.source, last.act);
+    const own = e && Number.isInteger(i);
+    const t = Date.now();
+    const r = await actuators.actuate(last.target, last.action, { source: own ? `replay:${e.key}#${i}` : 'replay', delta: actuators.delta(own ? e.src : last.source) });
+    if (!r.ok) { toast('info', r.refused === 'rate-limit' ? REFUSE_ZH['rate-limit'] : `没法重放：${REFUSE_ZH[r.refused] || r.refused}`); render(); return false; }
+    const pat = String(last.action.pattern || 'pulse');
+    recordFeedback(Object.assign({ t, from: 'reader', type: 'replay', value: /^[a-z]+$/.test(pat) ? pat : 'pulse' }, own ? { act: { key: e.key, i } } : {}));
+    flashDone('replay');
+    return true;
+  }
+  // 不经过界面的停止（面板被别的插件盖住时也能停）：斜杠命令 /hl-stop（酒馆有 SlashCommandParser 时）与快捷键 Alt+Shift+S
+  function registerStopControls() {
+    const c = ctx();
+    const run = () => { haltAll('slash'); return ''; };
+    try {
+      if (c && c.SlashCommandParser && typeof c.SlashCommandParser.addCommandObject === 'function' && c.SlashCommand && typeof c.SlashCommand.fromProps === 'function') {
+        c.SlashCommandParser.addCommandObject(c.SlashCommand.fromProps({ name: 'hl-stop', callback: run, returns: 'nothing', helpString: '立即停止 heartlink 连接的所有玩具（不经过模型）。快捷键 Alt+Shift+S。' }));
+        state.stopCommand = 'parser';
+      } else if (c && typeof c.registerSlashCommand === 'function') {
+        c.registerSlashCommand('hl-stop', run, [], '立即停止 heartlink 连接的所有玩具', true, true);
+        state.stopCommand = 'legacy';
+      }
+    } catch (err) { console.warn(LOG, '/hl-stop not registered:', err && err.message); }
+    const onKey = (e) => {
+      if (!e || !e.altKey || !e.shiftKey || e.ctrlKey || e.metaKey) return;
+      if (e.code !== 'KeyS' && String(e.key || '').toLowerCase() !== 's') return;
+      try { if (e.preventDefault) e.preventDefault(); } catch (_) {}
+      haltAll('shortcut');
+    };
+    // 挂在 window 的捕获阶段：比 document 捕获更早，输入框里有别的插件的快捷键（如玉子手机）也吞不掉它
+    host.addEventListener('keydown', onKey, true);
+    disposers.push(() => host.removeEventListener('keydown', onKey, true));
+  }
+
   function closePanel() {
     if (!hostEl) return;
     const was = hostEl.classList.contains('open');
@@ -3223,11 +3942,31 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     hostEl.style.setProperty('top', `${Math.round(top)}px`);
   }
   // 面板高度按可用空间算：上方放不下而下方更宽时向下展开，内容多了在面板里滚动
+  // 窄屏（< 480）：面板占满宽度，放在酒馆顶栏下面；胶囊在下半屏时面板停在胶囊上方，在上半屏时放在胶囊下方
+  function isNarrow() { return (Number(host.innerWidth) || 1024) < 480; }
+  function topBarBottom() {
+    for (const id of ['top-settings-holder', 'top-bar']) {
+      try { const n = doc.getElementById(id); const b = n && n.getBoundingClientRect ? n.getBoundingClientRect().bottom : null; if (Number.isFinite(b) && b > 0) return b; } catch (_) {}
+    }
+    return 0;
+  }
   function fitPanel() {
     const card = root && root.querySelector('.card');
     if (!card) return;
     const r = hostEl.getBoundingClientRect();
-    const above = r.top - 16; const below = host.innerHeight - r.bottom - 16;
+    const H = host.innerHeight;
+    if (isNarrow()) {
+      const bar = topBarBottom();
+      const pillLow = r.top > H / 2;
+      const top = Math.round((pillLow ? bar : Math.max(bar, r.bottom)) + 8);
+      const bottom = pillLow ? r.top - 8 : H - 8;
+      hostEl.classList.remove('below');
+      card.style.top = `max(${top}px, calc(env(safe-area-inset-top, 0px) + 8px))`;
+      card.style.maxHeight = `${Math.max(160, Math.floor(bottom - top))}px`;
+      return;
+    }
+    card.style.removeProperty('top');
+    const above = r.top - 16; const below = H - r.bottom - 16;
     const down = below > above;
     hostEl.classList.toggle('below', down);
     card.style.maxHeight = `${Math.max(180, Math.floor(down ? below : above) - 8)}px`;
@@ -3247,13 +3986,14 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
       const m = (c.match(/[\d.]+/g) || []).map(Number);
       const lum = m.length >= 3 ? (0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2]) / 255 : 1;
       hostEl.classList.toggle('light', lum < 0.5);
+      devAnim.colors = null;   // 设备卡的画布颜色重新取
     } catch (_) {}
   }
   // 胶囊与面板里的走势线：虚线是平静心率，曲线相对它上下浮动（百分比也是和它比）
   function sparkPath(ref) {
     const now = Date.now();
     const pts = HeartlinkCore.series(state.samples, now - 60000, now).map((v) => (v === '·' ? null : v));
-    const d = HeartlinkCore.sparkPath(pts, 44, 14, 6, ref);
+    const d = HeartlinkCore.sparkPath(pts, 36, 14, 6, ref);
     return { d, refY: HeartlinkCore.sparkPath.refY };
   }
   // 本轮相位（与注入块同一套边界，HeartlinkCore.buildTurn）：
@@ -3288,7 +4028,8 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     return { groups: groups.filter((g) => g.b > g.a), away: t.away || [] };
   }
   // 时间线：每个相位一个节点；看生成、读回复各带一张小走势图，所有小图纵向比例相同、以底边为准对齐，平静心率虚线在同一高度
-  const CHART_W = 274;
+  // 第二轮：4px 圆角、相位底色变淡（--tint / --tint-live）、子段顶线之间留 2px 缝、上方留 6px 给峰值点、离开的斜线变淡
+  const CHART_W = 276;
   function renderPhases(base, now) {
     const { groups, away } = phaseModel(now);
     const t0 = groups.length ? groups[0].a : now;
@@ -3308,11 +4049,11 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     });
     const all = charts.flatMap((c) => (c ? c.vals.filter((v) => v != null) : [])).concat(base ? [base.bpm] : []);
     const lo = all.length ? Math.min(...all) - 1 : 60;
-    let k = 3;   // 每 bpm 多少像素：取能让每张图都放得下的最大值
+    let k = 3;   // 每 bpm 多少像素：取能让每张图都放得下的最大值（上 6、下 4）
     for (const c of charts) {
       if (!c) continue;
       const hi = Math.max(lo + 6, ...c.vals.filter((v) => v != null), base ? base.bpm : lo);
-      k = Math.min(k, (c.h - 8) / (hi - lo));
+      k = Math.min(k, (c.h - 10) / (hi - lo));
     }
     k = Math.max(0.3, k);
     let peak = null;
@@ -3323,20 +4064,23 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
       const W = CHART_W;
       const X = (tt) => Math.max(0, Math.min(W, (tt - g.a) / span * W));
       const Y = (v) => h - 4 - (v - lo) * k;
-      let s = `<svg class="chart" viewBox="0 0 ${W} ${h}" height="${h}" preserveAspectRatio="none" aria-hidden="true"><defs><pattern id="hlaway${idx}" width="5" height="5" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="5" style="stroke:var(--muted);stroke-width:1.4;stroke-opacity:.5"/></pattern></defs>`;
-      for (const sb of g.subs) {
-        const x = X(sb.a); const w = Math.max(1, X(sb.b) - x); const inner = sb.a > g.a ? 0.5 : 0;
-        s += `<rect x="${x.toFixed(1)}" y="0" width="${w.toFixed(1)}" height="${h}" style="fill:var(--${PH[sb.k].c});fill-opacity:${sb.live ? 0.24 : 0.14}"/>`;
-        s += `<rect x="${(x + inner).toFixed(1)}" y="0" width="${Math.max(0, w - inner * 2).toFixed(1)}" height="2" style="fill:var(--${PH[sb.k].c});opacity:${PH[sb.k].o}"/>`;
-      }
+      let s = `<svg class="chart" viewBox="0 0 ${W} ${h}" height="${h}" preserveAspectRatio="none" aria-hidden="true"><defs>`
+        + `<clipPath id="hlclip${idx}"><rect width="${W}" height="${h}" rx="4"/></clipPath>`
+        + `<pattern id="hlaway${idx}" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" style="stroke:var(--muted);stroke-width:1;stroke-opacity:.35"/></pattern></defs><g clip-path="url(#hlclip${idx})">`;
+      g.subs.forEach((sb, i) => {
+        const x = X(sb.a); const w = Math.max(1, X(sb.b) - x);
+        const gl = i > 0 ? 1 : 0; const gr = i < g.subs.length - 1 ? 1 : 0;
+        s += `<rect x="${x.toFixed(1)}" y="0" width="${w.toFixed(1)}" height="${h}" style="fill:var(--${PH[sb.k].c});fill-opacity:var(${sb.live ? '--tint-live' : '--tint'})"/>`;
+        s += `<rect x="${(x + gl).toFixed(1)}" y="0" width="${Math.max(0, w - gl - gr).toFixed(1)}" height="2" style="fill:var(--${PH[sb.k].c});opacity:${PH[sb.k].o}"/>`;
+      });
       for (const [a, b] of away) if (b > g.a && a < g.b) s += `<rect x="${X(a).toFixed(1)}" y="2" width="${Math.max(1, X(b) - X(a)).toFixed(1)}" height="${h - 2}" fill="url(#hlaway${idx})"><title>离开，不计入</title></rect>`;
-      if (base) { const yb = Y(base.bpm).toFixed(1); s += `<line x1="0" x2="${W}" y1="${yb}" y2="${yb}" style="stroke:var(--faint);stroke-width:1;stroke-dasharray:3 3"/>`; }
+      if (base) { const yb = Y(base.bpm).toFixed(1); s += `<line x1="0" x2="${W}" y1="${yb}" y2="${yb}" style="stroke:var(--faint);stroke-width:1;stroke-dasharray:2 3"/>`; }
       // 断开超过 3 桶才断线（偶尔漏一两个样本不算中断）
       let d = ''; let gap = Infinity;
       vals.forEach((v, i) => { if (v == null) { gap++; return; } d += `${gap > 3 ? 'M' : 'L'}${((i + 0.5) * W / N).toFixed(1)},${Y(v).toFixed(1)}`; gap = 0; });
-      if (d) s += `<path d="${d}" style="fill:none;stroke:var(--heart);stroke-width:1.75;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke"/>`;
-      if (g.k === 'read' && peak && d) s += `<circle cx="${X(peak.t).toFixed(1)}" cy="${Y(peak.bpm).toFixed(1)}" r="3" style="fill:var(--heart);stroke:var(--bg);stroke-width:1.5"/>`;
-      return s + '</svg>';
+      if (d) s += `<path d="${d}" style="fill:none;stroke:var(--heart);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke"/>`;
+      if (g.k === 'read' && peak && d) s += `<circle cx="${X(peak.t).toFixed(1)}" cy="${Y(peak.bpm).toFixed(1)}" r="3" style="fill:var(--heart);stroke:var(--bg);stroke-width:2"/>`;
+      return s + '</g></svg>';
     };
     const SHORT = { wait: '首字', think: '思考', body: '正文' };
     setHtml(el.plist, groups.map((g, i) => {
@@ -3354,7 +4098,7 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
         right = `<span class="r"><span class="m">峰值</span><span class="big">${peak.bpm}</span></span>`;
       }
       const aw = awayIn(g);
-      if (aw >= 1000) sub += `${sub ? ' · ' : ''}<i class="hatch" title="离开的时段不计入"></i>离开 ${fmt(Math.round(aw / 1000))}`;
+      if (aw >= 1000) sub += `${sub ? '&nbsp;·&nbsp;' : ''}<i class="hatch" title="离开的时段不计入"></i>离开 ${fmt(Math.round(aw / 1000))}`;
       const liveTag = g.live ? `<span class="m${g.k === 'write' ? ' w' : ''}">进行中</span>` : '';
       return `<div class="node${g.live ? ' pulse' : ''}" style="--c:var(--${PH[g.k].c})"><div class="th"><b>${PH[g.k].name}</b><span class="d">${dur}${arrow}</span>${liveTag}${right}</div>`
         + (c ? chartSvg(c, i) : '') + (sub ? `<div class="tsub">${sub}</div>` : '') + '</div>';
@@ -3371,6 +4115,314 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     if (htmlCache.get(node) === html) return;
     htmlCache.set(node, html);
     node.innerHTML = html;
+  }
+  // ---------- 0.18：玩具页“设备”卡（效果图 docs/toy-device-card-mockup，2026-09-18 批准） ----------
+  // 每台设备一张，每一路一行：名字、跟着 heartlink 发出的帧动的小图、当前档位 N/总档。超过两台时每台收成一行。
+  // 只放扩展确实知道的：设备名、每一路的输出类型与档数、发出的档位、正在动 / 安静、要点名的输出、加热倒计时（动作时长或全局上限）。
+  // 电量、共用马达、保活、中文特性名、每一路的时限、是否接的是设备实验室、重连中：现在没有数据，不显示。
+  // 动画：整页一个 requestAnimationFrame 循环；只在面板打开、在玩具页、页面可见、这一节在可视范围内时跑；
+  // DOM 只改 transform / opacity，波形画在 canvas 上；系统开了“减少动态效果”时画静止的档位条。
+  const DEV_OUT_ZH = { Vibrate: '振动', Oscillate: '往复', Rotate: '旋转', Constrict: '收缩', HwPositionWithDuration: '抽动', Position: '位置', Estim: '电刺激', Temperature: '加热', Spray: '喷', Led: '灯' };
+  const DEV_HN = 72;   // 波形历史点数（每 60ms 一个，约 4.3 秒）
+  const devOpen = new Set();   // 收起模式下点开的设备
+  const devAnim = { sig: '', feats: [], cards: [], running: false, raf: 0, last: 0, visible: true, io: null, ioTarget: null, colors: null, heatEnd: new Map() };
+  const vizKind = (o) => (o === 'Temperature' ? 'heat' : o === 'Oscillate' || o === 'Position' || o === 'HwPositionWithDuration' ? 'osc' : o === 'Rotate' ? 'spin' : 'wave');
+  function featureSteps(f) {
+    if (!f || f.mode === 'position') return null;
+    if (f.source === 'intiface') return Number.isFinite(f.max) && f.max >= 1 ? Math.round(f.max) : null;
+    try {
+      const o = f.handle && f.handle._feature && f.handle._feature.Output && f.handle._feature.Output[f.output];
+      const r = o && (o.Value || o.StepRange || o.StepCount);
+      const m = Array.isArray(r) ? r[1] : r;
+      return Number.isFinite(m) && m >= 1 ? Math.round(m) : null;
+    } catch (_) { return null; }
+  }
+  function deviceModel(acts, offSet) {
+    const devs = new Map();
+    for (const a of acts) {
+      if (offSet.has(a.id)) continue;
+      const f = toyFeatures.get(a.id);
+      const key = f ? `${f.source}:${f.deviceIndex}` : `x:${a.device || a.id}`;
+      if (!devs.has(key)) devs.set(key, { key, name: String((f && f.name) || a.device || a.id), feats: [] });
+      const output = f ? f.output : ((a.outputs || []).find((o) => o !== '*') || 'Vibrate');
+      devs.get(key).feats.push({ id: a.id, output, kind: vizKind(output), steps: featureSteps(f), risky: HeartlinkHaptics.RISKY_OUTPUTS.includes(output), frames: !!f });
+    }
+    for (const d of devs.values()) {
+      const total = {}; const seen = {};
+      d.feats.forEach((x) => { total[x.output] = (total[x.output] || 0) + 1; });
+      d.feats.forEach((x) => { seen[x.output] = (seen[x.output] || 0) + 1; const zh = DEV_OUT_ZH[x.output] || x.output; x.label = total[x.output] > 1 ? `${zh} ${seen[x.output]}` : zh; });
+    }
+    return [...devs.values()];
+  }
+  function devRowHtml(f) {
+    const idle = f.risky ? '<span class="say idle">点名才会动</span>' : '';
+    let viz;
+    if (f.kind === 'osc') viz = `<div class="viz osc"><span class="range"></span><span class="rail"></span><span class="kn tr"></span><span class="kn tr"></span><span class="kn"></span>${idle}</div>`;
+    else if (f.kind === 'spin') viz = `<div class="viz spin"><svg class="wheel" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" style="stroke:var(--line2)"/><circle class="arc" cx="8" cy="8" r="6" stroke-dasharray="12 26" stroke-linecap="round" style="stroke:var(--faint)"/></svg><span class="track"><i></i></span>${idle}</div>`;
+    else if (f.kind === 'heat') viz = `<div class="viz heatv"><span class="fill"></span><span class="shim"><i></i></span><span class="end"></span>${idle}<span class="say run">${CLOCK_SVG}<span data-cd></span></span></div>`;
+    else viz = `<div class="viz"><canvas aria-hidden="true"></canvas>${idle}</div>`;
+    const lv = f.steps === 1 ? '<b>关</b>' : f.steps ? `<b>0</b>/${f.steps}` : '<b>0</b>%';
+    return `<div class="fr${f.kind === 'heat' ? ' heat' : ''}" data-id="${esc(f.id)}"><span class="fn" title="${esc(f.label)}">${f.risky ? RISK_SVG : ''}${esc(f.label)}</span>${viz}<span class="lv">${lv}</span></div>`;
+  }
+  function devCardHtml(d, collapsible, open) {
+    const art = `<span class="art"><span class="warm"></span><span class="fig">${WAVE_SVG}</span><span class="cd"></span></span>`;
+    const name = `<span class="dname" title="${esc(d.name)}">${esc(d.name)}</span>`;
+    const hd = collapsible
+      ? `<button class="dh" data-devtoggle="${esc(d.key)}" aria-expanded="${open}">${art}${name}<span class="minis" aria-hidden="true">${d.feats.map(() => '<i></i>').join('')}</span>${CV_SVG}</button>`
+      : `<div class="dh">${art}${name}</div>`;
+    return `<div class="dc" data-dev="${esc(d.key)}">${hd}<div class="rows"${open ? '' : ' hidden'}>${d.feats.map(devRowHtml).join('')}</div></div>`;
+  }
+  function renderDevices(acts, offSet) {
+    const list = deviceModel(acts, offSet);
+    el.devSec.hidden = !list.length;
+    const many = list.length > 2;
+    for (const k of [...devOpen]) if (!list.some((d) => d.key === k)) devOpen.delete(k);
+    const sig = JSON.stringify([many, list.map((d) => [d.key, d.name, many && devOpen.has(d.key), d.feats.map((f) => [f.id, f.label, f.kind, f.steps, f.risky])])]);
+    if (sig !== devAnim.sig) {
+      devAnim.sig = sig;
+      el.dcards.innerHTML = list.map((d) => devCardHtml(d, many, !many || devOpen.has(d.key))).join('');
+      const old = new Map(devAnim.feats.map((st) => [st.f.id, st]));
+      devAnim.cards = []; devAnim.feats = [];
+      list.forEach((d) => {
+        const card = el.dcards.querySelector(`[data-dev="${cssEsc(d.key)}"]`);
+        if (!card) return;
+        const cv = { el: card, d, fig: card.querySelector('.fig'), warm: card.querySelector('.warm'), minis: [...card.querySelectorAll('.minis i')], feats: [], seed: Math.random() * 10, moving: null, hot: null };
+        d.feats.forEach((f) => {
+          const row = card.querySelector(`.fr[data-id="${cssEsc(f.id)}"]`);
+          const prev = old.get(f.id);
+          const st = {
+            f, el: row, card: cv, on: false, step: -1, disp: prev ? prev.disp : 0, amp: prev ? prev.amp : 0, phase: Math.random() * 6, acc: 0, shimP: 0,
+            hist: prev ? prev.hist : new Float32Array(DEV_HN), hi: prev ? prev.hi : 0, trail: [],
+            lvB: row && row.querySelector('.lv b'), canvas: row && row.querySelector('canvas'), say: row && row.querySelector('.say.idle'),
+            kn: row ? [...row.querySelectorAll('.kn')] : [], rail: row && row.querySelector('.rail'), wheel: row && row.querySelector('.wheel'), arc: row && row.querySelector('.arc'),
+            dots: row && row.querySelector('.track i'), fill: row && row.querySelector('.fill'), shim: row && row.querySelector('.shim i'), cd: row && row.querySelector('[data-cd]'), viz: row && row.querySelector('.viz'),
+            w: 0, h: 0, railW: 0, vizW: 0, sayText: null, cdText: null,
+          };
+          st.ctx = st.canvas && typeof st.canvas.getContext === 'function' ? st.canvas.getContext('2d') : null;
+          cv.feats.push(st); devAnim.feats.push(st);
+        });
+        devAnim.cards.push(cv);
+      });
+      devMeasure();
+    }
+    devObserve();
+    devKick();
+  }
+  const cssEsc = (v) => String(v).replace(/["\\]/g, '\\$&');
+  // 尺寸只在重建、打开面板、窗口变化时量一次，动画循环里不读布局
+  function devMeasure() {
+    const dpr = Math.min(2, Number(host.devicePixelRatio) || 1);
+    for (const st of devAnim.feats) {
+      if (st.canvas) {
+        const w = st.canvas.clientWidth; const h = st.canvas.clientHeight;
+        if (w > 0 && h > 0) {
+          st.w = w; st.h = h; st.dpr = dpr;
+          if (st.canvas.width !== Math.round(w * dpr) || st.canvas.height !== Math.round(h * dpr)) { st.canvas.width = Math.round(w * dpr); st.canvas.height = Math.round(h * dpr); }
+        }
+      }
+      if (st.rail) st.railW = st.rail.clientWidth || 0;
+      if (st.viz) st.vizW = st.viz.clientWidth || 0;
+    }
+  }
+  function devObserve() {
+    if (typeof host.IntersectionObserver !== 'function' || !el.devSec || !el.body) { devAnim.visible = true; return; }
+    if (devAnim.ioTarget === el.devSec) return;
+    try {
+      if (devAnim.io) devAnim.io.disconnect();
+      devAnim.io = new host.IntersectionObserver((es) => { for (const e of es) devAnim.visible = e.isIntersecting; if (devAnim.visible) devKick(); }, { root: el.body });
+      devAnim.io.observe(el.devSec);
+      devAnim.ioTarget = el.devSec;
+      disposers.push(() => { try { devAnim.io && devAnim.io.disconnect(); } catch (_) {} });
+    } catch (_) { devAnim.visible = true; }
+  }
+  const reducedMotion = () => { try { return !!(host.matchMedia && host.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (_) { return false; } };
+  function devShouldRun() {
+    return !destroyed && !!hostEl && hostEl.classList.contains('open') && state.badgeTab === 'toy' && !doc.hidden && devAnim.visible && devAnim.feats.length > 0 && !el.devSec.hidden;
+  }
+  function devKick() {
+    if (devAnim.running || !devShouldRun() || typeof host.requestAnimationFrame !== 'function') return;
+    devAnim.running = true;
+    devAnim.last = 0;
+    devMeasure();
+    devAnim.raf = host.requestAnimationFrame(devFrame);
+  }
+  function devColors() {
+    if (devAnim.colors) return devAnim.colors;
+    try {
+      const cs = host.getComputedStyle(hostEl);
+      const v = (n, d) => String(cs.getPropertyValue(n) || '').trim() || d;
+      devAnim.colors = { toy: v('--toy', '#D0668C'), toy2: v('--toy2', '#E58BAB'), line: v('--line2', '#3A3B40'), faint: v('--faint', '#6A6965') };
+    } catch (_) { devAnim.colors = { toy: '#D0668C', toy2: '#E58BAB', line: '#3A3B40', faint: '#6A6965' }; }
+    return devAnim.colors;
+  }
+  function devSetOn(st, on) {
+    if (st.on === on) return;
+    st.on = on;
+    if (st.el) st.el.classList.toggle('on', on);
+  }
+  function devSay(st, text) {
+    if (!st.say || st.sayText === text) return;
+    st.sayText = text;
+    st.say.innerHTML = text;
+  }
+  function devDrawWave(st, dt, rm, C) {
+    const g = st.ctx; if (!g || !st.w) return;
+    const w = st.w; const h = st.h; const mid = h / 2;
+    g.setTransform(st.dpr, 0, 0, st.dpr, 0, 0);
+    g.clearRect(0, 0, w, h);
+    const xNow = w * 0.64; const amp = h / 2 - 3;
+    if (rm) {   // 减少动态效果：静止的档位条
+      if (st.say && !st.on) return;
+      g.fillStyle = C.line; g.fillRect(6, mid - 1, w - 12, 2);
+      if (st.disp > 0.01) { g.fillStyle = C.toy; g.beginPath(); if (g.roundRect) g.roundRect(6, mid - 3, (w - 12) * st.disp, 6, 3); else g.rect(6, mid - 3, (w - 12) * st.disp, 6); g.fill(); }
+      return;
+    }
+    if (!st.say || st.on) { g.strokeStyle = C.line; g.lineWidth = 1; g.beginPath(); g.moveTo(0, mid); g.lineTo(w, mid); g.stroke(); }
+    const n = DEV_HN;
+    const val = (k) => (k === n - 1 ? st.disp : st.hist[(st.hi + k) % n]);
+    let any = st.disp > 0.005;
+    for (let k = 0; k < n && !any; k++) if (st.hist[k] > 0.005) any = true;
+    if (any) {
+      // 历史包络：左淡右浓
+      const grad = g.createLinearGradient(0, 0, xNow, 0);
+      grad.addColorStop(0, 'rgba(0,0,0,0)'); grad.addColorStop(1, C.toy);
+      g.globalAlpha = 0.26; g.fillStyle = grad; g.beginPath();
+      for (let k = 0; k < n; k++) { const x = k / (n - 1) * xNow; const y = mid - val(k) * amp; if (k) g.lineTo(x, y); else g.moveTo(x, y); }
+      for (let k = n - 1; k >= 0; k--) g.lineTo(k / (n - 1) * xNow, mid + val(k) * amp);
+      g.closePath(); g.fill();
+      g.globalAlpha = 0.7; g.strokeStyle = grad; g.lineWidth = 1; g.beginPath();
+      for (let k = 0; k < n; k++) { const x = k / (n - 1) * xNow; const y = mid - val(k) * amp; if (k) g.lineTo(x, y); else g.moveTo(x, y); }
+      g.stroke(); g.globalAlpha = 1;
+    }
+    if (st.disp < 0.01) return;
+    // 载波：振幅跟档位走，频率随档位升高
+    const lv = st.disp;
+    st.phase += dt * (5 + 16 * lv);
+    const cyc = (2.2 + 4.5 * lv) / Math.max(1, w - xNow);
+    const path = () => {
+      g.beginPath();
+      for (let x = xNow; x <= w - 2; x += 1) {
+        const e = Math.min(1, (x - xNow) / 10) * Math.max(0, Math.min(1, (w - 2 - x) / 14));
+        const y = mid + Math.sin((x - xNow) * cyc * 2 * Math.PI - st.phase) * lv * amp * e;
+        if (x === xNow) g.moveTo(x, y); else g.lineTo(x, y);
+      }
+    };
+    g.lineJoin = 'round'; g.lineCap = 'round';
+    path(); g.strokeStyle = C.toy; g.globalAlpha = 0.18; g.lineWidth = 4; g.stroke();
+    path(); g.globalAlpha = 1; g.lineWidth = 1.5; g.strokeStyle = C.toy2; g.stroke();
+    g.fillStyle = C.toy2; g.beginPath(); g.arc(xNow, mid, 1.8, 0, Math.PI * 2); g.fill();
+  }
+  function devFrame(ts) {
+    devAnim.raf = 0;
+    if (!devShouldRun()) { devAnim.running = false; return; }
+    const dt = devAnim.last ? Math.min(0.05, Math.max(0, (ts - devAnim.last) / 1000)) : 0.016;
+    devAnim.last = ts;
+    const rm = reducedMotion();
+    const t = ts / 1000;
+    const C = devColors();
+    const nowMs = Date.now();
+    const runs = new Map(actuators.running().map((r) => [r.id, r]));
+    let active = false;
+    for (const st of devAnim.feats) {
+      const f = st.f; const run = runs.get(f.id);
+      let target;
+      if (f.kind === 'heat') target = run ? 1 : 0;
+      else target = f.frames ? (toyLevels.get(f.id) || 0) : (run ? run.intensity : 0);
+      let step; let q;
+      if (f.steps) { step = Math.round(target * f.steps); if (target > 0 && step === 0) step = 1; q = step / f.steps; }
+      else { step = Math.round(target * 100); q = target; }
+      st.disp += (q - st.disp) * (1 - Math.exp(-dt / (rm ? 0.001 : 0.12)));
+      if (Math.abs(q - st.disp) < 0.002) st.disp = q;
+      devSetOn(st, step > 0);
+      if (step !== st.step) { st.step = step; if (st.lvB) st.lvB.textContent = f.steps === 1 ? (step ? '开' : '关') : String(step); }
+      st.acc += dt;
+      while (st.acc >= 0.06) { st.acc -= 0.06; st.hist[st.hi] = st.disp; st.hi = (st.hi + 1) % DEV_HN; }
+      if (f.kind === 'wave') {
+        devDrawWave(st, dt, rm, C);
+        for (let k = 0; k < DEV_HN && !active; k++) if (st.hist[k] > 0.005) active = true;
+      } else if (f.kind === 'osc' && st.kn.length === 3) {
+        const span = st.railW; let x;
+        if (rm) x = span * st.disp;
+        else {
+          st.phase += dt * 2 * Math.PI * (0.35 + 1.9 * st.disp);
+          st.amp += ((st.on ? 1 : 0) - st.amp) * (1 - Math.exp(-dt / 0.25));
+          if (st.amp < 0.002) st.amp = 0;
+          x = span * ((1 - Math.cos(st.phase)) / 2) * st.amp;   // 两端减速、中间最快
+          if (st.amp > 0) active = true;
+        }
+        st.trail.unshift(x); if (st.trail.length > 8) st.trail.length = 8;
+        const tr1 = st.trail[3] == null ? x : st.trail[3]; const tr2 = st.trail[7] == null ? x : st.trail[7];
+        st.kn[2].style.transform = `translate3d(${x.toFixed(2)}px,0,0)`;
+        st.kn[1].style.transform = `translate3d(${tr1.toFixed(2)}px,0,0)`;
+        st.kn[0].style.transform = `translate3d(${tr2.toFixed(2)}px,0,0)`;
+        st.kn[1].style.opacity = rm || !span ? '0' : (Math.min(0.35, Math.abs(x - tr1) / span * 3) * st.disp * 1.5).toFixed(3);
+        st.kn[0].style.opacity = rm || !span ? '0' : (Math.min(0.2, Math.abs(x - tr2) / span * 2) * st.disp * 1.5).toFixed(3);
+      } else if (f.kind === 'spin' && st.wheel) {
+        if (!rm) {
+          st.phase += dt * (40 + 620 * st.disp);
+          st.wheel.style.transform = `rotate(${(st.phase % 360).toFixed(1)}deg)`;
+          if (st.dots) st.dots.style.transform = `translate3d(${(-(st.phase / 10) % 8).toFixed(2)}px,0,0)`;
+        }
+        const col = st.on ? C.toy : C.faint;
+        if (st.arc && st.arcCol !== col) { st.arcCol = col; st.arc.style.stroke = col; }
+      } else if (f.kind === 'heat') {
+        const remainMs = run ? Math.max(0, run.startedAt + run.spanMs - nowMs) : 0;
+        const p = run && run.spanMs > 0 ? 1 - remainMs / run.spanMs : 0;
+        if (st.fill) st.fill.style.transform = `scaleX(${p.toFixed(4)})`;
+        if (run) st.heatRun = true;
+        else if (st.heatRun) { st.heatRun = false; devAnim.heatEnd.set(f.id, nowMs); }
+        if (!rm && st.on && st.shim) {
+          st.shimP = (st.shimP + dt / 2.2) % 1;
+          const vw = st.vizW * p;
+          st.shim.style.transform = `translate3d(${(st.shimP * vw - 28).toFixed(1)}px,0,0)`;
+          st.shim.style.opacity = Math.min(1, vw / 40).toFixed(2);
+        }
+        if (st.cd) {
+          const txt = run ? `<b>${Math.ceil(remainMs / 1000)}</b>秒后自动停` : '';
+          if (st.cdText !== txt) { st.cdText = txt; st.cd.innerHTML = txt; }
+        }
+        const ended = devAnim.heatEnd.get(f.id);
+        if (ended && nowMs - ended < 4000) { devSay(st, `${CLOCK_SVG}到时已自动停`); active = true; }
+        else devSay(st, '点名才会动');
+      }
+      if (st.on || st.disp > 0.002) active = true;
+    }
+    for (const cv of devAnim.cards) {
+      let vib = 0; let osc = 0; let hot = 0; let anyOn = false;
+      cv.feats.forEach((st, i) => {
+        if (st.on) anyOn = true;
+        if (st.f.kind === 'wave') vib = Math.max(vib, st.disp);
+        else if (st.f.kind === 'heat') hot = Math.max(hot, st.disp);
+        else osc = Math.max(osc, st.disp);
+        const m = cv.minis[i];
+        if (m) {
+          const jit = rm ? 0 : 0.12 * Math.sin(t * 9 + i * 2);
+          m.style.transform = `scaleY(${(st.on ? Math.min(1, 0.3 + st.disp * 0.8 + jit) : 0.35).toFixed(3)})`;
+          if (m.classList.contains('on') !== st.on) m.classList.toggle('on', st.on);
+        }
+      });
+      if (cv.moving !== anyOn) { cv.moving = anyOn; cv.el.classList.toggle('moving', anyOn); }
+      const isHot = hot > 0.01;
+      if (cv.hot !== isHot) { cv.hot = isHot; cv.el.classList.toggle('hot', isHot); }
+      if (cv.fig) {
+        if (rm || (vib < 0.002 && osc < 0.002)) { if (cv.figMoved) { cv.fig.style.transform = ''; cv.figMoved = false; } }
+        else {
+          const tt = t + cv.seed;
+          const jx = vib * (Math.sin(tt * 53) * 0.6 + Math.sin(tt * 31) * 0.4) * 1.1;
+          const jy = vib * (Math.sin(tt * 47 + 1) * 0.5) * 0.8 + osc * Math.sin(tt * (3 + 5 * osc)) * 1.6;
+          const rot = vib * Math.sin(tt * 41) * 2.2 + osc * Math.sin(tt * (3 + 5 * osc) + 0.6) * 3;
+          cv.fig.style.transform = `translate3d(${jx.toFixed(2)}px,${jy.toFixed(2)}px,0) rotate(${rot.toFixed(2)}deg)`;
+          cv.figMoved = true;
+        }
+      }
+      if (cv.warm) {
+        const o = hot ? (rm ? 0.7 : (0.55 + 0.25 * Math.sin(t * 1.6)) * hot).toFixed(3) : '0';
+        if (cv.warmO !== o) { cv.warmO = o; cv.warm.style.opacity = o; }
+      }
+    }
+    // 都安静下来（波形历史也走完）就停，下一次发帧或打开面板时再启动
+    if (active) devAnim.raf = host.requestAnimationFrame(devFrame);
+    else devAnim.running = false;
   }
   // render() 只登记“要重画”：同一帧里的多次请求（样本、计时器、事件）合成一次；页面在后台时不画，回到前台补一次
   let beatBpm = null;
@@ -3394,12 +4446,13 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     const d = on && base ? Math.round((state.lastSample.bpm - base.bpm) / base.bpm * 100) : null;
     syncTone();
     // 胶囊：心率段
-    el.heart.className = 'dot heart ' + (on ? 'on' : state.connected ? 'stale' : 'off');
+    el.heart.className = 'disc hr ' + (on ? 'on' : state.connected ? 'stale' : 'off');
     if (on) {   // 心率变化不到 5 bpm 不改动画时长：改 --beat 会让动画重新计时、样式重算
       const bpm = Math.max(state.lastSample.bpm, 30);
       if (beatBpm == null || Math.abs(bpm - beatBpm) >= 5) { beatBpm = bpm; hostEl.style.setProperty('--beat', (60 / bpm) + 's'); }
     }
     el.bpm.textContent = on ? String(state.lastSample.bpm) : '--';
+    el.bpm.className = 'num' + (on ? '' : ' dim');
     el.bpm.style.display = (state.connected || (state.bridgeUp && fresh)) ? '' : 'none';   // 0.9：桥送来的心率也显示
     el.spark.style.display = on ? '' : 'none';
     if (on) {
@@ -3411,15 +4464,19 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     el.delta.textContent = d != null ? `${d >= 0 ? '+' : ''}${d}%` : '';
     el.delta.title = base ? `现在比平静心率 ${base.bpm} ${d >= 0 ? '高' : '低'} ${Math.abs(d || 0)}%` : '';
     el.delta.className = 'delta' + (d != null && d >= 10 ? ' up' : '');
-    let tag;
+    let tag; let tagWarn = false;
     if (state.newerVersion) tag = '请刷新';   // 别的页面已装更新版本，优先提示
     else if (state.waitingForDevice && !state.connected) tag = '等设备回来';
     else if (state.reconnecting) tag = '重连中';
     else if (!state.connected) tag = state.bridgeUp && fresh ? '经本机桥' : '未连接';
-    else if (!fresh) tag = `${Math.round((now - (state.lastSample ? state.lastSample.t : now)) / 1000)} 秒无数据`;
-    else tag = (MODE_ZH[mode] || '幕后') + (state.injectEnabled === false ? ' · 未发送' : modeSource() === 'card' ? ' · 卡片设定' : '');
+    else if (!fresh) {
+      tagWarn = true;
+      // 连上后还没收到过数据（或只有连上之前的旧数据）：不显示“0 秒无数据”
+      const lastT = state.lastSample ? state.lastSample.t : null;
+      tag = lastT == null || (state.connectedAt && lastT < state.connectedAt) ? '等待数据' : `${Math.max(1, Math.round((now - lastT) / 1000))} 秒无数据`;
+    } else tag = (MODE_ZH[mode] || '幕后') + (state.injectEnabled === false ? ' · 未发送' : modeSource() === 'card' ? ' · 卡片设定' : '');
     el.tag.textContent = tag;
-    el.tag.className = 'tag' + (state.connected && fresh && mode !== 'author' ? ' ch' : '');
+    el.tag.className = 'mode' + (tagWarn ? ' warn' : state.connected && fresh && mode !== 'author' ? ' ch' : '');
     // 胶囊：玩具段；只显示正在用的
     const acts = actuators.list();
     const busy = acts.filter((a) => a.busy);
@@ -3431,7 +4488,7 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     el.seg.toy.hidden = !toyActive;
     el.seg.none.hidden = hrActive || toyActive;
     el.segsep.hidden = !(hrActive && toyActive);
-    el.tn.textContent = `${nToy} 路`;
+    el.tn.textContent = String(nToy);
     el.live.className = 'live' + (busy.length ? ' on' : '');
     hostEl.classList.toggle('busy', busy.length > 0);
     const info = state.deviceInfo || {};
@@ -3442,6 +4499,7 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     const tab = state.badgeTab === 'toy' ? 'toy' : 'hr';   // 默认健康设备
     el.tabs.forEach((b) => b.setAttribute('aria-selected', String(b.getAttribute('data-tab') === tab)));
     el.panes.forEach((pn) => { pn.hidden = pn.getAttribute('data-pane') !== tab; });
+    el.head.className = 'head' + (tab === 'toy' ? ' pad' : '');
     el.hrBadge.hidden = !(state.connected || state.reconnecting || state.waitingForDevice);
     el.hrBadge.className = 'd6' + (state.connected ? '' : ' warn');
     el.hrBadge.title = state.connected ? '已连接' : state.reconnecting ? '重连中' : '等设备回来';
@@ -3452,6 +4510,8 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     const folded = !!state.settingsFolded;
     el.folds.forEach((b) => b.setAttribute('aria-expanded', String(!folded)));
     el.hrFold.hidden = folded; el.toyFold.hidden = folded;
+    el.hrFoldSec.className = 'sec' + (folded ? ' tight' : '');
+    el.toyFoldSec.className = 'sec' + (folded ? ' tight' : '');
     // 健康设备页
     el.hrEmpty.hidden = hrActive;
     el.hrLive.hidden = !hrActive;
@@ -3460,8 +4520,8 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
       const m2 = sourceMeta();
       el.dev.textContent = `${(state.deviceName || '心率设备').split(' ')[0]}${info.model ? ' ' + info.model : ''}`;
       el.hrDot.className = 'sdot ' + (on ? 'ok' : 'warn');
-      if (on) { setHtml(el.hrState, m2.rr ? IBI_SVG : ''); el.hrState.title = m2.rr ? '含心跳间隔' : ''; }
-      else { htmlCache.delete(el.hrState); el.hrState.textContent = tag; el.hrState.title = ''; }
+      if (on) { setHtml(el.hrState, m2.rr ? IBI_SVG : ''); el.hrState.title = m2.rr ? '含心跳间隔' : ''; el.hrState.className = 'st'; }
+      else { htmlCache.delete(el.hrState); el.hrState.textContent = tag; el.hrState.title = ''; el.hrState.className = 'st' + (tagWarn ? ' warn' : ''); }
       setHtml(el.batt, state.battery != null ? `电量 <em>${esc(state.battery)}%</em>` : '');
       renderPhases(base, now);
       const hist = history(); const lastTurn = hist[hist.length - 1];
@@ -3472,6 +4532,7 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
       setHtml(el.hrv, hrvHtml); setHtml(el.last, lastHtml);
       el.hrvLine.hidden = !hrvHtml && !lastHtml;
       // 这一轮会注入什么（一句话）；具体时长、峰值在上面的时间线里，这里只说比平静高多少
+      let seesMut = false;
       if (state.injectEnabled === false) setHtml(el.sees, '<i>“发给模型”已关，模型收不到这些数据。</i>');
       else {
         const c2 = compose(now, state.connected ? base : undefined);
@@ -3483,9 +4544,10 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
           else parts.push('峰值');
           if (sm.writeSec) parts.push('这条写了多久');
           setHtml(el.sees, `${parts.join('、')}，${modeTxt}。`);
-        } else setHtml(el.sees, '<span class="mut">还没有数据，角色回复后开始记。</span>');
+        } else { seesMut = true; setHtml(el.sees, '还没有数据，角色回复后开始记。'); }
         if (!el.ptext.hidden) el.ptext.textContent = c2.text;
       }
+      el.sees.className = 'sees' + (seesMut ? ' mut' : '');
       const sig = lastSignal();
       el.sigBox.hidden = !sig;
       el.sig.textContent = sig ? `“${sig.text}”` : '';
@@ -3498,10 +4560,11 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     el.sets.forEach((b) => {
       const [key, val] = b.getAttribute('data-set').split(':');
       const cur = key === 'mode' ? mode : key === 'profile' ? pol.profile : String(state.haptics.maxIntensity);
-      b.className = cur === val ? 'on' : '';
+      b.setAttribute('aria-pressed', String(cur === val));
     });
     const intiOn = state.intifaceStatus === 'connected'; const wasmOn = WASM.status === 'connected';
-    el.out.textContent = { idle: '推荐', connecting: '连接中…', connected: '已连接', disconnected: '已断开', error: '连不上，Intiface 开了吗' }[state.intifaceStatus] || '推荐';
+    el.out.textContent = { idle: '推荐', connecting: '连接中…', connected: '已连接', disconnected: '重连中…', error: '连不上，Intiface 开了吗' }[state.intifaceStatus] || '推荐';
+    el.out.className = state.intifaceStatus === 'idle' ? 'rec' : '';
     el.toyBtn.className = 'btn' + (state.haptics.intiface.enabled ? ' on' : '');
     el.wasmState.textContent = { idle: '测试', loading: '加载中…', connected: '已连接', error: '连接失败' }[WASM.status] || '测试';
     el.wasmBtn.className = 'btn' + (WASM.client ? ' on' : '');
@@ -3514,7 +4577,23 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     el.connDot.className = 'd6' + (busy.length ? ' toy' : '');
     el.toyEmpty.hidden = nToy > 0;
     el.toyTiles.hidden = nToy === 0;
-    const lastReply = (state.replyLog || []).filter((x) => x.chatId === chatId()).slice(-1)[0];
+    // 反馈按钮：没有设备不显示；有动作在动或排队时四个都在，否则只剩“再来一次”（没有可重放的也不显示）
+    const pendingN = actuators.pending();
+    const moving = busy.length > 0 || pendingN > 0;
+    const lastOk = actuators.lastOk();
+    const canReplay = !!(lastOk && lastOk.action && !lastOk.action.stop && acts.length);
+    el.fb.hidden = nToy === 0 || (!moving && !canReplay);
+    el.fb.className = 'fb' + (moving ? '' : ' solo');
+    el.fb.setAttribute('aria-label', moving ? '调整正在动的动作' : '重放最后一个动作');
+    const doneKind = state.fbDone && state.fbDone.until > now ? state.fbDone.kind : null;
+    el.fbBtns.forEach((b) => {
+      const spec = FB_BY[b.getAttribute('data-fb')]; if (!spec) return;
+      const done = doneKind === spec[0];
+      setHtml(b, done ? `${CK_SVG}${spec[2]}` : spec[1]);
+      b.className = 'fbtn' + (spec[0] === 'replay' ? ' rp' : '') + (done ? ' done' : '');
+    });
+    const entries = chatEntries();
+    const lastEntry = entries[entries.length - 1];
     const SKIP_ZH = { disabled: '联动没开', 'replies-off': '回复联动关了', 'no-device': '没有设备', safeword: '安全词拦下' };
     const PAT_ZH = { pulse: '轻点', double: '两下', triple: '三下', long: '持续', heartbeat: '心跳', wave: '波浪' };
     // 玩法说明只在刚开始时显示：看到第一条带动作的回复（或点 ×）后收起，底部留“玩法”可再打开
@@ -3522,30 +4601,38 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     el.play.hidden = !!state.playSeen && !state.playOpen;
     el.playBtn.hidden = tab !== 'toy' || !el.play.hidden;
     let movingShown = false;
-    if (!lastReply) setHtml(el.lastact, '<div class="node hol"><div class="th"><span class="m">角色写出动作后会列在这里</span></div></div>');
+    let skipNums = [];
+    if (!lastEntry) setHtml(el.lastact, '<div class="node hol"><div class="th"><span class="m">角色写出动作后会列在这里</span></div></div>');
     else {
-      // 动作按顺序执行：有设备在动时，最后一个已执行的动作就是正在动的那个
-      let movingIdx = -1;
-      if (busy.length && !lastReply.skipped) lastReply.acts.forEach((a, i) => { const r = lastReply.results[i]; if (r && r.results.some((x) => x.ok)) movingIdx = i; });
-      movingShown = movingIdx >= 0;
-      const rows = lastReply.acts.map((a, i) => {
-        const r = lastReply.results[i];
+      const out = lastEntry.outcome || [];
+      const rows = lastEntry.acts.map((a, i) => {
+        const r = lastEntry.results[i];
         const okN = r ? r.results.filter((x) => x.ok).length : 0;
-        const val = `${Math.round((a.intensity ?? 0.5) * 100)}%${a.durationMs ? ` · ${(a.durationMs / 1000).toFixed(a.durationMs % 1000 ? 1 : 0)}s` : ''}`;
+        const st = out[i];
+        const adj = (lastEntry.adj && lastEntry.adj[i]) || 0;
+        const pct = Math.max(0, Math.min(100, Math.round((a.intensity ?? 0.5) * 100) + adj));
+        const val = `${pct}%${a.durationMs ? ` · ${(a.durationMs / 1000).toFixed(a.durationMs % 1000 ? 1 : 0)}s` : ''}`;
+        const pop = lastEntry.tagT && now - lastEntry.tagT[i] < 400 ? ' pop' : '';
+        const skippedByReader = lastEntry.skipIdx && lastEntry.skipIdx.has(i);
         let cls = 'node'; let c = 'on'; let mid = ''; let right = '';
-        if (lastReply.skipped) { c = 'warn'; right = `<span class="r m no">${esc(SKIP_ZH[lastReply.skipped] || lastReply.skipped)}</span>`; }
+        if (lastEntry.skipped) { c = 'warn'; right = `<span class="r m no">${esc(SKIP_ZH[lastEntry.skipped] || lastEntry.skipped)}</span>`; }
+        else if (skippedByReader) { cls += ' skipped hol'; c = 'faint'; mid = `<span class="ntag skip${pop}">已跳过</span>`; right = okN ? `<span class="r m">${okN} 路</span>` : ''; }
+        else if (st === 'running') { cls += ' pulse toy'; c = 'toy'; mid = '<span class="m t">正在动</span>'; right = `<span class="r m">${okN} 路</span>`; movingShown = true; }
+        else if (st === 'refused' || (r && !okN)) { c = 'warn'; right = '<span class="r m no">没执行</span>'; }
+        else if (st === 'cut') { if (!r) cls += ' hol'; c = 'faint'; right = '<span class="r m">已停</span>'; }
         else if (!r) { cls += ' hol'; c = 'faint'; right = '<span class="r m">排队中</span>'; }
-        else if (!okN) { c = 'warn'; right = '<span class="r m no">没执行</span>'; }
-        else {
-          right = `<span class="r m">${okN} 路</span>`;
-          if (i === movingIdx) { cls += ' pulse toy'; c = 'toy'; mid = '<span class="m t">正在动</span>'; }
-        }
+        else right = `<span class="r m">${okN} 路</span>`;
+        if (adj && !skippedByReader && !lastEntry.skipped) mid += `<span class="ntag up${pop}">${adj > 0 ? '强 +' : '弱 −'}${Math.abs(adj)}%</span>`;
         return `<div class="${cls}" style="--c:var(--${c})"><div class="th"><b>${esc(PAT_ZH[a.pattern] || a.pattern)}</b><span class="d">${val}</span>${mid}${right}</div></div>`;
       });
       setHtml(el.lastact, '<div class="node hol"><div class="th"><span class="m">回复写完</span></div></div>'
         + (rows.join('') || '<div class="node hol"><div class="th"><span class="m">这条回复没有动作</span></div></div>'));
+      skipNums = [...new Set(fbState().log.filter((x) => x.type === 'skip' && x.act && x.act.key === lastEntry.key && Number.isInteger(x.act.i)).map((x) => x.act.i + 1))].sort((a, b) => a - b);
     }
+    el.fbnote.hidden = !skipNums.length;
+    el.fbnote.textContent = skipNums.length ? `下一轮会告诉模型：跳过了第 ${skipNums.join('、')} 个` : '';
     el.now.textContent = busy.length && !movingShown ? '正在动' : '';
+    renderDevices(acts, offSet);
     if (hostEl.classList.contains('devs')) {
       const OUT_ZH = { Vibrate: '振动', Oscillate: '往复', Rotate: '旋转', Constrict: '收缩', HwPositionWithDuration: '抽动', Position: '位置', Estim: '电刺激', Temperature: '加热' };
       const groups = {};
@@ -3559,8 +4646,7 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     const probs = diagnostics().problems;
     setHtml(el.help, probs.length ? probs.map((p) => `<li class="${p.severity}"><b>${esc(p.message)}</b>${p.hint ? `<br>${esc(p.hint)}` : ''}</li>`).join('') : '<li>一切正常。</li>');
     const warn = probs.some((p) => p.severity !== 'info');
-    el.helpBtn.textContent = warn ? '排查问题 ●' : '排查问题';
-    el.helpBtn.className = warn ? 'warn' : '';
+    setHtml(el.helpBtn, warn ? '排查问题<i class="d6 warn"></i>' : '排查问题');
     const nctx = Object.keys(contextSources()).length; const nk = Object.keys(kinds()).length;
     el.foot.textContent = '';
     el.foot.title = `${state.samples.length} 个样本${nk ? ` · 另有 ${nk} 类信号` : ''}${nctx ? ` · ${nctx} 条设备状态` : ''}`;
@@ -3607,6 +4693,8 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
     connect, disconnect, setManualBaseline, clearManualBaseline,
     injectContext, exportCsv, setPrior, diagnostics, exportDiagnostics, setExposure, ensureGuideWorldbook,
     getHaptics, setHaptics, actuate: (target, action, opts) => actuators.actuate(target, action, opts), stopHaptics: () => actuators.stop(), actOnReply,
+    // 0.18：与玩具页按钮同一条路径（全部停止 / 弱一点 / 强一点 / 再来一次 / 跳过）；feedbackLine() 是下一次发送会写的 feedback 行
+    haltAll: () => haltAll('api'), quickFeedback: (kind) => quickFeedback(kind), feedbackLine: () => safeFeedbackLine(),
     exportEvents: () => JSON.stringify({ version: VERSION, exportedAt: Date.now(), events: state.events, samples: state.samples }),
     destroy,
   };
@@ -3618,6 +4706,7 @@ button:focus-visible{outline:2px solid var(--on);outline-offset:2px}
   if (!state.chatIdSeen) state.chatIdSeen = chatId();
   if (!history().length) loadHistoryFromChat();
   mountBadge();
+  registerStopControls();
   state.onSample = () => render();
   state.onConnection = () => render();
   doc.addEventListener('visibilitychange', onRenderVisibility);
