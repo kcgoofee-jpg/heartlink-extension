@@ -1,38 +1,88 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 330" font-family="-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" role="img" aria-label="一轮对话的相位：上一条回复的生成与阅读、写本条消息、发送时注入">
-  <rect width="960" height="330" rx="18" fill="#16151b"/>
-  <text x="32" y="44" fill="#ecebf1" font-size="20" font-weight="700">一轮对话里，心率被切成哪几段</text>
-  <text x="32" y="68" fill="#9a97a6" font-size="13">相位边界都是页面事件；你按下发送的那一刻，heartlink 把这几段整理成 &lt;bio_context&gt; 注入给模型</text>
-  <!-- 时间轴 -->
-  <line x1="40" y1="176" x2="920" y2="176" stroke="#3a3842" stroke-width="2"/>
-  <!-- gen -->
-  <rect x="60" y="130" width="230" height="46" rx="8" fill="#7c8cf0" fill-opacity=".22" stroke="#7c8cf0"/>
-  <text x="175" y="151" fill="#c8cdfb" font-size="15" font-weight="700" text-anchor="middle">gen · 看生成</text>
-  <text x="175" y="168" fill="#9aa2e0" font-size="11.5" text-anchor="middle">首字、思维链、正文</text>
-  <!-- read -->
-  <rect x="290" y="130" width="300" height="46" rx="8" fill="#ef5a55" fill-opacity=".22" stroke="#ef5a55"/>
-  <text x="440" y="151" fill="#ffc2bf" font-size="15" font-weight="700" text-anchor="middle">read · 读上一条回复</text>
-  <text x="440" y="168" fill="#e89a96" font-size="11.5" text-anchor="middle">峰值、峰值出现在第几段、心率变异</text>
-  <!-- write -->
-  <rect x="590" y="130" width="230" height="46" rx="8" fill="#2bb8a8" fill-opacity=".22" stroke="#2bb8a8"/>
-  <text x="705" y="151" fill="#a6ece3" font-size="15" font-weight="700" text-anchor="middle">write · 写这一条</text>
-  <text x="705" y="168" fill="#7fcfc5" font-size="11.5" text-anchor="middle">打字时长、停顿、删改</text>
-  <!-- send -->
-  <line x1="820" y1="112" x2="820" y2="196" stroke="#e8a23c" stroke-width="3"/>
-  <text x="826" y="126" fill="#f3c47a" font-size="14" font-weight="700">send</text>
-  <text x="826" y="143" fill="#c9a36a" font-size="11.5">按下发送</text>
-  <!-- 事件刻度 -->
-  <g fill="#9a97a6" font-size="11.5" text-anchor="middle">
-    <line x1="60" y1="176" x2="60" y2="186" stroke="#9a97a6"/><text x="60" y="202">上一条开始生成</text>
-    <line x1="290" y1="176" x2="290" y2="186" stroke="#9a97a6"/><text x="290" y="202">回复出完</text>
-    <line x1="590" y1="176" x2="590" y2="186" stroke="#9a97a6"/><text x="590" y="202">开始打字</text>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 450" width="1000" height="450" font-family="-apple-system, 'PingFang SC', 'Noto Sans SC', 'Microsoft YaHei', sans-serif" role="img" aria-label="一轮对话的相位：gen 和 read 属于上一条回复，write 和 send 属于这一条消息；离开的时段不计入；虚线是平静心率">
+  <defs>
+    <pattern id="away" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)">
+      <rect width="8" height="8" fill="#fbfafc"/>
+      <line x1="0" y1="0" x2="0" y2="8" stroke="#c9c4d3" stroke-width="3"/>
+    </pattern>
+  </defs>
+
+  <!-- 底卡 -->
+  <rect x="1" y="1" width="998" height="448" rx="20" fill="#fbfafc" stroke="#e2dfe8" stroke-width="1.5"/>
+
+  <text x="50" y="52" fill="#24212c" font-size="22" font-weight="700">一轮对话里，心率被切成哪几段</text>
+  <text x="50" y="80" fill="#5d5a68" font-size="13">你按下发送时，heartlink 把这几段整理好，随提示词发给你自己的模型</text>
+
+  <!-- 相位底色 -->
+  <rect x="60" y="130" width="560" height="120" fill="#eeebf3"/>
+  <rect x="620" y="130" width="240" height="120" fill="#f5f1ea"/>
+  <g stroke="#fbfafc" stroke-width="2">
+    <line x1="120" y1="130" x2="120" y2="250"/>
+    <line x1="200" y1="130" x2="200" y2="250"/>
   </g>
+  <g stroke="#c9c4d3" stroke-width="1.5">
+    <line x1="300" y1="130" x2="300" y2="250"/>
+    <line x1="620" y1="130" x2="620" y2="250"/>
+  </g>
+  <rect x="470" y="130" width="60" height="120" fill="url(#away)"/>
+  <g font-size="12" fill="#5d5a68" text-anchor="middle">
+    <text x="90" y="148">等首字</text>
+    <text x="160" y="148">思考</text>
+    <text x="250" y="148">正文</text>
+  </g>
+  <g font-size="13" fill="#24212c" text-anchor="middle">
+    <rect x="478" y="176" width="44" height="42" rx="6" fill="#fbfafc"/>
+    <text x="500" y="193">离开</text>
+    <text x="500" y="211">不计</text>
+  </g>
+
+  <!-- 平静心率 -->
+  <line x1="60" y1="222" x2="860" y2="222" stroke="#8a8696" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="630" y="242" fill="#5d5a68" font-size="12">平静心率</text>
+
+  <!-- 心率曲线（离开的时段断开） -->
+  <g fill="none" stroke="#d6455d" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M60 214 C80 213 100 211 120 208 C140 204 170 200 200 196 C230 190 270 176 300 168 C330 160 360 140 390 140 C410 140 430 150 450 158 L470 162"/>
+    <path d="M530 186 C560 196 590 204 620 204 C650 204 680 196 710 192 C740 190 780 198 810 194 C830 190 850 182 860 178"/>
+  </g>
+  <circle cx="390" cy="140" r="4.5" fill="#d6455d" stroke="#fbfafc" stroke-width="1.5"/>
+  <text x="400" y="124" fill="#a8293f" font-size="13" font-weight="700">峰值</text>
+
+  <!-- 发送 -->
+  <line x1="860" y1="118" x2="860" y2="262" stroke="#24212c" stroke-width="2"/>
+  <circle cx="860" cy="178" r="4.5" fill="#24212c"/>
+  <text x="872" y="150" fill="#24212c" font-size="16" font-weight="700">send</text>
+  <text x="872" y="172" fill="#5d5a68" font-size="13">按下发送</text>
+
+  <!-- 相位名 -->
+  <g text-anchor="middle">
+    <text x="180" y="280" fill="#24212c" font-size="16" font-weight="700">gen · 看生成</text>
+    <text x="460" y="280" fill="#24212c" font-size="16" font-weight="700">read · 读回复</text>
+    <text x="740" y="280" fill="#24212c" font-size="16" font-weight="700">write · 写消息</text>
+    <text x="180" y="300" fill="#5d5a68" font-size="13">等它写出来</text>
+    <text x="460" y="300" fill="#5d5a68" font-size="13">读它的时候</text>
+    <text x="740" y="300" fill="#5d5a68" font-size="13">打字的时候</text>
+  </g>
+
   <!-- 归属 -->
-  <path d="M60 222 H590" stroke="#ef5a55" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
-  <text x="325" y="242" fill="#e89a96" font-size="12.5" text-anchor="middle">属于“上一条回复”：模型据此判断上一段写得怎么样</text>
-  <path d="M590 222 H820" stroke="#2bb8a8" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
-  <text x="705" y="242" fill="#7fcfc5" font-size="12.5" text-anchor="middle">属于“这一条消息”</text>
-  <!-- 其它 -->
-  <rect x="40" y="262" width="880" height="44" rx="10" fill="#ffffff" fill-opacity=".04"/>
-  <text x="56" y="283" fill="#cfcdd8" font-size="12.5">另外记录：平静心率（基线）· 页面切走 / 空闲（away，这段不算）· 最近几轮的峰值 · 10 秒一格的心率序列 · 触觉状态（haptics 行）</text>
-  <text x="56" y="299" fill="#8f8c9b" font-size="11.5">块里只写数值，不写“兴奋”“紧张”这类结论；怎么理解由世界书和你的预设决定。</text>
+  <g fill="none" stroke="#8a8696" stroke-width="1.5">
+    <path d="M62 318 V328 H616 V318"/>
+    <path d="M624 318 V328 H860 V318"/>
+  </g>
+  <g text-anchor="middle">
+    <text x="340" y="352" fill="#24212c" font-size="16" font-weight="700">属于上一条回复</text>
+    <text x="340" y="372" fill="#5d5a68" font-size="13">模型据此判断上一段写得怎么样</text>
+    <text x="742" y="352" fill="#24212c" font-size="16" font-weight="700">属于这一条消息</text>
+    <text x="742" y="372" fill="#5d5a68" font-size="13">你打字、按发送时的心率</text>
+  </g>
+
+  <!-- 图例 -->
+  <line x1="50" y1="394" x2="950" y2="394" stroke="#e2dfe8" stroke-width="1"/>
+  <g font-size="13" fill="#5d5a68">
+    <line x1="60" y1="420" x2="90" y2="420" stroke="#d6455d" stroke-width="2.5"/>
+    <text x="98" y="425">心率</text>
+    <line x1="160" y1="420" x2="190" y2="420" stroke="#8a8696" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="198" y="425">平静心率：默认按本场安静时段自动算，也可以手动记</text>
+    <rect x="620" y="411" width="30" height="18" fill="url(#away)" stroke="#c9c4d3" stroke-width="1"/>
+    <text x="658" y="425">离开（away）：切走页面或久未操作，不计入</text>
+  </g>
 </svg>

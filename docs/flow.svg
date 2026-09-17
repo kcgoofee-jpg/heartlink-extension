@@ -1,34 +1,98 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 492" font-family="-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" role="img" aria-label="一轮对话的流转：设备数据进提示词，模型写出动作，heartlink 执行到玩具，心率再回到下一轮">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 500" width="1000" height="500" font-family="-apple-system, 'PingFang SC', 'Noto Sans SC', 'Microsoft YaHei', sans-serif" role="img" aria-label="一轮对话：心率进提示词，你自己的模型在回复里写动作，经过安全关后驱动玩具，身体的反应进入下一轮">
   <defs>
-    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#9a97a6"/></marker>
+    <marker id="mn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#8a8696"/></marker>
+    <marker id="mh" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#d6455d"/></marker>
+    <marker id="mt" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" markerUnits="userSpaceOnUse" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#1c8f82"/></marker>
   </defs>
-  <rect width="960" height="492" rx="18" fill="#16151b"/>
-  <text x="32" y="44" fill="#ecebf1" font-size="20" font-weight="700">一轮对话里发生了什么</text>
-  <text x="32" y="68" fill="#9a97a6" font-size="13">heartlink 只负责“连得稳、注得准、停得下”；理解剧情、决定强弱的是你自己的模型</text>
-  <!-- 泳道 -->
-  <g font-size="13.5" font-weight="700" text-anchor="middle">
-    <rect x="30" y="92" width="170" height="46" rx="12" fill="#ef5a55" fill-opacity=".18" stroke="#ef5a55"/><text x="115" y="120" fill="#ffc2bf">手环 / 心率带</text>
-    <rect x="240" y="92" width="200" height="46" rx="12" fill="#2bb8a8" fill-opacity=".18" stroke="#2bb8a8"/><text x="340" y="120" fill="#a6ece3">heartlink（浏览器里）</text>
-    <rect x="480" y="92" width="200" height="46" rx="12" fill="#7c8cf0" fill-opacity=".18" stroke="#7c8cf0"/><text x="580" y="120" fill="#c8cdfb">酒馆 + 你的预设 / 模型</text>
-    <rect x="720" y="92" width="210" height="46" rx="12" fill="#ff6fa3" fill-opacity=".18" stroke="#ff6fa3"/><text x="825" y="120" fill="#ffc0d6">玩具（Intiface / 直连）</text>
+
+  <!-- 底卡：浅色实底，GitHub 深浅主题都能读 -->
+  <rect x="1" y="1" width="998" height="498" rx="20" fill="#fbfafc" stroke="#e2dfe8" stroke-width="1.5"/>
+
+  <text x="50" y="52" fill="#24212c" font-size="22" font-weight="700">一轮对话里发生了什么</text>
+  <text x="50" y="80" fill="#5d5a68" font-size="13">heartlink 只管连得稳、注得准、停得下；读懂剧情、决定强弱的是你自己的模型</text>
+
+  <!-- 上排：数据进模型（左 → 右） -->
+  <g text-anchor="middle">
+    <rect x="50" y="112" width="180" height="96" rx="12" fill="#fbe9ec" stroke="#d6455d" stroke-width="1.5"/>
+    <text x="140" y="148" fill="#a8293f" font-size="16" font-weight="700">心率设备</text>
+    <text x="140" y="174" fill="#5d5a68" font-size="13">手环、心率带</text>
+    <text x="140" y="194" fill="#5d5a68" font-size="13">每秒一个心率</text>
+
+    <rect x="290" y="112" width="180" height="96" rx="12" fill="#f1eff5" stroke="#c9c4d3" stroke-width="1.5"/>
+    <text x="380" y="148" fill="#24212c" font-size="16" font-weight="700">heartlink 整理</text>
+    <text x="380" y="174" fill="#5d5a68" font-size="13">按相位切成几段</text>
+    <text x="380" y="194" fill="#5d5a68" font-size="13">只写数值，不下结论</text>
+
+    <rect x="530" y="112" width="180" height="96" rx="12" fill="#fbfafc" stroke="#8a8696" stroke-width="1.5" stroke-dasharray="6 4"/>
+    <text x="620" y="148" fill="#24212c" font-size="16" font-weight="700">你自己的模型</text>
+    <text x="620" y="174" fill="#5d5a68" font-size="13">读剧情和心率</text>
+    <text x="620" y="194" fill="#5d5a68" font-size="13">决定写不写动作</text>
+
+    <rect x="770" y="112" width="180" height="96" rx="12" fill="#f1eff5" stroke="#c9c4d3" stroke-width="1.5"/>
+    <text x="860" y="148" fill="#24212c" font-size="16" font-weight="700">回复里的动作</text>
+    <text x="860" y="174" fill="#1c6f66" font-size="13" font-family="ui-monospace, Menlo, Consolas, monospace">&lt;bio_act/&gt;</text>
+    <text x="860" y="194" fill="#5d5a68" font-size="13">回复写完才解析</text>
   </g>
-  <g stroke="#3a3842" stroke-dasharray="3 5"><line x1="115" y1="138" x2="115" y2="430"/><line x1="340" y1="138" x2="340" y2="430"/><line x1="580" y1="138" x2="580" y2="430"/><line x1="825" y1="138" x2="825" y2="430"/></g>
-  <g font-size="12.5" fill="#dddbe4">
-    <line x1="115" y1="170" x2="336" y2="170" stroke="#ef5a55" stroke-width="2" marker-end="url(#a)"/>
-    <text x="126" y="162">① 每秒一个心率（蓝牙标准心率服务）</text>
-    <rect x="248" y="186" width="218" height="40" rx="8" fill="#ffffff" fill-opacity=".05"/>
-    <text x="258" y="203">② 按相位整理：读回复、写消息、</text><text x="258" y="219">基线、峰值、心率变异</text>
-    <line x1="340" y1="248" x2="576" y2="248" stroke="#2bb8a8" stroke-width="2" marker-end="url(#a)"/>
-    <text x="352" y="240">③ 你按发送 → 注入 &lt;bio_context&gt;</text>
-    <rect x="488" y="264" width="186" height="56" rx="8" fill="#ffffff" fill-opacity=".05"/>
-    <text x="498" y="281">④ 模型读剧情 + 身体数据，</text><text x="498" y="297">按世界书的读法理解，写回复；</text><text x="498" y="313">想让玩具动就写 &lt;bio_act/&gt;</text>
-    <line x1="580" y1="342" x2="344" y2="342" stroke="#7c8cf0" stroke-width="2" marker-end="url(#a)"/>
-    <text x="392" y="334">⑤ 回复写完，解析动作</text>
-    <rect x="248" y="356" width="218" height="40" rx="8" fill="#ffffff" fill-opacity=".05"/>
-    <text x="258" y="373">⑥ 过安全关：开关、节奏、</text><text x="258" y="389">间隔、有风险的输出要点名</text>
-    <line x1="340" y1="412" x2="821" y2="412" stroke="#ff6fa3" stroke-width="2" marker-end="url(#a)"/>
-    <text x="560" y="404">⑦ 按强度帧驱动；“全部停止”不经过模型</text>
-    <path d="M820 430 C 700 452, 240 452, 118 432" fill="none" stroke="#9a97a6" stroke-width="1.5" stroke-dasharray="4 4" marker-end="url(#a)"/>
-    <text x="480" y="480" fill="#9a97a6" text-anchor="middle">⑧ 你身体的反应，进入下一轮的 read 相位</text>
+
+  <!-- 下排：动作到玩具（右 → 左） -->
+  <g text-anchor="middle">
+    <rect x="770" y="288" width="180" height="96" rx="12" fill="#f1eff5" stroke="#c9c4d3" stroke-width="1.5"/>
+    <text x="860" y="324" fill="#24212c" font-size="16" font-weight="700">安全关</text>
+    <text x="860" y="350" fill="#5d5a68" font-size="13">开关、节奏、间隔</text>
+    <text x="860" y="370" fill="#5d5a68" font-size="13">有风险的输出要点名</text>
+
+    <rect x="530" y="288" width="180" height="96" rx="12" fill="#f1eff5" stroke="#c9c4d3" stroke-width="1.5"/>
+    <text x="620" y="324" fill="#24212c" font-size="16" font-weight="700">Intiface / 浏览器</text>
+    <text x="620" y="350" fill="#5d5a68" font-size="13">推荐 Intiface</text>
+    <text x="620" y="370" fill="#5d5a68" font-size="13">浏览器直连是测试版</text>
+
+    <rect x="290" y="288" width="180" height="96" rx="12" fill="#e3f3f0" stroke="#1c8f82" stroke-width="1.5"/>
+    <text x="380" y="324" fill="#136a60" font-size="16" font-weight="700">玩具</text>
+    <text x="380" y="350" fill="#5d5a68" font-size="13">跟着剧情动起来</text>
+
+    <rect x="50" y="288" width="180" height="96" rx="12" fill="#fbe9ec" stroke="#d6455d" stroke-width="1.5"/>
+    <text x="140" y="324" fill="#a8293f" font-size="16" font-weight="700">你的身体</text>
+    <text x="140" y="350" fill="#5d5a68" font-size="13">心跳跟着变</text>
+  </g>
+
+  <!-- 箭头：2px，心率路径用红，动作路径用青，其它中性 -->
+  <g fill="none" stroke-width="2">
+    <line x1="233" y1="160" x2="286" y2="160" stroke="#d6455d" marker-end="url(#mh)"/>
+    <line x1="473" y1="160" x2="526" y2="160" stroke="#8a8696" marker-end="url(#mn)"/>
+    <line x1="713" y1="160" x2="766" y2="160" stroke="#8a8696" marker-end="url(#mn)"/>
+    <line x1="860" y1="211" x2="860" y2="284" stroke="#1c8f82" marker-end="url(#mt)"/>
+    <line x1="767" y1="336" x2="714" y2="336" stroke="#1c8f82" marker-end="url(#mt)"/>
+    <line x1="527" y1="336" x2="474" y2="336" stroke="#1c8f82" marker-end="url(#mt)"/>
+    <line x1="287" y1="336" x2="234" y2="336" stroke="#8a8696" marker-end="url(#mn)"/>
+    <line x1="140" y1="285" x2="140" y2="212" stroke="#d6455d" marker-end="url(#mh)"/>
+  </g>
+  <g font-size="13" fill="#5d5a68" text-anchor="middle">
+    <text x="260" y="150">每秒</text>
+    <text x="500" y="150">按发送</text>
+    <text x="740" y="150">写回复</text>
+    <text x="740" y="326">放行</text>
+    <text x="500" y="326">驱动</text>
+    <text x="260" y="326">感受</text>
+  </g>
+  <g font-size="13" fill="#5d5a68">
+    <text x="872" y="253">解析动作</text>
+    <text x="128" y="253" text-anchor="end">进入下一轮</text>
+  </g>
+
+  <!-- 底部说明 -->
+  <line x1="50" y1="414" x2="950" y2="414" stroke="#e2dfe8" stroke-width="1"/>
+  <g font-size="13">
+    <rect x="50" y="432" width="76" height="26" rx="13" fill="#e3f3f0" stroke="#1c8f82" stroke-width="1.5"/>
+    <text x="88" y="450" fill="#136a60" font-weight="700" text-anchor="middle">全部停止</text>
+    <text x="138" y="450" fill="#24212c">随时可用，不经过模型</text>
+    <text x="50" y="482" fill="#5d5a68">剧情联动默认关，你打开才会动</text>
+
+    <line x1="560" y1="445" x2="590" y2="445" stroke="#d6455d" stroke-width="2"/>
+    <text x="598" y="450" fill="#5d5a68">心率数据</text>
+    <line x1="680" y1="445" x2="710" y2="445" stroke="#1c8f82" stroke-width="2"/>
+    <text x="718" y="450" fill="#5d5a68">玩具动作</text>
+    <rect x="800" y="436" width="30" height="18" rx="4" fill="none" stroke="#8a8696" stroke-width="1.5" stroke-dasharray="4 3"/>
+    <text x="838" y="450" fill="#5d5a68">你自己的模型</text>
+    <text x="950" y="482" fill="#5d5a68" text-anchor="end">灰色方框由 heartlink 负责</text>
   </g>
 </svg>
