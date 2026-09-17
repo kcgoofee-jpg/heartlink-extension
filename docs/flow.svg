@@ -25,7 +25,7 @@
     <line x1="580" y1="342" x2="344" y2="342" stroke="#7c8cf0" stroke-width="2" marker-end="url(#a)"/>
     <text x="392" y="334">⑤ 回复写完，解析动作</text>
     <rect x="248" y="356" width="218" height="40" rx="8" fill="#ffffff" fill-opacity=".05"/>
-    <text x="258" y="373">⑥ 过安全关：开关、上限、节奏、</text><text x="258" y="389">间隔、有风险的输出要点名</text>
+    <text x="258" y="373">⑥ 过安全关：开关、节奏、</text><text x="258" y="389">间隔、有风险的输出要点名</text>
     <line x1="340" y1="412" x2="821" y2="412" stroke="#ff6fa3" stroke-width="2" marker-end="url(#a)"/>
     <text x="560" y="404">⑦ 按强度帧驱动；“全部停止”不经过模型</text>
     <path d="M820 430 C 700 452, 240 452, 118 432" fill="none" stroke="#9a97a6" stroke-width="1.5" stroke-dasharray="4 4" marker-end="url(#a)"/>

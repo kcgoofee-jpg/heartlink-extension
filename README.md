@@ -9,7 +9,7 @@ SillyTavern（酒馆）扩展：把你身上的心率送进提示词，并让剧
 heartlink 做三件事，**不替你理解剧情**：
 
 1. **把设备数据送进提示词**：浏览器通过蓝牙标准心率服务每秒收一个心率。你按下发送时，它把上一轮的心率按对话相位整理成一段 `<bio_context>`，随提示词发给**你自己配置的模型**。块里只写数值，不写“兴奋”“紧张”这类结论；怎么理解，由自动安装的读法世界书和你的预设决定。
-2. **把模型写的动作变成玩具动作**：模型在回复里写 `<bio_act/>`，回复写完后 heartlink 解析，经过安全关（开关、上限、节奏、间隔、有风险的输出要点名），再交给 Intiface 或浏览器直连去驱动玩具。
+2. **把模型写的动作变成玩具动作**：模型在回复里写 `<bio_act/>`，回复写完后 heartlink 解析，经过安全关（开关、节奏、间隔、有风险的输出要点名），再交给 Intiface 或浏览器直连去驱动玩具。
 3. **形成闭环**：你身体的反应会进入下一轮的数据里，模型就能知道上一段写得怎么样。
 
 ![一轮对话里发生了什么](docs/flow.png)
@@ -75,7 +75,7 @@ https://github.com/kcgoofee-jpg/heartlink-extension
 ### 玩具
 
 1. 安装并打开 [Intiface Central](https://intiface.com/central/)，点 **Start Server**，在里面连上玩具（支持的型号见 buttplug 设备库）。
-2. 悬浮窗 → 玩具 → 打开 **剧情联动**，第一次会让你选节奏：**慢热**（从轻开始）或 **狂暴**（高触发、高功率）。
+2. 悬浮窗 → 玩具 → 打开 **剧情联动**，第一次会让你选节奏：**慢热**（从轻开始）、**持久**（中等强度、动得久）、**狂暴**（高触发、高功率）或 **极限**（几乎一直开满）。
 3. 点 **通过 Intiface**。显示“已连接 · N 路”即成功。
 4. 任何时候点 **全部停止**。页面关闭、Intiface 断开也会立即停。
 
@@ -89,13 +89,13 @@ https://github.com/kcgoofee-jpg/heartlink-extension
 <bio_act pattern="wave" intensity="0.6" ms="5000"/>
 ```
 
-回复生成完后，heartlink 按你的上限与档位执行。模式有 `pulse` `double` `triple` `long` `heartbeat` `wave`。不写 `output` 时驱动所有普通输出；加热、电刺激这类有风险的输出必须写明。详见 TBC 协议 §5。
+回复生成完后，heartlink 按你选的节奏执行。模式有 `pulse` `double` `triple` `long` `heartbeat` `wave`。不写 `output` 时驱动所有普通输出；加热、电刺激这类有风险的输出必须写明。详见 TBC 协议 §5。
 
-每轮注入的 `<bio_context>` 里有一行 `haptics(heartlink): on | cap 60% | profile frenzy`，卡片和预设可以据此决定要不要写动作。
+每轮注入的 `<bio_context>` 里有一行 `haptics(heartlink): on | cap 100% | profile frenzy`，卡片和预设可以据此决定要不要写动作。
 
 ## 安全
 
-- 剧情联动默认关，你打开才会动；强度不会超过你设的上限。
+- 剧情联动默认关，你打开才会动。
 - “全部停止”随时可用；停止不经过模型。
 - 安全词（消息里出现就全停）是可选功能，默认关。
 
