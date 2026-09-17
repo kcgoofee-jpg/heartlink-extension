@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 330" font-family="-apple-system,'PingFang SC','Microsoft YaHei',sans-serif" role="img" aria-label="一轮对话的相位：上一条回复的生成与阅读、写本条消息、发送时注入">
+  <rect width="960" height="330" rx="18" fill="#16151b"/>
+  <text x="32" y="44" fill="#ecebf1" font-size="20" font-weight="700">一轮对话里，心率被切成哪几段</text>
+  <text x="32" y="68" fill="#9a97a6" font-size="13">相位边界都是页面事件；你按下发送的那一刻，heartlink 把这几段整理成 &lt;bio_context&gt; 注入给模型</text>
+  <!-- 时间轴 -->
+  <line x1="40" y1="176" x2="920" y2="176" stroke="#3a3842" stroke-width="2"/>
+  <!-- gen -->
+  <rect x="60" y="130" width="230" height="46" rx="8" fill="#7c8cf0" fill-opacity=".22" stroke="#7c8cf0"/>
+  <text x="175" y="151" fill="#c8cdfb" font-size="15" font-weight="700" text-anchor="middle">gen · 看生成</text>
+  <text x="175" y="168" fill="#9aa2e0" font-size="11.5" text-anchor="middle">首字、思维链、正文</text>
+  <!-- read -->
+  <rect x="290" y="130" width="300" height="46" rx="8" fill="#ef5a55" fill-opacity=".22" stroke="#ef5a55"/>
+  <text x="440" y="151" fill="#ffc2bf" font-size="15" font-weight="700" text-anchor="middle">read · 读上一条回复</text>
+  <text x="440" y="168" fill="#e89a96" font-size="11.5" text-anchor="middle">峰值、峰值出现在第几段、心率变异</text>
+  <!-- write -->
+  <rect x="590" y="130" width="230" height="46" rx="8" fill="#2bb8a8" fill-opacity=".22" stroke="#2bb8a8"/>
+  <text x="705" y="151" fill="#a6ece3" font-size="15" font-weight="700" text-anchor="middle">write · 写这一条</text>
+  <text x="705" y="168" fill="#7fcfc5" font-size="11.5" text-anchor="middle">打字时长、停顿、删改</text>
+  <!-- send -->
+  <line x1="820" y1="112" x2="820" y2="196" stroke="#e8a23c" stroke-width="3"/>
+  <text x="826" y="126" fill="#f3c47a" font-size="14" font-weight="700">send</text>
+  <text x="826" y="143" fill="#c9a36a" font-size="11.5">按下发送</text>
+  <!-- 事件刻度 -->
+  <g fill="#9a97a6" font-size="11.5" text-anchor="middle">
+    <line x1="60" y1="176" x2="60" y2="186" stroke="#9a97a6"/><text x="60" y="202">上一条开始生成</text>
+    <line x1="290" y1="176" x2="290" y2="186" stroke="#9a97a6"/><text x="290" y="202">回复出完</text>
+    <line x1="590" y1="176" x2="590" y2="186" stroke="#9a97a6"/><text x="590" y="202">开始打字</text>
+  </g>
+  <!-- 归属 -->
+  <path d="M60 222 H590" stroke="#ef5a55" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+  <text x="325" y="242" fill="#e89a96" font-size="12.5" text-anchor="middle">属于“上一条回复”：模型据此判断上一段写得怎么样</text>
+  <path d="M590 222 H820" stroke="#2bb8a8" stroke-width="2" fill="none" stroke-dasharray="5 4"/>
+  <text x="705" y="242" fill="#7fcfc5" font-size="12.5" text-anchor="middle">属于“这一条消息”</text>
+  <!-- 其它 -->
+  <rect x="40" y="262" width="880" height="44" rx="10" fill="#ffffff" fill-opacity=".04"/>
+  <text x="56" y="283" fill="#cfcdd8" font-size="12.5">另外记录：平静心率（基线）· 页面切走 / 空闲（away，这段不算）· 最近几轮的峰值 · 10 秒一格的心率序列 · 触觉状态（haptics 行）</text>
+  <text x="56" y="299" fill="#8f8c9b" font-size="11.5">块里只写数值，不写“兴奋”“紧张”这类结论；怎么理解由世界书和你的预设决定。</text>
+</svg>
