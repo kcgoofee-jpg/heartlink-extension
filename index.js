@@ -1,4 +1,4 @@
-// heartlink v0.19.0 — SillyTavern 扩展：心率注入 + 触觉输出（Tavern Bio-Context 参考实现）。构建产物。
+// heartlink v0.20.0 — SillyTavern 扩展：心率注入 + 触觉输出（Tavern Bio-Context 参考实现）。构建产物。
 // https://github.com/kcgoofee-jpg/heartlink-extension
 // heartlink core — 纯函数层。没有 DOM、没有蓝牙、没有酒馆 API，Node 和浏览器都能跑。
 // 运行时（runtime.js）和单元测试共用这一份。构建时与 runtime.js 拼成 dist/heartlink.js。
@@ -9,7 +9,7 @@
 //     send(kind) / stream_start / reasoning_end / reply_end / swipe   生成相关
 //     type(len) / activity / visible / hidden / chat_changed          用户与页面
 // 输出
-//   composeContext() → 注入给模型的 <bio_context> 文本块（Tavern Bio-Context，见 docs/spec-draft.md）
+//   composeContext() → 注入给模型的 <bio_context> 文本块（Tavern Bio-Context，规范见 tavern-bio-context 仓库，本地目录 ../spec）
 const HeartlinkCore = (() => {
   'use strict';
 
@@ -54,6 +54,52 @@ const HeartlinkCore = (() => {
       while (offset + 1 < dataView.byteLength) { rr.push(dataView.getUint16(offset, true) / 1024); offset += 2; }
     }
     return { bpm, rr, sensorContact };
+  }
+
+  // ---------- 数据卫生（审查第 2 条）：只删明显不可能的值，不平滑、不修补；删掉的值如实体现在覆盖率里 ----------
+  //   范围：< 25 或 > 240 bpm 丢掉（0 常见于没读到数的包）；
+  //   单点跳变：和 3 秒内上一个样本差 > 30 bpm 的先扣住，下一个样本离它 ≤ 15 bpm 才算真的变了（两个一起放行），否则丢掉它
+  const HR_SANE = { MIN: 25, MAX: 240, JUMP_BPM: 30, JUMP_WITHIN_MS: 3000, CONFIRM_BPM: 15 };
+  const hrPlausible = (bpm) => Number.isFinite(bpm) && bpm >= HR_SANE.MIN && bpm <= HR_SANE.MAX;
+  function createHrGate() {
+    let last = null; let held = null;
+    const stats0 = { rejected: 0, jumps: 0 };
+    const near = (a, b, lim) => b.t >= a.t && b.t - a.t <= HR_SANE.JUMP_WITHIN_MS && Math.abs(b.bpm - a.bpm) <= lim;
+    function push(s) {
+      if (!s || !hrPlausible(s.bpm)) { stats0.rejected++; return []; }
+      const out = [];
+      if (held) {
+        if (near(held, s, HR_SANE.CONFIRM_BPM)) { out.push(held); last = held; }
+        else stats0.jumps++;
+        held = null;
+      }
+      if (!out.length && last && s.t >= last.t && s.t - last.t <= HR_SANE.JUMP_WITHIN_MS && Math.abs(s.bpm - last.bpm) > HR_SANE.JUMP_BPM) { held = s; return out; }
+      out.push(s); last = s;
+      return out;
+    }
+    return { push, stats: stats0, reset() { last = null; held = null; } };
+  }
+  // 佩戴位（parseHeartRate 的 sensorContact === false）：这些时段的心率不进统计（v0.3 §2.1 wear 行、§2.2 off-wrist 段）。
+  // 样本上带 contact:false 的，按 1 秒一个包连成区间（相邻 ≤ 2 秒的并成一段）
+  function contactSpans(samples) {
+    const out = [];
+    for (const s of samples || []) {
+      if (!s || s.contact !== false) continue;
+      const p = out[out.length - 1];
+      if (p && s.t <= p[1] + 2000) p[1] = Math.max(p[1], s.t + 1000); else out.push([s.t, s.t + 1000]);
+    }
+    return out;
+  }
+  // 设备戴在哪（v0.4 §2 的滞后按设备类型取缺省值）：广播名认得的胸带 → chest；认得的手环手表 → wrist；
+  // 都不认得时，报佩戴位又每包带心跳间隔的多半是胸带；其余按手腕。只是猜测，用户可在设置里改
+  const CHEST_RE = /(?:polar\s*h\d|\bh10\b|\bh9\b|\bhrm|tickr|coospo|wahoo|magene|moofit|chest|strap)/i;
+  const WRIST_RE = /(?:whoop|band|watch|huawei|honor|xiaomi|\bmi\b|amazfit|forerunner|venu|fenix|coros|fitbit|pixel|verity|ignite|vantage|pacer|grit|galaxy|oppo|suunto)/i;
+  const LAG_MS_BY_CLASS = { chest: 4000, wrist: 6000 };   // v0.4 §2.1：胸带 4 秒，腕式 / 未知 6 秒（经验值）
+  function guessWear({ name, rr, contact } = {}) {
+    const n = String(name || '');
+    if (CHEST_RE.test(n)) return 'chest';
+    if (WRIST_RE.test(n)) return 'wrist';
+    return rr && contact ? 'chest' : 'wrist';
   }
 
   // ---------- 通用统计 ----------
@@ -126,6 +172,34 @@ const HeartlinkCore = (() => {
     if (picked.length < CONFIG.MANUAL_BASELINE_MIN_SAMPLES) return { ok: false, reason: `最近 60 秒只有 ${picked.length} 个样本，至少要 ${CONFIG.MANUAL_BASELINE_MIN_SAMPLES} 个` };
     return { ok: true, bpm: Math.round(picked.reduce((sum, s) => sum + s.bpm, 0) / picked.length), hrv: hrvInWindow(samples, now - CONFIG.HRV_WINDOW_MS, now), count: picked.length };
   }
+  // 静坐记平静心率（v0.3 §1.5 manual 的做法：丢掉前 60 秒，再取 120 秒；Laborde 2017、Munoz 2015）
+  //   startedAt：开始静坐的时刻（中途打字或切走页面时由运行层重设）。样本不足一半时不记。
+  //   bpm 取中位数；HRV 走相位同一道 5% 门槛（审查第 13 条），不够就不给；noise = 稳健标准差（v0.4 §3）
+  const REST = { WARM_MS: 60000, REC_MS: 120000, MIN_SAMPLES: 60 };
+  function restBaseline(samples, startedAt) {
+    const from = startedAt + REST.WARM_MS; const to = from + REST.REC_MS;
+    const picked = inWin(samples || [], from, to).filter((s) => s.contact !== false);
+    if (picked.length < REST.MIN_SAMPLES) return { ok: false, reason: 'few-samples', count: picked.length };
+    const bpms = picked.map((s) => s.bpm);
+    const st = stats(picked);
+    let hrv = null;
+    if (st.rrDropout <= 0.05) { const c = collectRR(picked, from - 1, to); if (c.raw && 1 - c.kept / c.raw <= 0.05) hrv = rmssd(c); }
+    return { ok: true, bpm: Math.round(median(bpms)), hrv, n: picked.length, noise: robustSd(bpms), from, to };
+  }
+  // 手动基线是否还能用（v0.3 §1.5 / v0.4 §3-3：超过 24 小时或换了设备应降到下一优先级）
+  //   → null 可用；'age' 超过 24 小时；'device' 在别的设备上记的；'unknown' 不知道什么时候记的（或 v0.4 要的设备名不合规）
+  const MANUAL_MAX_AGE_MS = 24 * 3600 * 1000;
+  function manualBaselineStale(m, now, device, opts) {
+    if (!m) return null;
+    if (!Number.isFinite(m.at)) return 'unknown';
+    if (now - m.at > MANUAL_MAX_AGE_MS) return 'age';
+    if (device && m.device && device !== m.device) return 'device';
+    if (opts && opts.requireDeviceId && !isDeviceName(manualDeviceId(m))) return 'unknown';
+    return null;
+  }
+  // 块里写的设备名：运行层另存的 deviceId（与首行 device 属性同一套写法）；没有时用 device 本身（须已合规）
+  const manualDeviceId = (m) => (m && m.deviceId != null ? m.deviceId : m && m.device);
+  const STALE_WHY = { age: 'manual set over 24h ago', device: 'manual set on another device', unknown: 'manual set time unknown' };
   // 安静段：从事件流推出“页面前台且 60 秒内无按键”的区间
   function quietWindows(events, from, to) {
     const keys = events.filter((e) => e.type === 'type' && e.t >= from - CONFIG.IDLE_MS && e.t <= to).map((e) => e.t);
@@ -162,9 +236,9 @@ const HeartlinkCore = (() => {
         if (st && st.n >= 20 && st.rrDropout <= CONFIG.QUIET_MAX_RR_DROPOUT) quiet.push(...w);
       }
     }
-    if (quiet.length >= CONFIG.QUIET_MIN_SAMPLES) return { bpm: percentile(quiet.map((s) => s.bpm), 0.5), method: 'quiet-median', n: quiet.length, hrv: hrvOver(quiet), noise: robustSd(quiet.map((s) => s.bpm)) };
+    if (quiet.length >= CONFIG.QUIET_MIN_SAMPLES) return { bpm: percentile(quiet.map((s) => s.bpm), 0.5), method: 'quiet-median', n: quiet.length, hrv: hrvOver(quiet), noise: robustSd(quiet.map((s) => s.bpm)), lastT: quiet[quiet.length - 1].t };
     const all = inWin(samples, from, now);
-    if (all.length >= CONFIG.QUIET_MIN_SAMPLES) return { bpm: percentile(all.map((s) => s.bpm), 0.2), method: 'p20', n: all.length, hrv: null, noise: robustSd(all.map((s) => s.bpm)) };
+    if (all.length >= CONFIG.QUIET_MIN_SAMPLES) return { bpm: percentile(all.map((s) => s.bpm), 0.2), method: 'p20', n: all.length, hrv: null, noise: robustSd(all.map((s) => s.bpm)), lastT: all[all.length - 1].t };
     return null;
   }
 
@@ -287,9 +361,135 @@ const HeartlinkCore = (() => {
   }
   const SPARSE_MS = 30000;
 
+  // ---------- v0.4 §5：执行器与相位的重叠（act 段、clean 行、基线卫生） ----------
+  // 台账条目：{ id, source, act, outputs, from, to|null, frames: [[相对毫秒, 强度]], gain: [[时刻, 倍数]] }
+  // 口径（§5.1-1）：算的是**生产者发出的东西**（帧表 × 读者调整），不是设备确认执行的时间。
+  const RISKY_ORDER = ['Temperature', 'Estim', 'Spray'];
+  // v0.4 §3-1：v0.3 的两个方法名已弃用，按登记表改写（两者都是长窗口自动估计 → rolling-low）
+  const V04_METHOD = { 'quiet-median': 'rolling-low', p20: 'rolling-low' };
+  const fmtAge = (ms) => { const s = Math.max(0, Math.round(ms / 1000)); if (s < 60) return `${s}s`; const m = Math.round(s / 60); if (m < 60) return `${m}m`; const h = Math.round(m / 60); return h < 24 ? `${h}h` : `${Math.round(h / 24)}d`; };
+  // v0.4 §3：baseline 行的行尾段（age 必须有；noise 有就写）
+  function baselineSegs(base, now) {
+    if (!base) return '';
+    const segs = [];
+    const lastT = Number.isFinite(base.lastT) ? base.lastT : (Number.isFinite(base.at) ? base.at : null);
+    if (lastT != null) segs.push(`age ${fmtAge(now - lastT)}`);
+    if (Number.isFinite(base.noise)) segs.push(`noise ±${Math.round(base.noise)}`);
+    return segs.length ? ` | ${segs.join(' | ')}` : '';
+  }
+  const LAG_MS_DEFAULT = 6000;                       // §2 还没实现，先用腕式的经验滞后算 clean 的最短长度
+  const CLEAN = { MIN_SEC: 10, MIN_RATIO: 0.3 };     // §5.2-3：干净秒 < max(10s, 2×lag) 或 < 相位 30% 就整行不写
+  // 某条记录在 t 时刻发出的强度（帧是阶梯函数，乘上当时的读者调整）
+  function actLevelAt(rec, t) {
+    const end = rec.to == null ? Infinity : rec.to;
+    if (t < rec.from || t >= end) return 0;
+    let lv = 0;
+    for (const [at, v] of rec.frames || []) { if (rec.from + at <= t) lv = v; else break; }
+    let g = 1;
+    for (const [gt, gv] of rec.gain || []) { if (gt <= t) g = gv; else break; }
+    return Math.max(0, Math.min(1, lv * g));
+  }
+  // [a, b) 里按时间加权的平均强度（在所有断点上积分，不抽样）
+  function actMeanIn(rec, a, b) {
+    if (b <= a) return 0;
+    const pts = new Set([a]);
+    const add = (t) => { if (t > a && t < b) pts.add(t); };
+    add(rec.from); if (rec.to != null) add(rec.to);
+    for (const [at] of rec.frames || []) add(rec.from + at);
+    for (const [gt] of rec.gain || []) add(gt);
+    const xs = [...pts].sort((x, y) => x - y); xs.push(b);
+    let sum = 0;
+    for (let i = 0; i + 1 < xs.length; i++) sum += actLevelAt(rec, xs[i]) * (xs[i + 1] - xs[i]);
+    return sum / (b - a);
+  }
+  // §5.1-3（2026-09-18 修订）：mean = 各路最大值在实际驱动时间上的积分 ÷ 驱动毫秒数。
+  // 不按整秒平均：短动作跨秒时首尾两秒只占一部分，会把强度算低（写 0.8、8 秒会变成 71%）
+  function actMeanMs(recs, a, b, ex) {
+    const pts = new Set([a, b]);
+    const add = (t) => { if (t > a && t < b) pts.add(t); };
+    for (const r of recs) {
+      add(r.from); if (r.to != null) add(r.to);
+      for (const [at] of r.frames || []) add(r.from + at);
+      for (const [gt] of r.gain || []) add(gt);
+    }
+    for (const [x, y] of ex) { add(x); add(y); }
+    const xs = [...pts].sort((x, y) => x - y);
+    let sum = 0, ms = 0;
+    for (let i = 0; i + 1 < xs.length; i++) {
+      if (inSpans(ex, xs[i])) continue;
+      let lv = 0;
+      for (const r of recs) lv = Math.max(lv, actLevelAt(r, xs[i]));
+      if (lv > 0) { const dt = xs[i + 1] - xs[i]; sum += lv * dt; ms += dt; }
+    }
+    return ms ? sum / ms : 0;
+  }
+  // §5.1：把相位切成秒，任何一路非 0 的那一秒就计入（秒数）；强度见 actMeanMs
+  // → { sec, mean, n, outputs, risky, seconds:Set(秒起点), phaseSec } 或 null（没有驱动）
+  function actStats(log, from, to, away, printedSec) {
+    if (!Array.isArray(log) || !log.length || to <= from) return null;
+    const ex = excludedSpans(away);
+    const recs = log.filter((r) => r && r.from < to && (r.to == null ? to : r.to) > from);
+    const seconds = new Set();
+    const hit = new Set();
+    let phaseSec = 0;
+    for (let s = from; s < to; s += 1000) {
+      if (inSpans(ex, s)) continue;                  // 离开的秒本来就不进相位统计，也不算干净秒（§5.2-2）
+      phaseSec++;
+      const b = Math.min(s + 1000, to);
+      let lv = 0;
+      for (const r of recs) { const m = actMeanIn(r, s, b); if (m > 0) { hit.add(r); lv = Math.max(lv, m); } }
+      if (lv > 0) seconds.add(s);
+    }
+    if (printedSec != null) phaseSec = printedSec;   // 分母必须与相位行写出来的时长一致（§5.2 的 sec N/M）
+    if (!seconds.size) return { sec: 0, seconds, phaseSec, none: true };
+    const keys = new Set(); const outputs = [];
+    for (const r of hit) { keys.add(`${r.source}#${r.act}`); for (const o of r.outputs || []) if (!outputs.includes(o)) outputs.push(o); }
+    return { sec: Math.min(seconds.size, phaseSec), mean: Math.max(1, Math.min(100, Math.round(100 * actMeanMs([...hit], from, to, ex)))),
+      n: keys.size, outputs, risky: RISKY_ORDER.filter((o) => outputs.includes(o)), seconds, phaseSec };
+  }
+  const actSeg = (a) => (!a || a.none ? '' : ` | act ${a.sec}s, mean ${a.mean}%, ${a.n} ${a.n === 1 ? 'act' : 'acts'}${a.risky.length ? ` (${a.risky.join('/')})` : ''}`);
+  const secStart = (from, t) => from + Math.floor((t - from) / 1000) * 1000;
+  // §5.2：只统计没有驱动的那些秒。act 为空、干净秒太少时返回 null（整行省略）
+  function cleanStats({ samples, from, to, away, act, noise, cadenceMs, phaseSec, lagMs }) {
+    if (!act || act.none || !act.sec) return null;
+    const ex = excludedSpans(away);
+    const total = phaseSec != null ? phaseSec : act.phaseSec;
+    const cleanSec = Math.max(0, total - act.sec);
+    const minSec = Math.max(CLEAN.MIN_SEC, 2 * Math.round((lagMs == null ? LAG_MS_DEFAULT : lagMs) / 1000));
+    if (cleanSec < minSec || cleanSec < CLEAN.MIN_RATIO * total) return null;
+    const picked = inWin(samples, from, to).filter((s) => !inSpans(ex, s.t) && !act.seconds.has(secStart(from, s.t)));
+    const st = stats(picked);
+    if (!st) return null;
+    // §5.2-4：峰值必须落在同一段连续的干净秒里 → 取最长的那一段来判
+    let best = null, run = null;
+    for (let s = from; s < to; s += 1000) {
+      const skip = inSpans(ex, s) || act.seconds.has(s);
+      if (skip) { run = null; continue; }
+      if (!run) { run = { from: s, to: s + 1000 }; if (!best || run.to - run.from > best.to - best.from) best = run; }
+      else { run.to = Math.min(s + 1000, to); if (run.to - run.from > best.to - best.from) best = run; }
+    }
+    let peak = null;
+    if (best && best.to - best.from >= PEAK.MIN_PHASE_MS) {
+      const pk = detectPeak(picked.filter((s) => s.t >= best.from && s.t < best.to), best.from, best.to - best.from, noise);
+      if (pk) peak = { value: pk.value, at: pk.at, atSec: Math.round(netOffset(away, from, pk.at) / 1000) };
+    }
+    return { st, sec: cleanSec, phaseSec: total, peak, cov: coverage(st.n, 0, cleanSec * 1000, cadenceMs) };
+  }
+  function cleanLine(phase, c) {
+    if (!c) return null;
+    return `clean(${phase}): ${fmtRange(c.st)}${c.peak ? ` peak ${c.peak.value} @${c.peak.atSec}s` : ''} | sec ${c.sec}/${c.phaseSec}${covTxt(c.cov)}`;
+  }
+  // §5.5 的变量形状
+  const actVar = (a) => (!a || a.none ? null : { sec: a.sec, mean: a.mean, n: a.n, outputs: a.outputs.slice() });
+  const cleanVar = (c) => (!c ? null : { sec: c.sec, phaseSec: c.phaseSec, first: c.st.first, last: c.st.last, min: c.st.min, max: c.st.max,
+    peak: c.peak ? c.peak.value : null, peakAt: c.peak ? c.peak.atSec : null, cov: c.cov });
+  // §5.3：基线窗口排除驱动秒。返回合并后的驱动区间，调用方据此过滤样本
+  const actSpans = (log) => mergeSpans((log || []).filter((r) => r && r.from != null).map((r) => [r.from, r.to == null ? Infinity : r.to, 'act']));
+
   // ---------- 每轮摘要（跨轮曲线与聊天变量用） ----------
   // 在发送时刻对刚结束的“读回复 / 写消息”做一份紧凑摘要；没有读回复相位时返回 null
-  function turnSummary({ samples, turn, baseline }) {
+  // peak：composeContext 里 detectPeak 判定过的读回复峰值（{ value, at } 或 null）。readPeak 只写判定过的值，没有就是 null（审查第 4 条：面板、history、块同一口径）
+  function turnSummary({ samples, turn, baseline, peak }) {
     if (turn.readStart == null) return null;
     const readEnd = turn.readEnd != null ? turn.readEnd : (turn.typingStart != null ? turn.typingStart : turn.now);
     const ph = phaseStats(samples, turn.readStart, readEnd, turn.away);
@@ -300,8 +500,8 @@ const HeartlinkCore = (() => {
     const wr = !discarded && turn.typingStart != null ? phaseStats(samples, turn.typingStart, turn.now, turn.away) : null;
     return {
       t: turn.now, readStart: turn.readStart, readSec: Math.round(ph.netMs / 1000),
-      readPeak: rd.max, readMean: rd.mean, readFirst: rd.first, readLast: rd.last,
-      peakAtSec: Math.round(netOffset(turn.away, turn.readStart, rd.peakAt) / 1000),
+      readPeak: peak ? peak.value : null, readPeakT: peak ? peak.at : null, readMax: rd.max, readMean: rd.mean, readFirst: rd.first, readLast: rd.last,
+      peakAtSec: peak ? Math.round(netOffset(turn.away, turn.readStart, peak.at) / 1000) : null,
       awaySec: Math.round(ph.awayMs / 1000),
       hrv: gatedHrv(rd, ph.samples, turn.readStart, readEnd, ph.netMs),
       writeSec: wr ? Math.round(wr.netMs / 1000) : 0,
@@ -316,7 +516,7 @@ const HeartlinkCore = (() => {
   function historyLine(history, maxTurns = 8) {
     const h = (history || []).slice(-maxTurns);
     if (!h.length) return null;
-    const peaks = h.map((x) => x.readPeak).join(' ');
+    const peaks = h.map((x) => (x.readPeak != null ? x.readPeak : '·')).join(' ');
     const durs = h.map((x) => fmtMS(x.readSec)).join(' ');
     const hrvs = h.map((x) => (x.hrv != null ? x.hrv : '·')).join(' ');
     return `history: read-peaks ${peaks} | read-dur ${durs} | hrv ${hrvs}`;
@@ -377,6 +577,7 @@ const HeartlinkCore = (() => {
   // ---------- 注入块：Tavern Bio-Context（协议仓库 ../spec） ----------
   // 固定英文键，每行一个字段，缺失写 n/a；块内不解释。
   const SPEC_VERSION = '0.3';
+  const SPEC_DRAFT = '0.4';   // 草案，默认不输出（settings 里的开关打开才用）
   const SOURCE = 'heartlink';
   const MODES = ['author', 'character', 'aware'];
   // TBC 0.3：块与变量里写新名字；内部名 author / character / aware
@@ -409,6 +610,8 @@ const HeartlinkCore = (() => {
   // B-7：kind / source / unit / cadence 都来自总线，不合规的 kind 整行不写，其余不合规的换成缺省
   function kindLine(kind, meta, turn, now) {
     if (!isKindName(kind) || BUS_ONLY_KINDS.has(kind)) return null;
+    // v0.4 §5.6：读数来自执行器（玩具自带的压力 / 按键）时，单位不统一，只写相对变化
+    if (meta && meta.toy) return toySensorLine(kind, meta, turn, now);
     const smp = ((meta && meta.samples) || []).filter((s) => s && Number.isFinite(s.value));
     const unit0 = meta && typeof meta.unit === 'string' ? meta.unit.toLowerCase() : null;
     const unit = isIdent(unit0) && unit0 !== 'raw' ? ` ${unit0}` : '';
@@ -431,6 +634,57 @@ const HeartlinkCore = (() => {
     }
     return `${head} ${parts.join(' | ')}`;
   }
+  // v0.4 §5.6：玩具上的传感器。括号里第一项是执行器 id，只写相对本相位开始的变化，不写物理单位，
+  // 也不与心率合成任何指标——这些行说的是**设备那边发生的事**，不是读者的生理量。
+  const rel = (v) => `${v >= 0 ? '+' : '-'}${fmtVal(Math.abs(v))}`;
+  function toySensorLine(kind, meta, turn, now) {
+    const smp = ((meta && meta.samples) || []).filter((s) => s && Number.isFinite(s.value));
+    if (!smp.length) return null;
+    const id = meta && isIdent(meta.id) ? meta.id : null;
+    if (!id) return null;
+    const cadence = meta && typeof meta.cadence === 'string' && CADENCE_RE.test(meta.cadence) ? meta.cadence : null;
+    const head = `${kind}(${id}, ${kind === 'button' ? 'event' : (cadence || '1s')}):`;
+    const spans = [];
+    if (turn.readStart) spans.push(['read', turn.readStart, turn.readEnd != null ? turn.readEnd : (turn.typingStart || now)]);
+    if (turn.typingStart != null) spans.push(['write', turn.typingStart, now]);
+    const parts = [];
+    for (const [name, from, to] of spans) {
+      const w = inWin(smp, from, to);
+      if (!w.length) continue;
+      if (kind === 'button') {
+        // 按下记 1、弹起记 0：只数按下；次数不是测量值，照 v0.3 §2.1 写 ×N
+        const press = w.filter((x, i) => x.value >= 1 && (i === 0 || w[i - 1].value < 1));
+        if (press.length) parts.push(`${name} @${Math.round((press[0].t - from) / 1000)}s ×${press.length}`);
+        continue;
+      }
+      const base = w[0].value;
+      const st = valueStats(w);
+      const peak = name === 'read' && st.max > base ? ` peak ${rel(st.max - base)} @${Math.round((st.peakAt - from) / 1000)}s` : '';   // 与心率以外的信号行一样，峰值只给读回复
+      parts.push(`${name} ${rel(0)}→${rel(st.last - base)}${peak}`);
+    }
+    return parts.length ? `${head} ${parts.join(' | ')}` : null;
+  }
+
+  // v0.3 §2.1 wear 行：本轮窗口里佩戴位报“没接触”的区间，标出落在哪个相位；最后一段是现在的状态。
+  //   wear(polar-h10, event): off 21:10:03–21:10:15 (read) | on
+  // 括号里是设备名（首行 device 属性同一个值，不合规时写 hr-sensor）。本轮没有这样的区间时不写
+  function wearLine(offSpans, turn, now, meta) {
+    if (!offSpans || !offSpans.length) return null;
+    const from = turn.prevSend != null ? turn.prevSend : turn.readStart != null ? turn.readStart : turn.typingStart != null ? turn.typingStart : now - CONFIG.SERIES_MAX_MS;
+    const spans = offSpans.filter(([a, b]) => b > from && a < now).slice(-4);
+    if (!spans.length) return null;
+    const phaseOf = (t) => {
+      if (turn.typingStart != null && t >= turn.typingStart) return 'write';
+      if (turn.readStart != null && t >= turn.readStart && (turn.readEnd == null || t < turn.readEnd)) return 'read';
+      if (turn.prevSend != null && turn.replyEnd != null && t >= turn.prevSend && t < turn.replyEnd) return 'gen';
+      return null;
+    };
+    const segs = spans.map(([a, b]) => { const x = Math.max(a, from); const ph = phaseOf(x); return `off ${fmtClock(x)}–${fmtClock(Math.min(b, now))}${ph ? ` (${ph})` : ''}`; });
+    const off = spans[spans.length - 1][1] >= now - 2000;
+    const name = meta && isDeviceName(String(meta.device || '')) ? meta.device : 'hr-sensor';
+    return `wear(${name}, event): ${segs.join(' | ')} | ${off ? 'off' : 'on'}`;
+  }
+
   // 执行器登记的状态行：单行、去掉多余空白、≤120 字符、不带标签
   function deviceLine(text) {
     if (text == null) return null;
@@ -499,7 +753,7 @@ const HeartlinkCore = (() => {
     if (f.rr === false) add('NO_RR', 'info', '这台设备不提供心跳间隔，没有 HRV', '不影响使用；需要 HRV 请换胸带或 WHOOP 等支持 RR 的设备');
     if (f.cadenceMs != null && f.cadenceMs >= 30000) add('SPARSE_SOURCE', 'info', '数据很稀疏（30 秒以上一个）', '部分相位会写 n/a，属于正常');
     if (f.mode === 'author') add('MODE_BACKSTAGE', 'info', '当前是幕后模式，角色不会提起你的身体状态', '想让角色察觉，在健康设备页把模式切到入戏');
-    if (f.injectEnabled === false) add('INJECTION_DISABLED', 'warn', '你关掉了“发给模型”，模型收不到设备数据', '在健康设备页打开“发给模型”');
+    if (f.injectEnabled === false) add('INJECTION_DISABLED', 'warn', '注入被脚本暂停了，模型收不到设备数据', '刷新页面即恢复（暂停只给测试和实验用，面板里没有这个开关）');
     if (f.guideActive === false) add('GUIDE_INACTIVE', 'warn', '没有找到启用的读法世界书，模型可能看不懂设备数据', '刷新页面让 heartlink 自动安装；或在世界信息里把“heartlink·读法”设为全局');
     if (f.multiWindow) add('MULTI_WINDOW', 'warn', '这个聊天在别的窗口也开着，会互相覆盖', '只保留一个窗口');
     if (f.hostOk === false) add('HOST_UNSUPPORTED', 'error', '酒馆缺少注入所需的接口', '升级酒馆到 1.13 以上');
@@ -617,23 +871,51 @@ const HeartlinkCore = (() => {
 
   // baseline：调用方同一时刻已算好的 sessionBaseline 结果（可为 null）；undefined 时这里自己算
   // meta.trigger 决定 scope 行与相位规则（v0.3 §1.3）：swipe / regenerate 没有新消息；impersonate 读者还没写；continue 转成重放块
-  function composeContext({ samples, events, activityLog, now, mode, baselineOverride, history, replyMeta, cpsOverride, kinds, deviceLines, extraLines, meta, prior, baseline }) {
+  // offContact：佩戴位报“没接触”的区间 [[from, to], …]（运行层记的）；样本上带 contact:false 的也会并进来，并从统计里去掉
+  // deviceNow：现在连着的设备（原始名），手动基线换了设备时降级；lagMs：按设备类型的滞后（v0.4 §2.1），目前只给 clean 行的最短长度用
+  function composeContext({ samples: allSamples, events, activityLog, now, mode, baselineOverride, history, replyMeta, cpsOverride, kinds, deviceLines, extraLines, meta, prior, baseline, actLog, v04, offContact, deviceNow, lagMs }) {
     let readPos = null;
+    const flagged = (allSamples || []).some((s) => s && s.contact === false);
+    const samples = flagged ? allSamples.filter((s) => s.contact !== false) : (allSamples || []);
+    const offSpans = mergeSpans([...(offContact || []).filter((x) => Array.isArray(x) && x[1] > x[0]).map((x) => [x[0], x[1]]), ...(flagged ? contactSpans(allSamples) : [])]);
+    const offSeg = (from, to) => { const ms = overlapMs(offSpans, from, to); return ms >= 1000 ? ` | off-wrist ${fmtMS(Math.round(ms / 1000))}` : ''; };
+    // v0.4 §5：开关打开且拿到驱动台账时才输出 act / clean / 基线卫生（草案期间缺省关）
+    const acts = v04 && Array.isArray(actLog) && actLog.length ? actLog : null;
+    const phaseVars = {};
+    const cleanLines = [];   // §5.2：clean 是扩展区（L1）的行，统一放到 send 之后，不跟在相位行后面
     const cadenceMs = meta && meta.cadenceMs ? meta.cadenceMs : null;
     const trigger = meta && TRIGGERS.includes(meta.trigger) ? meta.trigger : 'normal';
     const discarded = DISCARDED_TRIGGERS.has(trigger);
     const sparse = cadenceMs != null && cadenceMs >= SPARSE_MS;   // v0.3 §2.8：稀疏来源不输出 peak / hrv / series / read-pos
     const turn = buildTurn(events, now, { trigger });
     if (replyMeta) turn.replyMeta = replyMeta;
-    const base = baselineOverride ? { bpm: baselineOverride.bpm, hrv: baselineOverride.hrv || null, method: 'manual', n: 0 } : baseline !== undefined ? baseline : sessionBaseline(samples, activityLog || events, now);
+    let readPeak = null;
+    // 手动基线（含静坐记下的）超过 24 小时、换了设备或不知道何时记的：降到会话自动基线，并写 warn（v0.3 §1.5）
+    const stale = baselineOverride ? manualBaselineStale(baselineOverride, now, deviceNow, { requireDeviceId: !!v04 }) : null;
+    const useManual = baselineOverride && !stale;
+    let base = useManual ? { bpm: baselineOverride.bpm, hrv: baselineOverride.hrv || null, method: 'manual', n: baselineOverride.n || 0, at: baselineOverride.at, device: baselineOverride.device, deviceId: manualDeviceId(baselineOverride), noise: baselineOverride.noise }
+      : (baseline !== undefined && !baselineOverride) ? baseline : sessionBaseline(samples, activityLog || events, now);
+    // v0.4 §5.3 基线卫生：会话内算出的基线，窗口里不得含有执行器在动的秒；样本不够就降级并写明
+    let baseWarn = null;
+    if (stale) baseWarn = base ? `warn: baseline degraded to ${v04 ? (V04_METHOD[base.method] || base.method) : base.method} (${STALE_WHY[stale]})` : `warn: manual baseline not used (${STALE_WHY[stale]})`;
+    if (acts && !useManual) {
+      const spans = actSpans(acts);
+      const nb = sessionBaseline(samples.filter((s) => !inSpans(spans, s.t)), activityLog || events, now);
+      if (!nb) { baseWarn = 'warn: baseline n/a (actuated seconds excluded)'; base = null; }
+      else { if (base && nb.method !== base.method) baseWarn = `warn: baseline degraded to ${nb.method} (actuated seconds excluded)`; base = nb; }
+    }
     const m = MODES.includes(mode) ? mode : 'author';
     // v0.3 §1.1：0.x 期间 mode 只写旧值（author / character），视角写在 view
-    const header = `<bio_context v="${SPEC_VERSION}" mode="${LEGACY_MODE[m]}" view="${WIRE_MODE[m]}" source="${SOURCE}"${headerAttrs(meta)}>`;
+    const header = `<bio_context v="${v04 ? SPEC_DRAFT : SPEC_VERSION}" mode="${LEGACY_MODE[m]}" view="${WIRE_MODE[m]}" source="${SOURCE}"${headerAttrs(meta)}>`;
     const L = [header];
     L.push(`sent: ${fmtClock(now)}`);
     // TBC 0.3 §1.3：相位归属，防止模型把上一轮读回复的反应安到新消息上
     L.push(discarded ? SCOPE_DISCARDED : trigger === 'impersonate' ? SCOPE_IMPERSONATE : SCOPE_LINE);
-    L.push(base ? `baseline: ${base.bpm} bpm (${base.method}${base.n ? `, n=${base.n}` : ''}${base.hrv ? `; hrv ${base.hrv} ms` : ''})` : 'baseline: n/a (session too short)');
+    // §3-1：弃用的方法名改写（manual 缺设定日期与设备的情形已在上面的 stale 里降级）
+    if (v04 && base) base = Object.assign({}, base, { method: V04_METHOD[base.method] || base.method });
+    const manualInfo = v04 && base && base.method === 'manual' ? `, set ${new Date(base.at).toISOString().slice(0, 10)}, ${base.deviceId}` : '';
+    L.push(base ? `baseline: ${base.bpm} bpm (${base.method}${base.n ? `, n=${base.n}` : ''}${manualInfo}${base.hrv ? `; hrv ${base.hrv} ms` : ''})${v04 ? baselineSegs(base, now) : ''}` : `baseline: n/a (${baseWarn && baseWarn.includes('actuated') ? 'actuated seconds excluded' : 'session too short'})`);
+    // warn 行只能在 note 之后（v0.3 §2），先记下，最后再写
     const pl = priorLine(prior); if (pl) L.push(pl);
     L.push(historyLine(history) || 'history: n/a');
 
@@ -643,7 +925,13 @@ const HeartlinkCore = (() => {
       if (turn.streamStart) parts.push(`ttft ${fmtS(turn.streamStart - turn.prevSend)}`);
       if (turn.reasoningEnd && turn.streamStart) parts.push(`reasoning ${fmtS(turn.reasoningEnd - turn.streamStart)}`);
       if (turn.reasoningEnd) parts.push(`body ${fmtS(turn.replyEnd - turn.reasoningEnd)}`);
-      L.push(`gen: ${fmtS(turn.replyEnd - turn.prevSend)}${parts.length ? ` (${parts.join(', ')})` : ''} | ${fmtRange(gen)}${covTxt(gen ? coverage(gen.n, turn.prevSend, turn.replyEnd, cadenceMs) : null)}`);
+      const genAct = acts ? actStats(acts, turn.prevSend, turn.replyEnd, turn.away, Math.round((turn.replyEnd - turn.prevSend) / 1000)) : null;
+      L.push(`gen: ${fmtS(turn.replyEnd - turn.prevSend)}${parts.length ? ` (${parts.join(', ')})` : ''} | ${fmtRange(gen)}${covTxt(gen ? coverage(gen.n, turn.prevSend, turn.replyEnd, cadenceMs) : null)}${offSeg(turn.prevSend, turn.replyEnd)}${actSeg(genAct)}`);
+      if (genAct && !genAct.none) {
+        const c = cleanStats({ samples, from: turn.prevSend, to: turn.replyEnd, away: turn.away, act: genAct, noise: base && base.noise, cadenceMs, phaseSec: Math.round((turn.replyEnd - turn.prevSend) / 1000), lagMs });
+        const cl = cleanLine('gen', c); if (cl) cleanLines.push(cl);
+        phaseVars.gen = { act: actVar(genAct), clean: cleanVar(c) };
+      }
     } else L.push('gen: n/a');
 
     if (turn.readStart != null) {
@@ -661,7 +949,14 @@ const HeartlinkCore = (() => {
       const hrv = sparse ? null : gatedHrv(rd, ph.samples, turn.readStart, readEnd, ph.netMs);
       const tooLong = ph.netMs > CONFIG.READ_SUSPICIOUS_MS;
       const flag = tooLong ? ' | flag: too-long (likely away)' : '';
-      L.push(`read: ${fmtMS(readSec)} | ${fmtRange(rd)}${peak}${covTxt(cov)}${rrLoss(rd)}${hrv != null ? ` | hrv ${hrv} ms` : ''}${flag}`);
+      const readAct = acts ? actStats(acts, turn.readStart, readEnd, turn.away, readSec) : null;
+      L.push(`read: ${fmtMS(readSec)} | ${fmtRange(rd)}${peak}${covTxt(cov)}${rrLoss(rd)}${hrv != null ? ` | hrv ${hrv} ms` : ''}${offSeg(turn.readStart, readEnd)}${actSeg(readAct)}${flag}`);
+      readPeak = pk;
+      if (readAct && !readAct.none) {
+        const c = cleanStats({ samples, from: turn.readStart, to: readEnd, away: turn.away, act: readAct, noise: base && base.noise, cadenceMs, phaseSec: readSec, lagMs });
+        const cl = cleanLine('read', c); if (cl) cleanLines.push(cl);
+        phaseVars.read = { act: actVar(readAct), clean: cleanVar(c) };
+      }
       // 可选字段 read-pos：峰值不明显、read 带 too-long、与离开区间重叠、换页/重新生成（回复已不在上下文里）、没有 replyMeta/字数为 0 时不输出
       if (hasPeak && !tooLong && !discarded && ph.awayMs === 0 && replyMeta && replyMeta.chars) {
         const cjk = typeof replyMeta.cjkRatio === 'number' && replyMeta.cjkRatio >= 0.3;
@@ -688,7 +983,14 @@ const HeartlinkCore = (() => {
     else if (turn.typingStart != null) {
       const ph = phaseStats(samples, turn.typingStart, now, turn.away);
       const wr = ph.st;
-      L.push(`write: ${fmtS(ph.netMs)}, ${turn.lastLen != null ? turn.lastLen : 'n/a'} chars, pauses ${turn.pauses}, edits ${turn.deletes} | ${fmtRange(wr)}${covTxt(wr ? coverage(wr.n, 0, ph.netMs, cadenceMs) : null)}${rrLoss(wr)}`);
+      const wrSec = Math.round(ph.netMs / 1000);
+      const wrAct = acts ? actStats(acts, turn.typingStart, now, turn.away, wrSec) : null;
+      L.push(`write: ${fmtS(ph.netMs)}, ${turn.lastLen != null ? turn.lastLen : 'n/a'} chars, pauses ${turn.pauses}, edits ${turn.deletes} | ${fmtRange(wr)}${covTxt(wr ? coverage(wr.n, 0, ph.netMs, cadenceMs) : null)}${rrLoss(wr)}${offSeg(turn.typingStart, now)}${actSeg(wrAct)}`);
+      if (wrAct && !wrAct.none) {
+        const c = cleanStats({ samples, from: turn.typingStart, to: now, away: turn.away, act: wrAct, noise: base && base.noise, cadenceMs, phaseSec: wrSec, lagMs });
+        const cl = cleanLine('write', c); if (cl) cleanLines.push(cl);
+        phaseVars.write = { act: actVar(wrAct), clean: cleanVar(c) };
+      }
     } else L.push('write: n/a (no typing detected)');
 
     L.push(turn.away.length
@@ -698,6 +1000,8 @@ const HeartlinkCore = (() => {
     const sendSt = stats(inWin(samples, now - 5000, now));
     if (discarded) L.push(`send: ${NO_NEW_MESSAGE}`);
     else L.push(sendSt ? `send: ${sendSt.last} bpm${base ? ` (${sendSt.last >= base.bpm ? '+' : '-'}${Math.round(Math.abs(sendSt.last - base.bpm) / base.bpm * 100)}%)` : ''}` : 'send: n/a (no data in last 5s)');
+    for (const cl of cleanLines) L.push(cl);
+    const wl = wearLine(offSpans, turn, now, meta); if (wl) L.push(wl);
     // 0.8：其它信号种类各一行，随后是执行器状态行（都是可选的增量行）
     if (kinds && typeof kinds === 'object') {
       for (const kind of Object.keys(kinds)) { if (kind === 'hr' || kind === 'rr' || ENV_KINDS.has(kind)) continue; const kl = kindLine(kind, kinds[kind], turn, now); if (kl) L.push(kl); }
@@ -711,8 +1015,10 @@ const HeartlinkCore = (() => {
     const seq = series(samples, seqStart, now);
     if (!sparse && seq.some((v) => v !== '·')) L.push(`series(10s from ${fmtClock(seqStart)}): ${seq.join(' ')}`);   // 没有任何数据时不写（series 是可选行）
     L.push(NOTE_LINE);
+    if (baseWarn) L.push(baseWarn);
     L.push('</bio_context>');
-    const summary = turnSummary({ samples, turn, baseline: base });
+    const summary = turnSummary({ samples, turn, baseline: base, peak: readPeak });
+    if (summary && Object.keys(phaseVars).length) summary.phases = phaseVars;   // v0.4 §5.5
     if (summary) summary.readPos = readPos;   // 0.7.1：read-pos 同步进摘要 → 聊天变量 bio.turns / 消息 extra.bio
     // v0.3 §2.5 单块保证：首行合规、中间行不含尖括号与控制字符，否则改发最小块
     const guarded = blockGuard(L, { header, now });
@@ -949,8 +1255,10 @@ const HeartlinkCore = (() => {
     CONFIG, SPEC_VERSION, SOURCE, MODES,
     parseHeartRate, inWin, stats, series, isFresh, fmtClock, fmtDur,
     collectRR, rmssd, hrvInWindow,
-    manualBaseline, quietWindows, sessionBaseline,
+    manualBaseline, quietWindows, sessionBaseline, restBaseline, REST, manualBaselineStale, MANUAL_MAX_AGE_MS,
+    HR_SANE, hrPlausible, createHrGate, contactSpans, guessWear, LAG_MS_BY_CLASS, wearLine,
     detectPeak, gatedHrv, robustSd, compareVersions, guideVersionOf, guideDecision, replayBlock, sanitizeText, isIdent, isKindName, isDeviceName, isDateText, serialProblem, mergeSpans, overlapMs, phaseStats, LEGACY_MODE, TRIGGERS, BUS_ONLY_KINDS,
+    SPEC_DRAFT, actStats, actSeg, cleanStats, cleanLine, actSpans,
     buildTurn, turnSummary, historyLine, readPosition, estimateCps, composeContext, attachBio, kindLine, deviceLine, coverage, priorLine, envLine, headerAttrs, normalizeMode, readCardHints, sparkPath, buildDiagnostics, WIRE_MODE, SCOPE_LINE,
   };
 })();
@@ -966,6 +1274,8 @@ const HeartlinkHaptics = (() => {
   const PATTERNS = ['pulse', 'double', 'triple', 'long', 'heartbeat', 'wave'];
   // §5.9：output="*" 不驱动这些输出，必须点名
   const RISKY_OUTPUTS = ['Temperature', 'Estim', 'Spray'];
+  const TOY_SENSORS = ['Pressure', 'Button'];   // v0.4 §5.6：玩具上的传感器输入
+  const ACT_LOG_MAX = 200;   // v0.4 §5.1：驱动区间台账的上限（一轮统计只看本相位，留够几分钟即可）
   const onlyRisky = (caps) => caps.outputs.every((o) => RISKY_OUTPUTS.includes(o));
   const MAX_PER_REPLY = 3;
   const DEFAULT_INTENSITY = 0.5;
@@ -1181,6 +1491,9 @@ const HeartlinkHaptics = (() => {
     let groupSeq = 0;
     const report = (ev) => { if (typeof onAct === 'function') { try { onAct(ev); } catch (err) { log('onAct failed', err && err.message); } } };
     const clamp01 = (v) => Math.min(1, Math.max(0, v));
+    // v0.4 §5.1：驱动区间台账。记的是**发出去的东西**（帧表 × 读者增益），不是设备确认执行的时间——
+    // 多数设备不回报执行状态（v0.3 §5.9-8），所以协议就是按这个口径定义的。
+    const actLog = [];
 
     function register(id, caps, handler) {
       if (!id || !caps || !Array.isArray(caps.outputs) || !caps.outputs.length) throw new Error('tbc.registerActuator: need (id, { outputs: [...] }, handler)');
@@ -1289,11 +1602,16 @@ const HeartlinkHaptics = (() => {
         const finish = (how, reason) => {
           if (finished) return;
           finished = true; T.clearTimeout(watchdog);
+          rec.to = now();
           if (items.get(id) === it && it.run === run) it.run = null;
           endRun(how, reason, how === 'done' && heat);
         };
+        // v0.4 §5.1：这一路的驱动区间（未结束时 to 为 null）；outputs 取执行器登记的输出（output='*' 时就是它全部的）
+        const rec = { id, source, act: actIdx, outputs: a.output === '*' ? it.caps.outputs.slice() : [a.output], from: t, to: null, frames, gain: [] };
+        actLog.push(rec);
+        if (actLog.length > ACT_LOG_MAX) actLog.splice(0, actLog.length - ACT_LOG_MAX);
         const run = {
-          source, act: actIdx, base: eff, cur: eff, cap, startedAt: t, span, output: a.output,
+          rec, source, act: actIdx, base: eff, cur: eff, cap, startedAt: t, span, output: a.output,
           cancel(reason) { if (finished) return; cancelInner.cancel(); finish('cut', reason); },
           applyGain() { for (const fn of gainFns) { try { fn(job.gain()); } catch (_) {} } },
         };
@@ -1380,6 +1698,7 @@ const HeartlinkHaptics = (() => {
         n++;
         r.cur = Math.round(Math.min(r.cap, clamp01(r.cur + d)) * 1000) / 1000;
         level = r.cur;
+        if (r.rec) r.rec.gain.push([now(), r.base > 0 ? r.cur / r.base : 0]);   // v0.4 §5.1：发出去的强度要算上读者的调整
         if (r.cur <= 0) { cut.push(r.act); stopOne(id, it, 'weaker'); } else r.applyGain();
       }
       if (source) deltas.set(source, Math.max(-1, Math.min(1, (deltas.get(source) || 0) + d)));
@@ -1405,7 +1724,10 @@ const HeartlinkHaptics = (() => {
 
     return { register, unregister, list, actuate, stop, runReplyActs, adjust, skip, running,
       pending: () => queue.length, queued: () => queue.map((q) => ({ source: q.source, act: q.idx, at: q.at })),
-      delta: (source) => deltas.get(source) || 0, last: () => last, lastOk: () => lastOk };
+      delta: (source) => deltas.get(source) || 0, last: () => last, lastOk: () => lastOk,
+      // v0.4 §5.1：从 sinceT 之后有重叠的驱动区间（未结束的 to 为 null），给相位统计用
+      actuations: (sinceT) => actLog.filter((r) => sinceT == null || r.to == null || r.to >= sinceT)
+        .map((r) => ({ id: r.id, source: r.source, act: r.act, outputs: r.outputs.slice(), from: r.from, to: r.to, frames: r.frames.map((f) => f.slice()), gain: r.gain.map((g) => g.slice()) })) };
   }
 
   // ---------- Intiface / buttplug ----------
@@ -1418,6 +1740,12 @@ const HeartlinkHaptics = (() => {
           // v4 §InputCmd：能读电量的特性单独记下（不是输出，不登记执行器）
           if (f.Input && f.Input.Battery && (f.Input.Battery.Command || []).includes('Read')) {
             out.push({ key: `intiface:${d.DeviceIndex}:${f.FeatureIndex}:Battery`, deviceIndex: d.DeviceIndex, featureIndex: f.FeatureIndex, input: 'Battery', name: d.DeviceDisplayName || d.DeviceName });
+          }
+          // v0.4 §5.6：玩具自带的压力 / 按键（能订阅的才要；单位不标准，只当相对变化用）
+          for (const kind of TOY_SENSORS) {
+            const inf = f.Input && f.Input[kind];
+            if (!inf || !(inf.Command || []).includes('Subscribe')) continue;
+            out.push({ key: `intiface:${d.DeviceIndex}:${f.FeatureIndex}:${kind}`, deviceIndex: d.DeviceIndex, featureIndex: f.FeatureIndex, input: kind, name: d.DeviceDisplayName || d.DeviceName, feature: f.FeatureDescription || '' });
           }
           const outs = Object.entries(f.Output || {}).filter(([o]) => OUTPUTS.includes(o) && o !== '*');
           const hasHw = outs.some(([o]) => o === 'HwPositionWithDuration');
@@ -1488,7 +1816,7 @@ const HeartlinkHaptics = (() => {
   }
 
   // 客户端：connect() / close() / setLevel(feature, level) / stop(feature?) / status()
-  function createIntifaceClient({ WebSocket, url, clientName, timers, onFeatures, onStatus, log }) {
+  function createIntifaceClient({ WebSocket, url, clientName, timers, onFeatures, onStatus, onInput, log }) {
     const T = timers;
     let ws = null;
     let version = 4;
@@ -1521,6 +1849,15 @@ const HeartlinkHaptics = (() => {
         if (type === 'Error') { if (p) { pending.delete(body.Id); p.reject(new Error(body.ErrorMessage || 'error')); } else log('intiface error', body && body.ErrorMessage); continue; }
         if (type === 'DeviceList') { applyDeviceList(body.Devices); if (p) { pending.delete(body.Id); p.resolve(body); } continue; }
         if (type === 'DeviceAdded' || type === 'DeviceRemoved') { request((mid) => ({ RequestDeviceList: { Id: mid } })).catch(() => {}); continue; }
+        // v4 服务器主动推送的传感器读数（Id 为 0）：Read 的回复照常走 pending
+        if (type === 'InputReading' && !p && typeof onInput === 'function') {
+          const kind = Object.keys(body.Reading || {})[0];
+          const value = body.Reading && body.Reading[kind] && body.Reading[kind].Value;
+          if (TOY_SENSORS.includes(kind) && Number.isFinite(value)) {
+            try { onInput({ deviceIndex: body.DeviceIndex, featureIndex: body.FeatureIndex, input: kind, value, t: Date.now() }); } catch (err) { log('onInput failed', err && err.message); }
+          }
+          continue;
+        }
         if (p) { pending.delete(body.Id); p.resolve(body); }
       }
     }
@@ -1575,6 +1912,12 @@ const HeartlinkHaptics = (() => {
         const r = await request((mid) => ({ InputCmd: { Id: mid, DeviceIndex: f.deviceIndex, FeatureIndex: f.featureIndex, Type: 'Battery', Command: 'Read' } }));
         const v = r && r.Reading && r.Reading.Battery && r.Reading.Battery.Value;
         return Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : null;
+      },
+      // v0.4 §5.6：订阅 / 退订玩具上的传感器（v4 的 InputCmd；v3 没有这条消息）
+      subscribeInput(f, on) {
+        if (version < 4 || !f || !TOY_SENSORS.includes(f.input)) return Promise.resolve(false);
+        return request((mid) => ({ InputCmd: { Id: mid, DeviceIndex: f.deviceIndex, FeatureIndex: f.featureIndex, Type: f.input, Command: on === false ? 'Unsubscribe' : 'Subscribe' } }))
+          .then(() => true, () => false);
       },
       status: () => ({ status, version, features: features.length, url }),
     };
@@ -2559,7 +2902,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
 //   preview()                            当前时刻会注入的 <bio_context> 文本（不注入）
 //   getMode() / setMode(m) / toggleMode()  'author' | 'character' | 'aware'，按聊天记忆；没选过时用角色卡 data.extensions.tbc.mode_hint（TBC v0.3 §1.2）
 //   connect() / disconnect()             connect 必须由真人点击触发（浏览器规定）
-//   setManualBaseline() / clearManualBaseline()
+//   setManualBaseline() / clearManualBaseline()   startRestBaseline() / cancelRestBaseline()（静坐 3 分钟，前 1 分钟不算）
+//   setWear('wrist'|'chest'|null) / getWear()     设备戴在哪（决定按几秒算心率滞后；null = 自动猜）
 //   getHistory()                         本聊天最近 20 轮摘要（也在聊天变量 bio.turns）
 //   exportCsv()                          本聊天每轮摘要的 CSV 文本
 //   exportEvents()                       { events, samples } 的 JSON 字符串
@@ -2569,7 +2913,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
 (function heartlinkRuntime() {
   'use strict';
 
-  const VERSION = '0.19.0';
+  const VERSION = '0.20.0';
   const CONFIG = {
     RUNTIME_KEY: '__HEARTLINK_RUNTIME__',
     PUBLIC_KEY: 'heartlink',
@@ -2581,12 +2925,14 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     MAX_EVENTS: 4000,
     TYPE_COALESCE_MS: 400,
     ACTIVITY_THROTTLE_MS: 10000,
-    RECONNECT_DELAYS_MS: [1000, 2000, 4000, 8000, 15000],   // 用完后改为等设备的广播（设备回到附近自动连）
+    RECONNECT_DELAYS_MS: [1000, 2000, 4000, 8000, 15000],   // 用完后改为慢速重试（下一行），浏览器支持时同时等设备的广播
+    SLOW_RETRY_MS: 45000,   // 页面还拿着设备时，每 45 秒悄悄试一次，不设上限；用户点“断开设备”才停（审查第 3 条）
+    CONTACT_FRESH_MS: 5000, // 最近一个“没接触”的包在这么久以内：显示“没戴好”
     STALE_MS: 15000,        // 显示已连接但这么久没数据：重新订阅；再过 STALE_MS 仍没有：断开重连
     RENDER_MS: 2000,
     META_FALLBACK_MS: 10000,       // 聊天变量写入后，宿主这么久还没保存（且不在生成中）才自己存一次元数据
     GUIDE_CHECK_MS: 10 * 60 * 1000, // 读法世界书兜底复查间隔；平时靠 CHAT_CHANGED / WORLDINFO_* 事件触发
-    BRIDGE_URL: 'ws://127.0.0.1:27130/tbc/v0.2',   // 0.9：本机桥（heartlink Desk）；页面自己连着蓝牙时忽略桥送来的 hr
+    BRIDGE_URL: 'ws://127.0.0.1:27130/tbc/v0.2',   // 0.9：本机桥客户端（协议 v0.3 §6；目前没有维护中的桥程序）；页面自己连着蓝牙时忽略桥送来的 hr
     BRIDGE_RETRY_MS: [3000, 10000, 30000, 60000],
     HISTORY_MAX: 20,
     USER_GEN_KINDS: ['normal', 'regenerate', 'swipe', 'continue', 'impersonate', ''],
@@ -2612,11 +2958,11 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     // 玩具本身没有间隔要求，间隔交给档位（§5.8）
     TOY_CAPS: { levels: true, maxIntensity: 1, maxDurationMs: 30000, minIntervalMs: 0, via: 'intiface' },
     ACTUATION_LINE_MS: 10 * 60 * 1000,
-    LAB_URL: 'http://127.0.0.1:12346/lab/',   // 设备实验室（~/dev/tbc/device-lab，npm run sim）
+    LAB_URL: 'http://127.0.0.1:12346/lab/',   // 设备实验室（device-lab 仓库，npm run sim）
   };
   const LOG = '[heartlink]';
-  const GUIDE_BOOK = [{"name":"00 bio_context 读法","enabled":true,"content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","strategy":{"type":"selective","keys":["<bio_context"]},"position":{"type":"after_character_definition","order":100},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.19.0"}},{"name":"10 view=backstage 幕后（旧 mode=author）","enabled":true,"content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","strategy":{"type":"selective","keys":["view=\"backstage\"","mode=\"author\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.19.0"}},{"name":"11 view=in-story 入戏（旧 mode=character）","enabled":true,"content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","strategy":{"type":"selective","keys":["view=\"in-story\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.19.0"}},{"name":"12 view=device-aware 知情","enabled":true,"content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","strategy":{"type":"selective","keys":["view=\"device-aware\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.19.0"}},{"name":"20 feedback 读法","enabled":true,"content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","strategy":{"type":"selective","keys":["feedback("]},"position":{"type":"after_character_definition","order":101},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.19.0"}}];
-  const GUIDE_BOOK_NATIVE = [{"uid":0,"key":["<bio_context"],"keysecondary":[],"comment":"00 bio_context 读法","content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":100,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":0,"heartlink":"0.19.0"},{"uid":1,"key":["view=\"backstage\"","mode=\"author\""],"keysecondary":[],"comment":"10 view=backstage 幕后（旧 mode=author）","content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":1,"heartlink":"0.19.0"},{"uid":2,"key":["view=\"in-story\""],"keysecondary":[],"comment":"11 view=in-story 入戏（旧 mode=character）","content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":2,"heartlink":"0.19.0"},{"uid":3,"key":["view=\"device-aware\""],"keysecondary":[],"comment":"12 view=device-aware 知情","content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":3,"heartlink":"0.19.0"},{"uid":4,"key":["feedback("],"keysecondary":[],"comment":"20 feedback 读法","content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":101,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":4,"heartlink":"0.19.0"}];
+  const GUIDE_BOOK = [{"name":"00 bio_context 读法","enabled":true,"content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","strategy":{"type":"selective","keys":["<bio_context"]},"position":{"type":"after_character_definition","order":100},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.20.0"}},{"name":"10 view=backstage 幕后（旧 mode=author）","enabled":true,"content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","strategy":{"type":"selective","keys":["view=\"backstage\"","mode=\"author\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.20.0"}},{"name":"11 view=in-story 入戏（旧 mode=character）","enabled":true,"content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","strategy":{"type":"selective","keys":["view=\"in-story\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.20.0"}},{"name":"12 view=device-aware 知情","enabled":true,"content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","strategy":{"type":"selective","keys":["view=\"device-aware\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.20.0"}},{"name":"20 feedback 读法","enabled":true,"content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","strategy":{"type":"selective","keys":["feedback("]},"position":{"type":"after_character_definition","order":101},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.20.0"}},{"name":"30 bio_act 写法","enabled":true,"content":"<bio_act_guide>\n块里有 haptics(heartlink): on 时，读者连着玩具并允许剧情驱动。想让设备动，就在回复正文里写动作标签，回复写完后按出现顺序执行：\n<bio_act target=\"*\" output=\"Vibrate\" pattern=\"wave\" intensity=\"0.4\" ms=\"3000\"/>\n- 属性都可省略。target：设备，缺省 * 全部。output：Vibrate / Rotate / Oscillate / Constrict / Position 等，缺省 * 任意输出；Temperature、Estim、Spray 只有点名才会动。pattern：pulse / double / triple / long / heartbeat / wave，缺省 pulse。intensity：0–1，缺省 0.5，0 是停下。ms：毫秒，只对 long / heartbeat / wave 有效。\n- 每条回复最多 3 个（haptics 行的 profile 是 frenzy 或 max 时最多 5 个），多出的不执行。\n- 写在思维链（<think> 等）、代码、HTML 注释里的标签不算动作；标签在显示时会被隐藏。\n- 读者可以随时直接停下，不经过你；停下、跳过、调强调弱会在下一轮的 feedback 行里出现。\n- 什么时候动、动多强，跟着剧情和读者的反馈来。\n</bio_act_guide>","strategy":{"type":"selective","keys":["haptics(heartlink): on"]},"position":{"type":"after_character_definition","order":102},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.20.0"}}];
+  const GUIDE_BOOK_NATIVE = [{"uid":0,"key":["<bio_context"],"keysecondary":[],"comment":"00 bio_context 读法","content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":100,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":0,"heartlink":"0.20.0"},{"uid":1,"key":["view=\"backstage\"","mode=\"author\""],"keysecondary":[],"comment":"10 view=backstage 幕后（旧 mode=author）","content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":1,"heartlink":"0.20.0"},{"uid":2,"key":["view=\"in-story\""],"keysecondary":[],"comment":"11 view=in-story 入戏（旧 mode=character）","content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":2,"heartlink":"0.20.0"},{"uid":3,"key":["view=\"device-aware\""],"keysecondary":[],"comment":"12 view=device-aware 知情","content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":3,"heartlink":"0.20.0"},{"uid":4,"key":["feedback("],"keysecondary":[],"comment":"20 feedback 读法","content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":101,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":4,"heartlink":"0.20.0"},{"uid":5,"key":["haptics(heartlink): on"],"keysecondary":[],"comment":"30 bio_act 写法","content":"<bio_act_guide>\n块里有 haptics(heartlink): on 时，读者连着玩具并允许剧情驱动。想让设备动，就在回复正文里写动作标签，回复写完后按出现顺序执行：\n<bio_act target=\"*\" output=\"Vibrate\" pattern=\"wave\" intensity=\"0.4\" ms=\"3000\"/>\n- 属性都可省略。target：设备，缺省 * 全部。output：Vibrate / Rotate / Oscillate / Constrict / Position 等，缺省 * 任意输出；Temperature、Estim、Spray 只有点名才会动。pattern：pulse / double / triple / long / heartbeat / wave，缺省 pulse。intensity：0–1，缺省 0.5，0 是停下。ms：毫秒，只对 long / heartbeat / wave 有效。\n- 每条回复最多 3 个（haptics 行的 profile 是 frenzy 或 max 时最多 5 个），多出的不执行。\n- 写在思维链（<think> 等）、代码、HTML 注释里的标签不算动作；标签在显示时会被隐藏。\n- 读者可以随时直接停下，不经过你；停下、跳过、调强调弱会在下一轮的 feedback 行里出现。\n- 什么时候动、动多强，跟着剧情和读者的反馈来。\n</bio_act_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":102,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":5,"heartlink":"0.20.0"}];
   // 1.0：同一份源码构建两种形态——'script' 酒馆助手全局脚本（旧），'extension' 酒馆扩展
   const FORM = 'extension';
   // 开发者工具（设备模拟器按钮等）：发布版关闭
@@ -2657,6 +3003,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     pendingGen: null, genKind: null, genStartT: 0, turnBlock: state.turnBlock || null, impersonateBlock: null, impersonating: false,
     groupTurn: null, toolCallsAt: 0, round: null, bgGens: [],
     badInput: state.badInput || 0, invalidBlocks: state.invalidBlocks || 0, guideConflict: state.guideConflict || null, guideWrote: state.guideWrote || null,
+    // 佩戴位（parseHeartRate().sensorContact）：没接触的包不进样本，只记成区间；contactOff = { since, lastT }
+    offContact: state.offContact || [], contactOff: state.contactOff || null, contactSupported: !!state.contactSupported, lastPacketT: state.lastPacketT || 0,
+    wearClass: state.wearClass || null, rest: null, slowRetry: null,
   });
   if (previous && typeof previous.destroy === 'function') {
     try { previous.destroy(); } catch (err) { console.warn(LOG, 'destroy previous runtime failed', err); }
@@ -2674,7 +3023,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
       if (s.modes && typeof s.modes === 'object') state.modes = s.modes;
       if (typeof s.deviceName === 'string') state.deviceName = s.deviceName;
       if (s.prior && typeof s.prior === 'object' && !state.prior) state.prior = s.prior;
-      if (typeof s.injectEnabled === 'boolean') state.injectEnabled = s.injectEnabled;
+      // 2026-09-18 用户定：面板不再有“发给模型”开关，扩展总是注入（setExposure 只给测试与 ON/SHAM 实验用，不存盘）。
+      // 以前关过的人没有界面能打开，所以读到 false 就改回 true 并重写设置
+      if (s.injectEnabled === false) { state.injectEnabled = true; state.migrateInject = true; }
       if (s.privacyAck) state.privacyAck = true;
       if (s.badgePos && Number.isFinite(s.badgePos.right) && Number.isFinite(s.badgePos.top)) state.badgePos = s.badgePos;
       if (typeof s.badgeHidden === 'boolean') state.badgeHidden = s.badgeHidden;
@@ -2682,6 +3033,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
       if (s.playSeen) state.playSeen = true;
       if (s.haptics && typeof s.haptics === 'object') state.haptics = normalizeHaptics(s.haptics);
       if (typeof s.guideWrote === 'string') state.guideWrote = s.guideWrote;
+      if (typeof s.v04 === 'boolean') state.v04 = s.v04;   // v0.4 草案开关（缺省关，界面里没有）
+      if (s.wearClass === 'wrist' || s.wearClass === 'chest') state.wearClass = s.wearClass;
     } catch (err) { console.warn(LOG, 'loadSettings failed', err); }
   }
   // 旧设置缺的字段补缺省；安全词开关与词表分开合并
@@ -2707,7 +3060,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     return sw.words.some((w) => w && t.includes(w));
   }
   function saveSettings() {
-    try { host.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify({ manualBaseline: state.manualBaseline, modes: state.modes, deviceName: state.deviceName, prior: state.prior || null, injectEnabled: state.injectEnabled !== false, privacyAck: !!state.privacyAck, haptics: state.haptics, badgePos: state.badgePos || null, badgeHidden: !!state.badgeHidden, settingsFolded: !!state.settingsFolded, playSeen: !!state.playSeen, guideWrote: state.guideWrote || null })); }
+    try { host.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify({ manualBaseline: state.manualBaseline, modes: state.modes, deviceName: state.deviceName, prior: state.prior || null, privacyAck: !!state.privacyAck, haptics: state.haptics, badgePos: state.badgePos || null, badgeHidden: !!state.badgeHidden, settingsFolded: !!state.settingsFolded, playSeen: !!state.playSeen, guideWrote: state.guideWrote || null, v04: !!state.v04, wearClass: state.wearClass || null })); }
     catch (err) { console.warn(LOG, 'saveSettings failed', err); }
   }
   // 提示合并（0.18，手机上一串提示会盖住面板）：4 秒内的新提示替换上一条，两条合成一条；同样的话不重复弹
@@ -2749,6 +3102,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
       state.activityLog.push(e);
       if (state.activityLog.length > CONFIG.MAX_EVENTS) state.activityLog.splice(0, state.activityLog.length - CONFIG.MAX_EVENTS);
     }
+    if (state.rest) restOnEvent(e);
     return e;
   }
 
@@ -2764,6 +3118,38 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     if (!state.lastSample || sample.t >= state.lastSample.t) state.lastSample = sample;
     if (typeof state.onSample === 'function') { try { state.onSample(sample); } catch (_) {} }
     emit('bio:sample', sample);
+  }
+  // 数据卫生（审查第 2 条）：蓝牙与总线各一道闸，不可能的值与单点跳变不进样本（覆盖率里如实少掉）
+  const hrGates = { ble: HeartlinkCore.createHrGate(), bus: HeartlinkCore.createHrGate() };
+  function acceptHr(gate, bpm, rr, t) {
+    const accepted = hrGates[gate].push({ t: t == null ? Date.now() : t, bpm, rr: rr || [] });
+    for (const x of accepted) pushSample(x.bpm, x.rr, x.t);
+    return accepted.length > 0;
+  }
+  // 蓝牙心率包：佩戴位报“没接触”（sensorContact === false）时，这一秒不进样本，只记进 offContact 区间（v0.3 §2.1 wear、§2.2 off-wrist）
+  function onHrPacket(parsed, t) {
+    const now = t == null ? Date.now() : t;
+    state.lastPacketT = now;
+    if (parsed.sensorContact !== null && parsed.sensorContact !== undefined) state.contactSupported = true;
+    if (parsed.sensorContact === false) {
+      const spans = state.offContact;
+      const p = spans[spans.length - 1];
+      if (p && now <= p[1] + 2000) p[1] = Math.max(p[1], now + 1000); else spans.push([now, now + 1000]);
+      if (spans.length > 50) spans.splice(0, spans.length - 50);
+      if (!state.contactOff) { state.contactOff = { since: now, lastT: now }; render(); } else state.contactOff.lastT = now;
+      return false;
+    }
+    if (state.contactOff) { state.contactOff = null; render(); }
+    return acceptHr('ble', parsed.bpm, parsed.rr, now);
+  }
+  function contactOffNow(now) { return !!(state.contactOff && (now || Date.now()) - state.contactOff.lastT <= CONFIG.CONTACT_FRESH_MS); }
+  // 设备戴在哪：用户选过就用用户的；没选时按名字 / 佩戴位 / 心跳间隔猜（v0.4 §2.1 的滞后按它取）
+  function wearGuess() { const m = sourceMeta(); return HeartlinkCore.guessWear({ name: state.deviceName, rr: !!m.rr, contact: !!state.contactSupported }); }
+  function effectiveWear() { return state.wearClass || wearGuess(); }
+  function setWear(v) {
+    if (v !== null && v !== 'wrist' && v !== 'chest') throw new Error("wear must be 'wrist' | 'chest' | null");
+    state.wearClass = v; saveSettings(); render(); emit('bio:state', getState());
+    return effectiveWear();
   }
   // ---------- v0.2 头部属性：设备、传输、采样间隔（最近 60 个样本的中位间隔）、是否带 RR、本轮触发类型 ----------
   function sourceMeta() {
@@ -2805,8 +3191,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
   }
 
   // ---------- 0.8：TBC 总线（协议 device-interface-zh.md §1–§3）——别的脚本/扩展往这里 push 样本、登记设备状态行、订阅事件 ----------
+  // 只给测试与 ON/SHAM 实验用（面板里没有开关）；不存盘，刷新页面即恢复注入
   function setExposure(x) {
-    if (x && typeof x.inject === 'boolean') { state.injectEnabled = x.inject; if (!x.inject) clearInject(); saveSettings(); render(); }
+    if (x && typeof x.inject === 'boolean') { state.injectEnabled = x.inject; if (!x.inject) clearInject(); render(); }
     return { inject: state.injectEnabled !== false };
   }
   function diagnostics() {
@@ -3058,7 +3445,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     if (kind === 'hr') {
       if (state.connected) return false;   // 页面蓝牙是主来源
       const rr = Array.isArray(sample.rr) ? sample.rr.filter((x) => typeof x === 'number' && Number.isFinite(x) && x > 0 && x < 3) : [];
-      pushSample(Math.round(sample.value), rr, t);
+      if (!HeartlinkCore.hrPlausible(Math.round(sample.value))) return false;   // 0、300 之类：不入账，也不算别的脚本出错（桥没读到数时常送 0）
+      acceptHr('bus', Math.round(sample.value), rr, t);
       return true;
     }
     const k = kinds();
@@ -3090,7 +3478,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     return { signals: Object.assign({ hr: state.samples.length ? { source: 'heartlink', n: state.samples.length } : null }, Object.fromEntries(Object.entries(kinds()).map(([k, v]) => [k, { source: v.source, unit: v.unit, cadence: v.cadence, n: v.samples.length }]))), contexts: Object.keys(contextSources()) };
   }
   // ---------- 0.9：本机桥客户端（协议 spec-v0.2 §6）----------
-  // 桥在 heartlink Desk（macOS 菜单栏 App）里：它连蓝牙、推 bio:sample；页面把状态回传（cmd:state / prior），
+  // 本机桥（协议 v0.3 §6；原先的 macOS 桥程序已停用，目前没有维护中的实现）：桥连蓝牙、推 bio:sample；页面把状态回传（cmd:state / prior），
   // 这样 Safari / iPhone / 局域网 http 的酒馆也能拿到心率。ws://127.0.0.1 从 https 页面连在 Chrome/Firefox 允许（回环例外），Safari 不允许。
   function bridgeSend(obj) { try { if (state.bridge && state.bridge.readyState === 1) state.bridge.send(JSON.stringify(obj)); } catch (_) {} }
   function bridgeConnect(attempt) {
@@ -3190,15 +3578,22 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
   const toyFeatures = new Map();   // key → feature（带 driver：intiface 或 wasm）
   const toyBattery = new Map();    // `${source}:${deviceIndex}` → 电量 0–100（v4 InputCmd 读到才有）
   const toyInputs = new Map();     // key → 能读电量的特性（不是输出，不登记执行器）
+  const toySensors = new Map();    // key → 玩具自带的压力 / 按键特性（v0.4 §5.6；订阅后只当相对变化用）
   const toyLevels = new Map();     // key → 最近一次发出的档位（0–1，设备卡的实时动效只画这个，不代表设备真的执行了）
   let intiface = null;
   // 每个来源（intiface / wasm）各自同步自己的特性，互不影响
   function syncToys(source, driver, features) {
     const keep = new Set(features.map((f) => f.key));
     for (const [key, f] of [...toyInputs.entries()]) if (f.source === source && !keep.has(key)) { toyInputs.delete(key); toyBattery.delete(`${f.source}:${f.deviceIndex}`); }
+    for (const [key, f] of [...toySensors.entries()]) if (f.source === source && !keep.has(key)) { toySensors.delete(key); delete kinds()[sensorKind(f)]; }
     for (const [key, f] of [...toyFeatures.entries()]) if (f.source === source && !keep.has(key)) { toyFeatures.delete(key); toyLevels.delete(key); actuators.unregister(key); }
     for (const f0 of features) {
       if (f0.input === 'Battery') { toyInputs.set(f0.key, Object.assign({ source }, f0)); continue; }
+      // v0.4 §5.6：玩具上的压力 / 按键。订阅后读数进块里的 pressure / button 行（只写相对变化）
+      if (f0.input === 'Pressure' || f0.input === 'Button') {
+        if (!toySensors.has(f0.key)) { const f = Object.assign({ source }, f0); toySensors.set(f0.key, f); subscribeToySensor(f); }
+        continue;
+      }
       if (toyFeatures.has(f0.key)) continue;
       const f = Object.assign({ source }, f0);
       toyFeatures.set(f.key, f);
@@ -3224,6 +3619,28 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     }
     render();
   }
+  const sensorKind = (f) => (f.input === 'Button' ? 'button' : 'pressure');
+  // 括号里写设备 id（协议 §5.6-1，2026-09-18 修订）：buttplug 的传感器是设备上独立的特性，不属于某一路输出；
+  // 设备 id 是这台设备所有执行器 id 的公共前缀
+  const sensorId = (f) => `intiface:${f.deviceIndex}`;
+  function subscribeToySensor(f) {
+    if (!intiface || typeof intiface.subscribeInput !== 'function') return;
+    Promise.resolve(intiface.subscribeInput(f, true)).then((ok) => {
+      if (!ok) console.warn(LOG, 'toy sensor subscribe failed', f.key);
+    }).catch(() => {});
+  }
+  // 服务器推来的传感器读数 → 总线（kind 为 pressure / button，单位 raw）
+  function onToySensor(ev) {
+    const f = [...toySensors.values()].find((x) => x.deviceIndex === ev.deviceIndex && x.featureIndex === ev.featureIndex && x.input === ev.input);
+    if (!f) return;
+    const kind = sensorKind(f);
+    const k = kinds();
+    if (!k[kind] || !k[kind].toy) k[kind] = { source: 'heartlink', unit: 'raw', toy: true, id: sensorId(f), cadence: kind === 'button' ? null : '200ms', samples: [] };
+    const arr = k[kind].samples;
+    arr.push({ t: ev.t || Date.now(), value: ev.value });
+    if (arr.length > HeartlinkCore.CONFIG.MAX_SAMPLES) arr.splice(0, arr.length - HeartlinkCore.CONFIG.MAX_SAMPLES);
+    emit('bio:sample', { t: ev.t, kind, value: ev.value, source: 'heartlink', unit: 'raw', device: sensorId(f) });
+  }
   const intifaceDriver = { alive: () => !!intiface, setLevel: (f, lv) => intiface.setLevel(f, lv), setPosition: (f, p, ms) => intiface.setPosition(f, p, ms), stop: (f) => intiface.stop(f) };
   // 玩具电量（v4 InputCmd Read）：连上时读一次，之后每 5 分钟一次；读不到就不显示
   const BATTERY_EVERY_MS = 300000;
@@ -3248,6 +3665,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     intiface = HeartlinkHaptics.createIntifaceClient({
       WebSocket: host.WebSocket, url: state.haptics.intiface.url, clientName: `heartlink ${VERSION}`, timers: hTimers,
       onFeatures: (fs) => { syncToys('intiface', intifaceDriver, fs); readToyBattery(); },
+      onInput: onToySensor,
       onStatus: (st, detail) => {
         const was = state.intifaceStatus; state.intifaceStatus = st; state.intifaceDetail = detail || null;
         if (st === 'connected' && was !== 'connected') toast('success', `已连上 Intiface（协议 v${detail && detail.version}）`);
@@ -4045,7 +4463,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     await characteristic.startNotifications();
     detachDeviceListeners();
     state.notifyHandler = (event) => {
-      try { const parsed = HeartlinkCore.parseHeartRate(event.target.value); pushSample(parsed.bpm, parsed.rr); }
+      try { onHrPacket(HeartlinkCore.parseHeartRate(event.target.value)); }
       catch (err) { console.warn(LOG, 'parse failed', err); }
     };
     characteristic.addEventListener('characteristicvaluechanged', state.notifyHandler);
@@ -4054,7 +4472,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     state.device = device; state.characteristic = characteristic;
     state.deviceName = device.name || state.deviceName;
     state.connected = true; state.reconnecting = false; state.connectedAt = Date.now(); state.staleStep = 0;
-    stopAdvertisementWatch();
+    stopAdvertisementWatch(); stopSlowRetry();
+    hrGates.ble.reset();
     saveSettings(); notifyConnection();
     console.log(LOG, 'subscribed to', device.name);
     readDeviceExtras(server).catch((err) => console.log(LOG, 'device extras unavailable:', err && err.message));
@@ -4080,9 +4499,35 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
       try { await subscribe(device); toast('success', '心率设备已重连'); return; } catch (err) { console.warn(LOG, 'reconnect failed', err); }
     }
     state.reconnecting = false;
-    if (await waitForAdvertisement(device)) { notifyConnection(); toast('info', '心率设备暂时连不上，设备回到附近会自动重连。'); return; }
+    if (state.device !== device) return;
+    // 不再 30 秒后就放弃（审查第 3 条）：页面还拿着这台设备，就每 45 秒悄悄试一次，浏览器支持时同时等它的广播；点“断开设备”才停
+    await waitForAdvertisement(device);
+    scheduleSlowRetry(device);
     notifyConnection();
-    toast('warning', '心率设备断开，自动重连失败。点悬浮窗 → 健康设备 → 连接设备。');
+    toast('info', '心率设备暂时连不上，设备回来会自动接上。');
+  }
+  function scheduleSlowRetry(device) {
+    stopSlowRetry();
+    if (destroyed || state.device !== device || state.connected) return;
+    state.waitingForDevice = true;
+    state.slowRetry = hTimers.setTimeout(async () => {
+      state.slowRetry = null;
+      if (destroyed || state.device !== device || state.connected) return;
+      state.slowRetries = (state.slowRetries || 0) + 1;
+      try {
+        await subscribe(device);
+        pushEvent('ble_resumed', { via: 'retry' });
+        toast('success', `已自动重连 ${device.name || '心率设备'}`);
+      } catch (err) {
+        console.log(LOG, 'slow retry failed, will try again:', err && err.message);
+        if (state.device === device && !state.connected) scheduleSlowRetry(device);
+      }
+    }, CONFIG.SLOW_RETRY_MS);
+  }
+  function stopSlowRetry() {
+    if (state.slowRetry != null) { try { hTimers.clearTimeout(state.slowRetry); } catch (_) {} }
+    state.slowRetry = null;
+    if (!state.advWatch) state.waitingForDevice = false;
   }
   // 重试用完后：浏览器支持时等设备的广播，收到就重连（设备走远又回来的情形）
   async function waitForAdvertisement(device) {
@@ -4108,7 +4553,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
   }
   function stopAdvertisementWatch() {
     const w = state.advWatch;
-    state.advWatch = null; state.waitingForDevice = false;
+    state.advWatch = null; if (state.slowRetry == null) state.waitingForDevice = false;
     if (!w) return;
     try { w.device.removeEventListener('advertisementreceived', w.onAdv); } catch (_) {}
     try { if (w.ac) w.ac.abort(); } catch (_) {}   // Chrome：用 signal 结束扫描
@@ -4117,9 +4562,11 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
   // 看门狗：显示已连接却长时间没数据（常见的“假连接”）→ 先重新订阅，仍没有就断开，交给重连流程
   async function checkStale() {
     if (!state.connected || !state.device || state.subscribing) return;
-    const last = Math.max(state.lastSample ? state.lastSample.t : 0, state.connectedAt || 0);
+    // 没接触、被数据卫生丢掉的包也算“有数据在来”：设备没假死，不用重新订阅
+    const lastData = Math.max(state.lastSample ? state.lastSample.t : 0, state.lastPacketT || 0);
+    const last = Math.max(lastData, state.connectedAt || 0);
     const idle = Date.now() - last;
-    if (idle < CONFIG.STALE_MS) { if (idle < 3000) { state.staleStep = 0; if (state.lastSample && Date.now() - state.lastSample.t < 3000) { state.staleFixes = 0; state.staleGaveUp = false; } } return; }
+    if (idle < CONFIG.STALE_MS) { if (idle < 3000) { state.staleStep = 0; if (lastData && Date.now() - lastData < 3000) { state.staleFixes = 0; state.staleGaveUp = false; } } return; }
     if (!state.staleStep) {
       if ((state.staleFixes || 0) >= 3) {   // 连得上却一直不发数据：试过 3 轮就不再折腾，提示一次
         if (!state.staleGaveUp) { state.staleGaveUp = true; toast('warning', '心率设备连着但一直没有数据：请检查设备是否打开了“心率广播”，或断开后重新连接。'); }
@@ -4142,26 +4589,31 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
   }
   const CONNECT_HELP = '没有选择设备。列表里找不到时请检查：① 设备打开了“心率广播”（华为/小米/荣耀在运动健康 App 里开，WHOOP 在 App 的心率广播里开）；② 手环没被其他电脑或网页占着；③ 离电脑近一些；④ 用电脑或安卓上的 Chrome / Edge，iPhone 暂不支持。';
   const NO_BT_TEXT = '这个浏览器不支持网页蓝牙：请用电脑或安卓上的 Chrome / Edge，iPhone 暂不支持';
-  async function connect() {
+  // opts.name：刷新后“重新连接 上次的设备”——列表里只放这个名字（点击本身就是用户手势：requestDevice 必须在点击处理里同步走到，前面不能 await）
+  async function connect(opts) {
     const bt = bluetooth();
     if (!bt) { toast('error', NO_BT_TEXT); return false; }
+    const byName = opts && typeof opts.name === 'string' && opts.name ? opts.name : null;
     try {
-      const device = await bt.requestDevice({ filters: [{ services: ['heart_rate'] }], optionalServices: ['battery_service', 'device_information'] });
+      const device = await bt.requestDevice(byName
+        ? { filters: [{ name: byName }], optionalServices: ['heart_rate', 'battery_service', 'device_information'] }
+        : { filters: [{ services: ['heart_rate'] }], optionalServices: ['battery_service', 'device_information'] });
       await subscribe(device);
       toast('success', `已连接 ${device.name || '心率设备'}`);
       if (!state.privacyAck) {
         state.privacyAck = true; saveSettings();
-        toast('info', '提示：心率会作为一段文字随提示词发给你配置的模型服务商，不会发到别处。不想发送时，在悬浮窗的健康设备页关掉“发给模型”。');
+        toast('info', '提示：心率会作为一段文字随提示词发给你配置的模型服务商，不会发到别处。');
       }
       return true;
     } catch (err) {
-      if (err && err.name === 'NotFoundError') { toast('info', CONNECT_HELP); return false; }
+      if (err && err.name === 'NotFoundError') { toast('info', byName ? `没找到 ${byName}：确认它开着心率广播、离电脑近一些；或点“连别的设备”。` : CONNECT_HELP); return false; }
       console.warn(LOG, 'connect failed', err); toast('error', `连接失败：${err && err.message ? err.message : err}`);
       return false;
     }
   }
   function disconnect() {
-    stopAdvertisementWatch();
+    stopAdvertisementWatch(); stopSlowRetry(); state.waitingForDevice = false;
+    state.contactOff = null;
     const device = state.device;
     state.device = null; state.characteristic = null; state.connected = false;
     detachDeviceListeners();
@@ -4187,17 +4639,78 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
   }
 
   // ---------- 基线与用法 ----------
+  // 手动基线在面板与胶囊里照常用（面板标出“几天前记的，建议重记”）；注入块里过期的按协议降级（composeContext）
   function baselineInfo(now) {
-    if (state.manualBaseline) return { bpm: state.manualBaseline.bpm, hrv: state.manualBaseline.hrv || null, method: 'manual', n: 0 };
+    const m = state.manualBaseline;
+    if (m) return { bpm: m.bpm, hrv: m.hrv || null, method: 'manual', n: m.n || 0, at: m.at, device: m.device, how: m.how || 'quick', noise: m.noise,
+      stale: HeartlinkCore.manualBaselineStale(m, now || Date.now(), state.deviceName) };
     return HeartlinkCore.sessionBaseline(state.samples, state.activityLog, now || Date.now());
   }
+  function saveManual(r, how) {
+    // v0.4 §3：手动基线要记下设定时刻与设备（原始名用来比较是否换了设备，deviceId 是块里写的设备名）
+    state.manualBaseline = { bpm: r.bpm, hrv: r.hrv || null, at: Date.now(), device: state.deviceName || null, deviceId: sourceMeta().device || null, how, n: r.n || 0, noise: Number.isFinite(r.noise) ? Math.round(r.noise * 10) / 10 : null };
+    saveSettings(); render(); emit('bio:state', getState());
+    return state.manualBaseline;
+  }
+  // 旧接口：最近 60 秒平均（面板里已换成静坐 3 分钟；保留给脚本调用）
   function setManualBaseline() {
     const r = HeartlinkCore.manualBaseline(state.samples, Date.now());
     if (!r.ok) { toast('warning', `还不能记基线：${r.reason}`); return null; }
-    state.manualBaseline = { bpm: r.bpm, hrv: r.hrv };
-    saveSettings(); render();
+    saveManual({ bpm: r.bpm, hrv: r.hrv }, 'quick');
     toast('success', `手动基线：${r.bpm} bpm${r.hrv ? `，HRV ${r.hrv} ms` : ''}（覆盖自动基线）`);
     return state.manualBaseline;
+  }
+  // ---------- 静坐记平静心率（v0.3 §1.5 manual 的做法：前 60 秒不算，再记 120 秒） ----------
+  // 期间打字或切走页面：提示一行并从头再来（切走的，回到页面时才重新开始）
+  const REST_HINT = '别说话、别打字，前 1 分钟不算';
+  function startRestBaseline() {
+    if (!state.connected && !(state.bridgeUp && HeartlinkCore.isFresh(state.lastSample, Date.now()))) { toast('warning', '先连上心率设备，再静坐记平静心率'); return null; }
+    cancelRestBaseline(true);
+    const now = Date.now();
+    state.rest = { startedAt: now, hiddenAt: doc.visibilityState === 'hidden' ? now : null, hint: null, hintUntil: 0, restarts: 0 };
+    state.restTimer = host.setInterval(restTick, 1000);
+    render();
+    return restState();
+  }
+  function cancelRestBaseline(silent) {
+    if (state.restTimer != null) { try { host.clearInterval(state.restTimer); } catch (_) {} }
+    state.restTimer = null;
+    const had = !!state.rest;
+    state.rest = null;
+    if (had && !silent) render();
+    return had;
+  }
+  function restRestart(why) {
+    const r = state.rest; if (!r) return;
+    r.startedAt = Date.now(); r.restarts++;
+    r.hint = why === 'type' ? '打字了，已重新开始' : '切走了页面，已重新开始'; r.hintUntil = r.startedAt + 6000;
+    render();
+  }
+  function restOnEvent(e) {
+    const r = state.rest; if (!r) return;
+    if (e.type === 'type') restRestart('type');
+    else if (e.type === 'hidden') r.hiddenAt = e.t;
+    else if (e.type === 'visible' && r.hiddenAt != null) { r.hiddenAt = null; restRestart('hidden'); }
+  }
+  function restState(now) {
+    const r = state.rest; if (!r) return null;
+    const t = now || Date.now();
+    const W = HeartlinkCore.REST.WARM_MS; const R = HeartlinkCore.REST.REC_MS;
+    const elapsed = r.hiddenAt != null ? 0 : Math.max(0, t - r.startedAt);
+    return { startedAt: r.startedAt, elapsedMs: Math.min(elapsed, W + R), leftMs: Math.max(0, W + R - elapsed), warm: Math.min(1, elapsed / W), rec: Math.max(0, Math.min(1, (elapsed - W) / R)), hint: r.hint && t < r.hintUntil ? r.hint : null, restarts: r.restarts };
+  }
+  function restTick() {
+    const r = state.rest; if (!r) return;
+    const now = Date.now();
+    if (r.hiddenAt == null && now - r.startedAt >= HeartlinkCore.REST.WARM_MS + HeartlinkCore.REST.REC_MS) {
+      const res = HeartlinkCore.restBaseline(state.samples, r.startedAt);
+      cancelRestBaseline(true);
+      if (!res.ok) { toast('warning', `这 2 分钟只收到 ${res.count} 个心率，没有记下；检查设备是否戴好再试一次`); render(); return; }
+      saveManual(res, 'rest');
+      toast('success', `已记下平静心率 ${res.bpm}`);
+      return;
+    }
+    render();
   }
   function clearManualBaseline() { state.manualBaseline = null; saveSettings(); toast('info', '已改回会话自动基线'); render(); }
   // 卡片声明（TBC v0.3 §1.2）：群聊不读；只作默认值，用户在本聊天选过的模式优先
@@ -4292,7 +4805,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
       for (let i = c.chat.length - 1; i >= 0; i--) {
         const m = c.chat[i];
         if (m.is_user) continue;
-        // 0.7.2：不再主动调 saveChat（完整性检查 + 保存锁风险，见 docs/st-compat-audit-2026-09.md §4）；
+        // 0.7.2：不再主动调 saveChat（完整性检查 + 保存锁风险，见 spec 仓库 docs/st-compat-audit-2026-09-zh.md §4）；
         // 此刻用户消息已由酒馆落盘，这里写的数据会随本轮回复结束时酒馆自己的保存一起落盘
         HeartlinkCore.attachBio(m, Object.assign({}, summary, { v: HeartlinkCore.SPEC_VERSION, source: HeartlinkCore.SOURCE }, modeFields()));
         return;
@@ -4378,7 +4891,14 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     const defaultCps = cjk ? HeartlinkCore.CONFIG.READ_CPS_CJK : HeartlinkCore.CONFIG.READ_CPS_LATIN;
     const cpsOverride = HeartlinkCore.estimateCps({ history: history(), defaultCps });
     const meta = Object.assign(sourceMeta(), { trigger: trigger || 'normal' });
-    return HeartlinkCore.composeContext({ samples: state.samples, events: state.events, activityLog: state.activityLog, now: now || Date.now(), mode: getMode(), baselineOverride: state.manualBaseline, history: history(), replyMeta, cpsOverride, kinds: kinds(), deviceLines: deviceLines(), extraLines: [hapticsLine(), safeFeedbackLine()].filter(Boolean), meta, prior: state.prior || null, baseline });
+    // v0.4 §5：开关打开时把驱动台账一起给核心（相位的 act 段、clean 行、基线排除驱动秒）
+    const t0 = Math.min(now || Date.now(), Date.now()) - HeartlinkCore.CONFIG.SERIES_MAX_MS;
+    const actLog = state.v04 ? safeActuations(t0) : null;
+    return HeartlinkCore.composeContext({ samples: state.samples, events: state.events, activityLog: state.activityLog, now: now || Date.now(), mode: getMode(), baselineOverride: state.manualBaseline, history: history(), replyMeta, cpsOverride, kinds: kinds(), deviceLines: deviceLines(), extraLines: [hapticsLine(), safeFeedbackLine()].filter(Boolean), meta, prior: state.prior || null, baseline, actLog, v04: !!state.v04,
+      offContact: state.offContact, deviceNow: state.deviceName || null, lagMs: HeartlinkCore.LAG_MS_BY_CLASS[effectiveWear()] });
+  }
+  function safeActuations(sinceT) {
+    try { return typeof actuators.actuations === 'function' ? actuators.actuations(sinceT) : null; } catch (err) { console.warn(LOG, 'actuations failed', err); return null; }
   }
   function safeFeedbackLine() { try { return feedbackLineNow(); } catch (err) { console.warn(LOG, 'feedback line failed', err); return null; } }
   // 酒馆助手的 injectPrompts 优先；不可用时退回酒馆核心的 setExtensionPrompt（同一条 in_chat 注入）
@@ -4407,7 +4927,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     const composed = compose(now, undefined, trigger);
     let text = composed.text;
     if (composed.invalid) state.invalidBlocks = (state.invalidBlocks || 0) + 1;
-    else if (!HeartlinkCore.isFresh(state.lastSample, now) && state.samples.length) text = text.replace('\n</bio_context>', '\nwarn: device silent over 10s at send; recent phases may be incomplete\n</bio_context>');
+    else if (!HeartlinkCore.isFresh(state.lastSample, now) && state.samples.length && !contactOffNow(now)) text = text.replace('\n</bio_context>', '\nwarn: device silent over 10s at send; recent phases may be incomplete\n</bio_context>');
     return { sendT: now, trigger, text, summary: composed.summary };
   }
   function recordSummary(block) {
@@ -4729,8 +5249,8 @@ button:focus-visible{outline:2px solid var(--on-ink);outline-offset:2px}
 .delta:empty{display:none}
 .mode{font:12px/16px var(--font);color:var(--muted);margin-left:8px}
 .mode.ch{color:var(--toy)}
-.mode.warn{color:var(--warn)}
-.act{font:500 13px/20px var(--font);color:var(--ink);margin-left:8px}
+.mode.warn{color:var(--warn-ink)}
+.act{font:600 13px/20px var(--font);color:var(--on-ink);margin-left:8px}
 .live{display:none;width:6px;height:6px;border-radius:50%;background:var(--toy);margin-left:8px;box-shadow:0 0 0 2px color-mix(in srgb,var(--toy) 22%,transparent)}
 .live.on{display:inline-block;animation:br 1.6s ease-in-out infinite}
 /* 面板：固定头部 + 中间滚动 + 固定页脚 */
@@ -4777,14 +5297,24 @@ button:focus-visible{outline:2px solid var(--on-ink);outline-offset:2px}
 .sh{display:flex;align-items:center;height:16px;margin:0 0 4px;font:500 11px/16px var(--font);letter-spacing:.02em;color:var(--muted)}
 .sh .r{margin-left:auto;display:flex;align-items:center;gap:6px;color:var(--toy)}
 .status{display:flex;align-items:center;gap:8px;height:20px}
-.status b{font-weight:600}
-.status .st{color:var(--muted);display:inline-flex;align-items:center;font-size:12px}
-.status .st.warn{color:var(--warn)}
+.status b{font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.status .st{color:var(--muted);display:inline-flex;align-items:center;font-size:12px;white-space:nowrap}
+.status .st.warn{color:var(--warn-ink)}
+.status .st:empty{display:none}
+/* 健康页改版（效果图 ../docs/hr-panel-mockup，2026-09-18 批准）：戴在哪、三格信号、低电量、没戴好、平静心率的来历、静坐记录 */
+.kind{flex:none;font:500 11px/16px var(--font);color:var(--ink2);padding:0 6px;border:1px solid var(--line2);border-radius:999px;white-space:nowrap}
+.sig{display:inline-flex;align-items:flex-end;gap:2px;height:11px;margin-left:auto;flex:none}
+.sig:not([hidden]) + .batt{margin-left:8px}
+.sig i{display:block;width:3px;border-radius:1px;background:var(--line2)}
+.sig i:nth-child(1){height:5px}.sig i:nth-child(2){height:8px}.sig i:nth-child(3){height:11px}
+.sig i.on{background:var(--on)}
+.status .st.warn ~ .sig i.on{background:var(--warn)}
 .sdot{width:7px;height:7px;border-radius:50%;flex:none;background:var(--faint)}
 .sdot.ok{background:var(--on)}
 .sdot.warn{background:var(--warn)}
-.batt{margin-left:auto;font:12px/16px var(--font);color:var(--muted)}
+.batt{margin-left:auto;font:12px/16px var(--font);color:var(--muted);white-space:nowrap}
 .batt em{font-style:normal;font-weight:500;color:var(--ink)}
+.batt.low em{color:var(--warn-ink)}
 .empty{color:var(--muted);margin:0}
 .link{margin-left:auto;margin-right:-2px;border:0;background:none;padding:0 2px;border-radius:4px;cursor:pointer;color:var(--on-ink);font:500 12px/16px var(--font)}
 .link:hover{text-decoration:underline;text-underline-offset:2px}
@@ -4813,6 +5343,7 @@ button:focus-visible{outline:2px solid var(--on-ink);outline-offset:2px}
 .chart{display:block;margin-top:6px;width:100%;overflow:visible}
 .ghost{margin-top:6px;height:28px;border:1px dashed var(--line2);border-radius:4px;display:grid;place-items:center;font:12px/16px var(--font);color:var(--muted)}
 .hatch{display:inline-block;width:10px;height:8px;margin-right:4px;background:repeating-linear-gradient(135deg,var(--muted) 0 1px,transparent 1px 3px);opacity:.6}
+.hatch.warn{background:repeating-linear-gradient(135deg,var(--warn) 0 1px,transparent 1px 3px);opacity:.9}
 .node p{margin:2px 0 0}
 .quote{max-height:6em;overflow:auto}
 .sees b{font-weight:600}
@@ -4827,6 +5358,22 @@ button:focus-visible{outline:2px solid var(--on-ink);outline-offset:2px}
 .basemenu{display:flex;gap:8px;margin-top:8px}
 .basemenu button{flex:1;height:28px;border:1px solid var(--line2);background:none;border-radius:8px;font:500 12px/16px var(--font);cursor:pointer;transition:background-color .15s}
 .basemenu button:hover{background:var(--hover)}
+.base .old{color:var(--warn-ink)}
+.rest{display:flex;align-items:center;gap:10px;padding-top:10px;margin-top:2px;border-top:1px solid var(--hair)}
+.ring3{width:44px;height:44px;flex:none;transform:rotate(-90deg)}
+.ring3 circle{fill:none;stroke-width:4;stroke-linecap:round}
+.ring3 .bg{stroke:var(--track)}
+.ring3 .warm{stroke:var(--faint)}
+.ring3 .rec{stroke:var(--on);animation:breathe 2.4s ease-in-out infinite}
+.rt{display:flex;flex-direction:column;min-width:0}
+.rt b{font:600 13px/18px var(--font)}
+.rt span{font:12px/16px var(--font);color:var(--muted)}
+.rt span.w{color:var(--warn-ink)}
+.rleft{margin-left:auto;font:600 20px/20px var(--font);letter-spacing:-.01em}
+.last{margin:0;color:var(--ink2)}
+.last b{color:var(--ink);font-weight:600}
+.other{margin-top:6px}
+.small2{font-size:12px;line-height:18px}
 .ntag{display:inline-flex;align-items:center;align-self:center;height:18px;padding:0 5px;border-radius:4px;font:500 11px/1 var(--font);white-space:nowrap}
 .ntag.up{color:var(--toy);background:color-mix(in srgb,var(--toy) 14%,transparent)}
 .ntag.skip{color:var(--muted);background:color-mix(in srgb,var(--muted) 16%,transparent)}
@@ -4835,7 +5382,14 @@ button:focus-visible{outline:2px solid var(--on-ink);outline-offset:2px}
 .node.skipped .th .d{color:var(--muted);text-decoration:line-through;text-decoration-color:var(--faint)}
 .fbnote{margin:4px 0 0 20px;font:11px/16px var(--font);color:var(--muted)}
 .play{margin:0}
-.play q{quotes:"「" "」";color:var(--toy)}
+.play q,.steps q{quotes:"「" "」";color:var(--toy)}
+.steps{margin:0;padding-left:18px}
+.steps li{margin:2px 0}
+.steps b{font-weight:600}
+/* 效果图里叫 .more；这里改名 .pmore：.body.more 已是“还能往下滚”的遮罩 */
+.pmore{display:inline-block;margin-top:6px;color:var(--on-ink);font:500 12px/16px var(--font);text-decoration:none;border-radius:4px}
+.pmore:hover{text-decoration:underline;text-underline-offset:2px}
+.pmore:focus-visible{outline:2px solid var(--on-ink);outline-offset:2px}
 /* 设置与连接 */
 .fold{display:flex;align-items:center;gap:8px;width:calc(100% + 16px);height:36px;margin:0 -8px;padding:0 8px;border:0;border-radius:8px;background:none;cursor:pointer;font:600 13px/20px var(--font);color:var(--ink);text-align:left;transition:background-color .15s}
 .fold:hover{background:var(--hover)}
@@ -4855,6 +5409,7 @@ button:focus-visible{outline:2px solid var(--on-ink);outline-offset:2px}
 .switch[aria-checked="true"]::after{transform:translateX(16px)}
 .textbtn{display:inline-flex;align-items:center;height:28px;border:0;background:none;padding:0;cursor:pointer;font:500 12px/16px var(--font);color:var(--muted)}
 .textbtn:hover{color:var(--stop)}
+.textbtn.other:hover{color:var(--ink)}
 .row2{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:4px 0 0}
 .btn{min-height:48px;border:1px solid var(--line2);background:none;border-radius:8px;padding:6px 8px;font:600 13px/20px var(--font);color:var(--ink);cursor:pointer;text-align:center;transition:border-color .15s,background-color .15s}
 .btn:hover{background:var(--hover)}
@@ -5062,7 +5617,7 @@ button.dh:hover{background:var(--hover)}
 .ring .bg{stroke:color-mix(in srgb,var(--warn) 25%,transparent)}
 .ring .fg{stroke:var(--warn);stroke-linecap:round}
 @media (prefers-reduced-motion:reduce){
-  .disc.hr.on::after,.live.on,.node.pulse::before,.ntag.pop,:host(.open) .card,.fr.on::before,.spin2,.hs .dots i.now,.art .cd.pending{animation:none!important}
+  .disc.hr.on::after,.live.on,.node.pulse::before,.ntag.pop,:host(.open) .card,.fr.on::before,.spin2,.hs .dots i.now,.art .cd.pending,.ring3 .rec{animation:none!important}
   .disc.hr.on::after{opacity:0}
   .cv,.switch,.switch::after,.fbtn,.segctl button,.stop,.pill,.btn,.fold,.basemenu button,button.dh,.dc::before,.fr::before,.fn,.lv,.lv b,.viz .say,.osc .range,.osc .kn,.heatv .shim,.heatv .end,.minis i,.model,.sbtn,.suck .cup,.suck .core,.suck .flow{transition:none!important}
   .heatv .shim{display:none}
@@ -5075,7 +5630,6 @@ button.dh:hover{background:var(--hover)}
 }`;
   const HEART_SVG = '<svg viewBox="0 0 24 22" aria-hidden="true"><path d="M12 21s-9-5.6-9-12.2A5 5 0 0 1 12 6a5 5 0 0 1 9 2.8C21 15.4 12 21 12 21z"/></svg>';
   const WAVE_SVG = '<svg viewBox="0 0 16 10" aria-hidden="true"><path d="M1.2 5c1.9-3.6 3-3.6 4.9 0s3 3.6 4.9 0 2.6-3.6 3.8 0"/></svg>';
-  const IBI_SVG = '<svg width="14" height="12" viewBox="0 0 14 12" aria-hidden="true"><path d="M0 7h3l1.5-4 2.5 8 2-6 1 2h4" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" stroke-linecap="round"/></svg>';
   const X_SVG = '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1 1l8 8M9 1L1 9"/></svg>';
   const CV_SVG = '<svg class="cv" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 4.5l3 3 3-3"/></svg>';
   const CK_SVG = '<svg viewBox="0 0 10 10" aria-hidden="true"><path d="M1.5 5.2l2.3 2.3 4.7-5"/></svg>';
@@ -5096,6 +5650,7 @@ button.dh:hover{background:var(--hover)}
   const FB_BTNS = [['weaker', '弱一点', '已调弱'], ['stronger', '强一点', '已调强'], ['replay', '再来一次', '已重放'], ['skip', '跳过', '已跳过']];
   const FB_BY = Object.fromEntries(FB_BTNS.map((b) => [b[0], b]));
   const FB_STEP = 20;   // 调强 / 调弱一次的百分点
+  const PLAY_URL = 'https://github.com/kcgoofee-jpg/heartlink-extension#模型怎么让设备动';
   const REFUSE_ZH = { disabled: '剧情联动没开', 'unknown-target': '设备不在了', unsupported: '设备不支持', 'not-worn': '没戴着', sleeping: '睡眠中', 'quiet-hours': '勿扰时段', 'rate-limit': '太快了，稍等再按' };
 
   let hostEl = null, root = null, el = {};
@@ -5128,21 +5683,34 @@ button.dh:hover{background:var(--hover)}
   <ul class="help" data-f="help"></ul>
 
   <section data-pane="hr">
-    <div class="sec first" data-f="hrEmpty">
-      <p class="empty">还没连接设备。手环 / 心率带要先打开“心率广播”；用电脑或安卓上的 Chrome / Edge，iPhone 暂不支持。</p>
-      <button class="btn primary" data-act="hr">连接设备</button>
+    <div data-f="hrEmpty">
+      <div class="sec first" data-f="hrFirst">
+        <p class="empty">还没连接设备。手环 / 心率带要先打开“心率广播”；用电脑或安卓上的 Chrome / Edge，iPhone 暂不支持。</p>
+        <button class="btn primary" data-act="hr">连接设备</button>
+      </div>
+      <div data-f="hrAgain" hidden>
+        <div class="sec first">
+          <p class="last">上次连的是 <b data-f="lastName"></b></p>
+          <button class="btn primary" data-act="hrLast" data-f="lastBtn">重新连接</button>
+          <button class="textbtn other" data-act="hr">连别的设备</button>
+        </div>
+        <div class="sec"><p class="empty small2">手环 / 心率带要先打开“心率广播”；用电脑或安卓上的 Chrome / Edge，iPhone 暂不支持。</p></div>
+      </div>
     </div>
     <div data-f="hrLive">
       <div class="sec first">
-        <div class="status"><span class="sdot" data-f="hrDot"></span><b data-f="dev">--</b><span class="st" data-f="hrState"></span><span class="batt" data-f="batt"></span></div>
+        <div class="status"><span class="sdot" data-f="hrDot"></span><b data-f="dev">--</b><span class="kind" data-f="kind" hidden></span><span class="st" data-f="hrState"></span><span class="sig" data-f="sigBars"><i></i><i></i><i></i></span><span class="batt" data-f="batt"></span></div>
       </div>
       <div class="sec">
         <div class="tl">
           <div data-f="plist"></div>
           <div class="node hol" data-f="pnote" hidden><div class="ghost">发出第一条消息后，这里按相位分段显示</div></div>
           <div class="node bare">
-            <div class="base">${DASH_SVG}<span data-f="base">平静心率</span><button class="link" data-act="basemenu" title="虚线是平静心率，胶囊上的百分比也是和它比">调整</button></div>
-            <div class="basemenu" data-f="baseMenu" hidden><button data-act="baseline">记下现在为平静</button><button data-act="clear">改回自动计算</button></div>
+            <div class="base" data-f="baseRow">${DASH_SVG}<span data-f="base">平静心率</span><button class="link" data-act="basemenu" title="虚线是平静心率，胶囊上的百分比也是和它比">调整</button></div>
+            <div class="basemenu" data-f="baseMenu" hidden><button data-act="rest">静坐 3 分钟记下</button><button data-act="clear">改回自动计算</button></div>
+            <div class="rest" data-f="rest" role="timer" hidden><svg class="ring3" viewBox="0 0 44 44" aria-hidden="true"><circle cx="22" cy="22" r="19" class="bg"/><circle cx="22" cy="22" r="19" class="warm" data-f="ringWarm"/><circle cx="22" cy="22" r="19" class="rec" data-f="ringRec"/></svg>
+              <div class="rt"><b>静坐记平静心率</b><span data-f="restHint">别说话、别打字，前 1 分钟不算</span></div><span class="rleft" data-f="restLeft">3:00</span></div>
+            <div class="basemenu" data-f="restMenu" hidden><button data-act="restCancel">取消</button></div>
             <div class="small" data-f="hrvLine"><span data-f="hrv"></span><span data-f="last"></span></div>
           </div>
           <div class="node hol" style="--c:var(--gen)">
@@ -5162,8 +5730,8 @@ button.dh:hover{background:var(--hover)}
       <div class="foldbody" data-f="hrFold">
         <div class="set"><span>模式</span><div class="segctl" role="group" aria-label="模式"><button data-set="mode:author">幕后</button><button data-set="mode:character">入戏</button><button data-set="mode:aware">知情</button></div></div>
         <div class="meaning" data-f="modeHint"></div>
-        <div class="set"><span>发给模型</span><button class="switch" role="switch" data-act="inject" aria-label="发给模型"></button></div>
-        <div data-f="hrTools"><button class="textbtn" data-act="disconnect">断开设备</button></div>
+        <div class="set" data-f="wearRow"><span>设备戴在</span><div class="segctl" role="group" aria-label="设备戴在"><button data-set="wear:wrist">手腕</button><button data-set="wear:chest">胸前</button></div></div>
+        <div><button class="textbtn" data-act="disconnect" data-f="hrTools">断开设备</button></div>
       </div>
     </div>
   </section>
@@ -5181,7 +5749,8 @@ button.dh:hover{background:var(--hover)}
     </div>
     <div class="sec" data-f="play">
       <div class="sh">在对话里这样玩<button class="x" data-act="playClose" title="收起玩法说明" aria-label="收起玩法说明">${X_SVG}</button></div>
-      <p class="play">角色在回复里写动作，回复写完就动。也可以直接对角色说<q>轻一点</q><q>再强点</q><q>像心跳那样</q><q>慢慢来</q>。</p>
+      <ol class="steps"><li>打开下面的<b>剧情联动</b>，选个节奏</li><li>照常聊天，角色会在回复里让设备动，回复写完就动</li><li>想改就直接对角色说<q>轻一点</q><q>像心跳那样</q><q>慢慢来</q>，或按上面的按钮</li></ol>
+      <a class="pmore" href="${PLAY_URL}" target="_blank" rel="noopener">完整玩法 ↗</a>
     </div>
     <div class="sec" data-f="toyFoldSec">
       <button class="fold" data-act="fold" aria-expanded="true">设置与连接${CV_SVG}</button>
@@ -5221,11 +5790,12 @@ button.dh:hover{background:var(--hover)}
   </span>
   <span class="psep"></span>
   <span class="seg" data-seg="toy"><span class="disc toy">${WAVE_SVG}</span><span class="num" data-f="tn">--</span><span class="unit">路</span><span class="live" data-f="live" title="正在动"></span><span class="ring" data-f="ring" title="自带模式还在跑" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><circle class="bg" cx="8" cy="8" r="6"/><circle class="fg" data-f="ringFg" cx="8" cy="8" r="6" stroke-dasharray="37.7" stroke-dashoffset="0"/></svg></span></span>
-  <span class="seg" data-seg="none"><span class="disc hr off">${HEART_SVG}</span><span class="act">连接设备</span></span>
+  <span class="seg" data-seg="none"><span class="disc hr off">${HEART_SVG}</span><span class="act" data-f="noneAct">连接设备</span></span>
 </div>`;
     const q = (s) => root.querySelector(s);
     el = { heart: q('[data-seg="hr"] .disc'), poly: q('.spark path'), sparkRef: q('.spark .ref'), delta: q('.delta'), tag: q('[data-seg="hr"] .mode'), pill: q('.pill'), spark: q('.spark') };
-    ['bpm', 'tn', 'head', 'fb', 'base', 'hrv', 'last', 'hrvLine', 'dev', 'out', 'sig', 'sigBox', 'foot', 'hrBadge', 'toyBadge', 'hrEmpty', 'hrLive', 'hrDot', 'hrState', 'batt', 'plist', 'pnote', 'baseMenu', 'modeHint', 'hrTools', 'hrFold', 'toyFold', 'hrFoldSec', 'toyFoldSec', 'toyEmpty', 'toyTiles', 'now', 'lastact', 'fbnote', 'devSec', 'dcards', 'wasmState', 'help', 'devs', 'helpBtn', 'sees', 'ptext', 'body', 'play', 'playBtn', 'connRow', 'connTxt', 'connBtns',
+    ['hrFirst', 'hrAgain', 'lastName', 'lastBtn', 'kind', 'sigBars', 'baseRow', 'rest', 'ringWarm', 'ringRec', 'restHint', 'restLeft', 'restMenu', 'wearRow', 'noneAct',
+      'bpm', 'tn', 'head', 'fb', 'base', 'hrv', 'last', 'hrvLine', 'dev', 'out', 'sig', 'sigBox', 'foot', 'hrBadge', 'toyBadge', 'hrEmpty', 'hrLive', 'hrDot', 'hrState', 'batt', 'plist', 'pnote', 'baseMenu', 'modeHint', 'hrTools', 'hrFold', 'toyFold', 'hrFoldSec', 'toyFoldSec', 'toyEmpty', 'toyTiles', 'now', 'lastact', 'fbnote', 'devSec', 'dcards', 'wasmState', 'help', 'devs', 'helpBtn', 'sees', 'ptext', 'body', 'play', 'playBtn', 'connRow', 'connTxt', 'connBtns',
       'pick', 'wait', 'scrim', 'sheet', 'natBanner', 'natLeft', 'natSub', 'natProg', 'live', 'ring', 'ringFg']
       .forEach((f) => { el[f] = q(`[data-f="${f}"]`); });
     el.folds = [...root.querySelectorAll('[data-act="fold"]')];
@@ -5237,7 +5807,7 @@ button.dh:hover{background:var(--hover)}
     el.tabs = [...root.querySelectorAll('[data-tab]')];
     el.panes = [...root.querySelectorAll('[data-pane]')];
     el.sets = [...root.querySelectorAll('[data-set]')];
-    el.injSw = q('[data-act="inject"]'); el.vibSw = q('[data-act="vib"]');
+    el.vibSw = q('[data-act="vib"]');
     el.toyBtn = q('[data-act="toy"]'); el.wasmBtn = q('[data-act="direct"]');
     el.devs.addEventListener('change', (e) => {
       const id = e.target && e.target.getAttribute('data-id');
@@ -5269,6 +5839,7 @@ button.dh:hover{background:var(--hover)}
           return;
         }
         if (key === 'cap') { setHaptics({ maxIntensity: Number(val) }); return; }
+        if (key === 'wear') { if (effectiveWear() !== val || !state.wearClass) setWear(val); return; }
         return;
       }
       const btn = t.closest && t.closest('[data-act]');
@@ -5314,7 +5885,6 @@ button.dh:hover{background:var(--hover)}
           closeSheet();
           return;
         }
-        if (act === 'inject') { setExposure({ inject: state.injectEnabled === false }); toast('info', state.injectEnabled === false ? '已停止发给模型' : '已恢复发给模型'); return; }
         if (act === 'vib') { const on = !state.haptics.enabled; setHaptics({ enabled: on }); if (on) askProfile(); toast(on ? 'warning' : 'info', on ? '剧情联动已打开' : '剧情联动已关闭，玩具已停'); return; }
         if (act === 'toy') { const on = !state.haptics.intiface.enabled; setHaptics({ intiface: { enabled: on } }); toast('info', on ? '正在连接 Intiface（先在 Intiface Central 里点 Start Server）' : '已断开 Intiface'); return; }
         if (act === 'hide') { setBadgeHidden(true); toast('info', '悬浮窗已隐藏，可在魔杖菜单里恢复'); return; }
@@ -5325,6 +5895,9 @@ button.dh:hover{background:var(--hover)}
         if (act === 'preview') { el.ptext.hidden = !el.ptext.hidden; btn.textContent = el.ptext.hidden ? '看原文' : '收起'; if (!el.ptext.hidden) { el.ptext.textContent = compose().text; console.log(LOG, 'preview:\n' + el.ptext.textContent); } return; }
         if (act === 'basemenu') { el.baseMenu.hidden = !el.baseMenu.hidden; return; }
         if (act === 'baseline') { el.baseMenu.hidden = true; return setManualBaseline(); }
+        if (act === 'rest') { el.baseMenu.hidden = true; startRestBaseline(); return; }
+        if (act === 'restCancel') { cancelRestBaseline(); return; }
+        if (act === 'hrLast') return connect({ name: state.deviceName });
         if (act === 'clear') { el.baseMenu.hidden = true; return clearManualBaseline(); }
         if (act === 'disconnect') { disconnect(); return render(); }
         if (act === 'hr') return connect();
@@ -5591,11 +6164,12 @@ button.dh:hover{background:var(--hover)}
     return { d, refY: HeartlinkCore.sparkPath.refY };
   }
   // 本轮相位（与注入块同一套边界，HeartlinkCore.buildTurn）：
-  //   看生成 = 等首字 → 思维链 → 正文（非流式时只有一段）；读回复；写消息；离开（页面切走 / 长时间没操作）不计
-  //   颜色是 CSS 变量；看生成的三小段只用顶部线条的透明度区分
+  //   生成中 = 等首字 → 思维链 → 正文（非流式时只有一段）；读回复；打字；离开（页面切走 / 长时间没操作）不计
+  //   界面上的相位名（2026-09-18 改）：生成中 / 读回复 / 打字；协议里的字段名仍是 gen / read / write
+  //   颜色是 CSS 变量；生成中的三小段只用顶部线条的透明度区分
   const PH = {
-    wait: { name: '等首字', c: 'gen', o: 0.55 }, think: { name: '思考', c: 'gen', o: 0.75 }, body: { name: '正文', c: 'gen', o: 1 }, gen: { name: '看生成', c: 'gen', o: 1 },
-    read: { name: '读回复', c: 'read', o: 1 }, write: { name: '写消息', c: 'write', o: 1 },
+    wait: { name: '等首字', c: 'gen', o: 0.55 }, think: { name: '思考', c: 'gen', o: 0.75 }, body: { name: '正文', c: 'gen', o: 1 }, gen: { name: '生成中', c: 'gen', o: 1 },
+    read: { name: '读回复', c: 'read', o: 1 }, write: { name: '打字', c: 'write', o: 1 },
   };
   function phaseModel(now) {
     const t = HeartlinkCore.buildTurn(state.events, now);
@@ -5621,11 +6195,14 @@ button.dh:hover{background:var(--hover)}
     }
     return { groups: groups.filter((g) => g.b > g.a), away: t.away || [] };
   }
-  // 时间线：每个相位一个节点；看生成、读回复各带一张小走势图，所有小图纵向比例相同、以底边为准对齐，平静心率虚线在同一高度
+  // 时间线：每个相位一个节点；生成中、读回复各带一张小走势图，所有小图纵向比例相同、以底边为准对齐，平静心率虚线在同一高度
   // 第二轮：4px 圆角、相位底色变淡（--tint / --tint-live）、子段顶线之间留 2px 缝、上方留 6px 给峰值点、离开的斜线变淡
+  // 健康页改版：没戴好的时段打琥珀斜线、曲线断开；峰值点只画块里判定过的那个（composed.summary.readPeak，审查 U7）
   const CHART_W = 276;
-  function renderPhases(base, now) {
+  function renderPhases(base, now, composed) {
     const { groups, away } = phaseModel(now);
+    const offs = (state.offContact || []).filter(([a, b]) => b > a);
+    const offIn = (g) => HeartlinkCore.overlapMs(offs, g.a, g.b);
     const t0 = groups.length ? groups[0].a : now;
     const pts = state.samples.filter((x) => x.t >= t0 && x.t <= now);
     const fmt = (sec) => (sec >= 60 ? `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, '0')}` : `${sec}s`);
@@ -5650,9 +6227,9 @@ button.dh:hover{background:var(--hover)}
       k = Math.min(k, (c.h - 10) / (hi - lo));
     }
     k = Math.max(0.3, k);
-    let peak = null;
+    const sm = composed && composed.summary;
     const rd = groups.find((g) => g.k === 'read');
-    if (rd) for (const x of pts) if (x.t >= rd.a && x.t <= rd.b && (!peak || x.bpm > peak.bpm)) peak = x;
+    const peak = rd && sm && sm.readPeak != null && sm.readPeakT != null && sm.readStart === rd.a ? { t: sm.readPeakT, bpm: sm.readPeak } : null;
     const chartSvg = (c, idx) => {
       const { g, h, N, span, vals } = c;
       const W = CHART_W;
@@ -5660,7 +6237,8 @@ button.dh:hover{background:var(--hover)}
       const Y = (v) => h - 4 - (v - lo) * k;
       let s = `<svg class="chart" viewBox="0 0 ${W} ${h}" height="${h}" preserveAspectRatio="none" aria-hidden="true"><defs>`
         + `<clipPath id="hlclip${idx}"><rect width="${W}" height="${h}" rx="4"/></clipPath>`
-        + `<pattern id="hlaway${idx}" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" style="stroke:var(--muted);stroke-width:1;stroke-opacity:.35"/></pattern></defs><g clip-path="url(#hlclip${idx})">`;
+        + `<pattern id="hlaway${idx}" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" style="stroke:var(--muted);stroke-width:1;stroke-opacity:.35"/></pattern>`
+        + `<pattern id="hlwear${idx}" width="4" height="4" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><line x1="0" y1="0" x2="0" y2="4" style="stroke:var(--warn);stroke-width:1;stroke-opacity:.55"/></pattern></defs><g clip-path="url(#hlclip${idx})">`;
       g.subs.forEach((sb, i) => {
         const x = X(sb.a); const w = Math.max(1, X(sb.b) - x);
         const gl = i > 0 ? 1 : 0; const gr = i < g.subs.length - 1 ? 1 : 0;
@@ -5668,10 +6246,17 @@ button.dh:hover{background:var(--hover)}
         s += `<rect x="${(x + gl).toFixed(1)}" y="0" width="${Math.max(0, w - gl - gr).toFixed(1)}" height="2" style="fill:var(--${PH[sb.k].c});opacity:${PH[sb.k].o}"/>`;
       });
       for (const [a, b] of away) if (b > g.a && a < g.b) s += `<rect x="${X(a).toFixed(1)}" y="2" width="${Math.max(1, X(b) - X(a)).toFixed(1)}" height="${h - 2}" fill="url(#hlaway${idx})"><title>离开，不计入</title></rect>`;
+      for (const [a, b] of offs) if (b > g.a && a < g.b) s += `<rect x="${X(a).toFixed(1)}" y="2" width="${Math.max(1, X(b) - X(a)).toFixed(1)}" height="${h - 2}" fill="url(#hlwear${idx})"><title>没戴好，不计入</title></rect>`;
       if (base) { const yb = Y(base.bpm).toFixed(1); s += `<line x1="0" x2="${W}" y1="${yb}" y2="${yb}" style="stroke:var(--faint);stroke-width:1;stroke-dasharray:2 3"/>`; }
       // 断开超过 3 桶才断线（偶尔漏一两个样本不算中断）
+      // 没戴好的桶一律断开（哪怕只有一两秒）
       let d = ''; let gap = Infinity;
-      vals.forEach((v, i) => { if (v == null) { gap++; return; } d += `${gap > 3 ? 'M' : 'L'}${((i + 0.5) * W / N).toFixed(1)},${Y(v).toFixed(1)}`; gap = 0; });
+      vals.forEach((v, i) => {
+        const b0 = g.a + i * span / N; const b1 = b0 + span / N;
+        if (offs.some(([a, b]) => a < b1 && b > b0)) { gap = Infinity; return; }
+        if (v == null) { gap++; return; }
+        d += `${gap > 3 ? 'M' : 'L'}${((i + 0.5) * W / N).toFixed(1)},${Y(v).toFixed(1)}`; gap = 0;
+      });
       if (d) s += `<path d="${d}" style="fill:none;stroke:var(--heart);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round;vector-effect:non-scaling-stroke"/>`;
       if (g.k === 'read' && peak && d) s += `<circle cx="${X(peak.t).toFixed(1)}" cy="${Y(peak.bpm).toFixed(1)}" r="3" style="fill:var(--heart);stroke:var(--bg);stroke-width:2"/>`;
       return s + '</g></svg>';
@@ -5685,21 +6270,34 @@ button.dh:hover{background:var(--hover)}
         if (g.subs.length > 1) sub = g.subs.map((sb) => `${SHORT[sb.k]} ${fmt(secs(sb.a, sb.b))}`).join(' · ');
         else if (g.live && g.subs[0] && g.subs[0].k === 'wait') sub = '等首字';
       }
-      if (g.k === 'read' && peak) {
+      if (g.k === 'read') {
         const fl = pts.filter((x) => x.t >= g.a && x.t <= g.b);
         const up = fl.length ? fl[fl.length - 1].bpm - fl[0].bpm : 0;
         arrow = up >= 3 ? ' ↑' : up <= -3 ? ' ↓' : '';
-        right = `<span class="r"><span class="m">峰值</span><span class="big">${peak.bpm}</span></span>`;
+        if (peak) right = `<span class="r"><span class="m">峰值</span><span class="big">${peak.bpm}</span></span>`;
       }
       const aw = awayIn(g);
       if (aw >= 1000) sub += `${sub ? '&nbsp;·&nbsp;' : ''}<i class="hatch" title="离开的时段不计入"></i>离开 ${fmt(Math.round(aw / 1000))}`;
+      const ow = offIn(g);
+      if (ow >= 1000) sub += `${sub ? '&nbsp;·&nbsp;' : ''}<i class="hatch warn" title="没戴好的时段不计入"></i>没戴好 ${fmt(Math.round(ow / 1000))}，不计`;
       const liveTag = g.live ? `<span class="m${g.k === 'write' ? ' w' : ''}">进行中</span>` : '';
       return `<div class="node${g.live ? ' pulse' : ''}" style="--c:var(--${PH[g.k].c})"><div class="th"><b>${PH[g.k].name}</b><span class="d">${dur}${arrow}</span>${liveTag}${right}</div>`
         + (c ? chartSvg(c, i) : '') + (sub ? `<div class="tsub">${sub}</div>` : '') + '</div>';
     }).join(''));
     el.pnote.hidden = groups.length > 0;
-    const how = base ? { manual: ' · 手动记下', p20: ' · 估算' }[base.method] || '' : '';
-    setHtml(el.base, base ? `平静心率 <b>${base.bpm}</b>${how}` : '平静心率稍后自动算出');
+    setHtml(el.base, baseText(base, now));
+  }
+  // 平静心率的来历与年龄（审查 U5）：自动 / 手动记下 · 2 小时前 / 静坐记下 · 刚刚；超过 24 小时或换了设备 → 琥珀色“建议重记”
+  const agoZh = (ms) => { const m = Math.floor(Math.max(0, ms) / 60000); if (m < 1) return '刚刚'; if (m < 60) return `${m} 分钟前`; const h = Math.floor(m / 60); return h < 24 ? `${h} 小时前` : `${Math.floor(h / 24)} 天前`; };
+  function baseText(base, now) {
+    if (!base) return '平静心率稍后自动算出';
+    const v = `平静心率 <b>${esc(base.bpm)}</b>`;
+    if (base.method !== 'manual') return `${v} · 自动`;
+    const how = base.how === 'rest' ? '静坐记下' : '手动记下';
+    if (base.stale === 'age') return `${v} · <span class="old">${agoZh(now - base.at)}记的，建议重记</span>`;
+    if (base.stale === 'device') return `${v} · <span class="old">在别的设备上记的，建议重记</span>`;
+    if (base.stale === 'unknown') return `${v} · <span class="old">${how}，时间不明，建议重记</span>`;
+    return `${v} · ${how} · ${agoZh(now - base.at)}`;
   }
   const fmtSec = (sec) => (sec >= 60 ? `${Math.floor(sec / 60)} 分 ${sec % 60} 秒` : `${sec} 秒`);
   const esc = (v) => String(v == null ? '' : v).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
@@ -5885,7 +6483,7 @@ button.dh:hover{background:var(--hover)}
   // ---------- 0.18：玩具页“设备”卡（效果图 docs/toy-device-card-mockup，2026-09-18 批准） ----------
   // 每台设备一张，每一路一行：名字、跟着 heartlink 发出的帧动的小图、当前档位 N/总档。超过两台时每台收成一行。
   // 只放扩展确实知道的：设备名、每一路的输出类型与档数、发出的档位、正在动 / 安静、要点名的输出、加热倒计时（动作时长或全局上限）。
-  // 电量、共用马达、保活、中文特性名、每一路的时限、是否接的是设备实验室、重连中：现在没有数据，不显示。
+  // 电量与中文特性名 0.19 起有；浏览器直接连的设备另有连接状态（握手、断线、可能仍在动）。共用马达、保活、每一路的时限只在自有驱动里有，经 Intiface 拿不到，不显示。
   // 动画：整页一个 requestAnimationFrame 循环；只在面板打开、在玩具页、页面可见、这一节在可视范围内时跑；
   // DOM 只改 transform / opacity，波形画在 canvas 上；系统开了“减少动态效果”时画静止的档位条。
   const DEV_OUT_ZH = { Vibrate: '振动', Oscillate: '往复', Rotate: '旋转', Constrict: '收缩', HwPositionWithDuration: '抽动', Position: '位置', Estim: '电刺激', Temperature: '加热', Spray: '喷', Led: '灯' };
@@ -6249,6 +6847,43 @@ button.dh:hover{background:var(--hover)}
     if (!root || destroyed) return;
     renderQ.request();
   }
+  // 三格信号：最近 60 秒收到的心率占应收的百分比（刚连上不满 60 秒时按连上以来算；没戴好、被丢掉的都不算收到）
+  function signalCoverage(now) {
+    const from = Math.max(now - 60000, state.connected && state.connectedAt ? state.connectedAt : 0);
+    if (now - from < 3000) return null;
+    const n = state.samples.filter((x) => x.t > from && x.t <= now).length;
+    return HeartlinkCore.coverage(n, from, now, sourceMeta().cadenceMs || 1000);
+  }
+  // “下次发送时，模型会收到”：按块里真有的行说（读回复的时长 / 峰值、写了多久、和平静心率比）
+  function seesParts(text) {
+    const line = (name) => String(text || '').split('\n').find((l) => l.startsWith(name + ': ')) || '';
+    const out = [];
+    const rd = line('read');
+    if (rd && !/^read: n\/a/.test(rd)) out.push(/ peak \d+/.test(rd) ? '读回复的时长和峰值' : '读回复的时长');
+    const wr = line('write');
+    if (wr && !/^write: n\/a/.test(wr)) out.push('这条写了多久');
+    if (/^send: \d+ bpm \([+-]\d+%\)/.test(line('send'))) out.push('和平静心率比');
+    return out;
+  }
+  // 静坐记平静心率：倒计时环（前 1 分钟灰，后 2 分钟青绿）、剩余时间、打字 / 切走后的一行提示
+  const RING_C = 2 * Math.PI * 19;
+  function renderRest(now) {
+    const r = restState(now);
+    const on = !!r;
+    el.rest.hidden = !on; el.restMenu.hidden = !on; el.baseRow.hidden = on;
+    if (on) el.baseMenu.hidden = true;
+    if (!on) return;
+    const third = RING_C / 3;
+    el.ringWarm.setAttribute('stroke-dasharray', `${(third * r.warm).toFixed(1)} ${RING_C.toFixed(1)}`);
+    el.ringRec.setAttribute('stroke-dasharray', `${(2 * third * r.rec).toFixed(1)} ${RING_C.toFixed(1)}`);
+    el.ringRec.setAttribute('stroke-dashoffset', (-third).toFixed(1));
+    el.ringRec.style.display = r.rec > 0 ? '' : 'none';
+    el.ringWarm.style.display = r.warm > 0 ? '' : 'none';
+    const left = Math.ceil(r.leftMs / 1000);
+    el.restLeft.textContent = `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`;
+    el.restHint.textContent = r.hint || REST_HINT;
+    el.restHint.className = r.hint ? 'w' : '';
+  }
   const onRenderVisibility = () => renderQ.onVisible();
   function renderNow() {
     if (!root || destroyed) return;
@@ -6256,20 +6891,27 @@ button.dh:hover{background:var(--hover)}
     const fresh = HeartlinkCore.isFresh(state.lastSample, now);
     const on = state.connected && fresh;
     const mode = getMode();
-    const base = state.connected ? baselineInfo(now) : null;
-    const d = on && base ? Math.round((state.lastSample.bpm - base.bpm) / base.bpm * 100) : null;
+    const base = state.connected || state.waitingForDevice ? baselineInfo(now) : null;
+    // 胶囊百分比用最近 5 秒的中位数（审查 U12），不跟着单个样本跳；变色门槛按平静心率的噪声算：max(5 bpm, 2 × noise)，没有 noise 时 10%
+    const offWrist = state.connected && contactOffNow(now);
+    const waiting = !state.connected && !!state.waitingForDevice;
+    const live = on && !offWrist;
+    const recent = live ? state.samples.filter((x) => x.t > now - 5000).map((x) => x.bpm).sort((a, b) => a - b) : [];
+    const med = recent.length ? (recent.length % 2 ? recent[recent.length >> 1] : (recent[recent.length / 2 - 1] + recent[recent.length / 2]) / 2) : null;
+    const d = live && base && med != null ? Math.round((med - base.bpm) / base.bpm * 100) : null;
+    const upThr = base ? (Number.isFinite(base.noise) ? Math.max(5, 2 * base.noise) : Math.max(5, base.bpm * 0.1)) : null;
     syncTone();
     // 胶囊：心率段
-    el.heart.className = 'disc hr ' + (on ? 'on' : state.connected ? 'stale' : 'off');
-    if (on) {   // 心率变化不到 5 bpm 不改动画时长：改 --beat 会让动画重新计时、样式重算
+    el.heart.className = 'disc hr ' + (live ? 'on' : state.connected || waiting ? 'stale' : 'off');
+    if (live) {   // 心率变化不到 5 bpm 不改动画时长：改 --beat 会让动画重新计时、样式重算
       const bpm = Math.max(state.lastSample.bpm, 30);
       if (beatBpm == null || Math.abs(bpm - beatBpm) >= 5) { beatBpm = bpm; hostEl.style.setProperty('--beat', (60 / bpm) + 's'); }
     }
-    el.bpm.textContent = on ? String(state.lastSample.bpm) : '--';
-    el.bpm.className = 'num' + (on ? '' : ' dim');
-    el.bpm.style.display = (state.connected || (state.bridgeUp && fresh)) ? '' : 'none';   // 0.9：桥送来的心率也显示
-    el.spark.style.display = on ? '' : 'none';
-    if (on) {
+    el.bpm.textContent = live ? String(state.lastSample.bpm) : '--';
+    el.bpm.className = 'num' + (live ? '' : ' dim');
+    el.bpm.style.display = (state.connected || waiting || (state.bridgeUp && fresh)) ? '' : 'none';   // 0.9：桥送来的心率也显示
+    el.spark.style.display = live ? '' : 'none';
+    if (live) {
       const sp = sparkPath(base ? base.bpm : null);
       el.poly.setAttribute('d', sp.d);
       el.sparkRef.style.display = sp.refY == null ? 'none' : '';
@@ -6277,10 +6919,11 @@ button.dh:hover{background:var(--hover)}
     }
     el.delta.textContent = d != null ? `${d >= 0 ? '+' : ''}${d}%` : '';
     el.delta.title = base ? `现在比平静心率 ${base.bpm} ${d >= 0 ? '高' : '低'} ${Math.abs(d || 0)}%` : '';
-    el.delta.className = 'delta' + (d != null && d >= 10 ? ' up' : '');
+    el.delta.className = 'delta' + (d != null && upThr != null && med - base.bpm >= upThr ? ' up' : '');
     let tag; let tagWarn = false;
     if (state.newerVersion) tag = '请刷新';   // 别的页面已装更新版本，优先提示
-    else if (state.waitingForDevice && !state.connected) tag = '等设备回来';
+    else if (waiting) { tag = '等设备回来'; tagWarn = true; }
+    else if (offWrist) { tag = '没戴好'; tagWarn = true; }
     else if (state.reconnecting) tag = '重连中';
     else if (!state.connected) tag = state.bridgeUp && fresh ? '经本机桥' : '未连接';
     else if (!fresh) {
@@ -6306,6 +6949,9 @@ button.dh:hover{background:var(--hover)}
     el.seg.hr.hidden = !hrActive;
     el.seg.toy.hidden = !toyActive;
     el.seg.none.hidden = hrActive || toyActive;
+    // 刷新后（页面丢了蓝牙连接）：胶囊写“重新连接”，面板里一键连回上次的设备（审查 U10）
+    const again = !!(state.deviceName && bluetooth() && !hrActive);
+    el.noneAct.textContent = again ? '重新连接' : '连接设备';
     el.segsep.hidden = !(hrActive && toyActive);
     el.tn.textContent = String(nToy || maybeCount);
     el.live.className = 'live' + (nats.length ? '' : maybeAny ? ' warn on' : busy.length ? ' on' : '');
@@ -6339,36 +6985,45 @@ button.dh:hover{background:var(--hover)}
     // 健康设备页
     el.hrEmpty.hidden = hrActive;
     el.hrLive.hidden = !hrActive;
+    el.hrFirst.hidden = again; el.hrAgain.hidden = !again;
+    if (again) {
+      const nm = state.deviceName.split(' ')[0];
+      el.lastName.textContent = nm; el.lastBtn.textContent = `重新连接 ${nm}`;
+    }
     el.hrTools.hidden = !state.connected && !state.reconnecting && !state.waitingForDevice;
+    el.wearRow.hidden = !state.deviceName;
     if (hrActive) {
-      const m2 = sourceMeta();
       el.dev.textContent = `${(state.deviceName || '心率设备').split(' ')[0]}${info.model ? ' ' + info.model : ''}`;
-      el.hrDot.className = 'sdot ' + (on ? 'ok' : 'warn');
-      if (on) { setHtml(el.hrState, m2.rr ? IBI_SVG : ''); el.hrState.title = m2.rr ? '含心跳间隔' : ''; el.hrState.className = 'st'; }
-      else { htmlCache.delete(el.hrState); el.hrState.textContent = tag; el.hrState.title = ''; el.hrState.className = 'st' + (tagWarn ? ' warn' : ''); }
+      el.hrDot.className = 'sdot ' + (live ? 'ok' : 'warn');
+      // 设备行：戴在哪（U4）· 状态（没戴好 / 等设备回来 / 无数据）· 三格信号（U2）· 电量（≤15% 琥珀，U3）
+      el.kind.hidden = !state.deviceName;
+      el.kind.textContent = effectiveWear() === 'chest' ? '胸前' : '手腕';
+      htmlCache.delete(el.hrState);
+      el.hrState.textContent = live ? '' : tag; el.hrState.className = 'st' + (!live && tagWarn ? ' warn' : '');
+      const cov = signalCoverage(now);
+      const bars = cov == null ? 0 : cov >= 85 ? 3 : cov >= 50 ? 2 : cov > 0 ? 1 : 0;
+      [...el.sigBars.children].forEach((b, i) => { b.className = i < bars ? 'on' : ''; });
+      el.sigBars.title = `信号：最近一分钟收到 ${cov == null ? 0 : cov}% 的心率`;
       setHtml(el.batt, state.battery != null ? `电量 <em>${esc(state.battery)}%</em>` : '');
-      renderPhases(base, now);
+      el.batt.className = 'batt' + (state.battery != null && state.battery <= 15 ? ' low' : '');
+      const c2 = compose(now, state.connected ? base : undefined);
+      renderPhases(base, now, c2);
+      renderRest(now);
       const hist = history(); const lastTurn = hist[hist.length - 1];
       const hrv = lastTurn ? lastTurn.hrv : base && base.hrv;
       const hrvHtml = hrv != null ? `心率变异 <em>${esc(hrv)}ms</em>` : lastTurn ? '心率变异信号不足' : '';
-      const peaks = hist.slice(-5).map((x) => x.readPeak).filter((v) => v != null);
+      // 前几轮峰值：块里判定过的峰值；没判出峰值的轮写“·”（审查 U9）
+      const peaks = hist.slice(-5).map((x) => (x.readPeak != null ? x.readPeak : '·'));
       const lastHtml = peaks.length ? `${hrvHtml ? ' · ' : ''}前几轮峰值 ${peaks.map((v) => `<em>${esc(v)}</em>`).join(' · ')}` : '';
       setHtml(el.hrv, hrvHtml); setHtml(el.last, lastHtml);
-      el.hrvLine.hidden = !hrvHtml && !lastHtml;
-      // 这一轮会注入什么（一句话）；具体时长、峰值在上面的时间线里，这里只说比平静高多少
+      el.hrvLine.hidden = (!hrvHtml && !lastHtml) || !!state.rest;
+      // 下次发送时模型会收到什么（审查 U8）：只说块里真有的东西，不重复上面的数字；后半句是模式的含义
       let seesMut = false;
-      if (state.injectEnabled === false) setHtml(el.sees, '<i>“发给模型”已关，模型收不到这些数据。</i>');
+      if (state.injectEnabled === false) setHtml(el.sees, '<i>注入已被脚本暂停，模型收不到这些数据；刷新页面即恢复。</i>');
       else {
-        const c2 = compose(now, state.connected ? base : undefined);
-        const sm = c2.summary;
-        const modeTxt = `按${MODE_ZH[mode] || '幕后'}方式使用`;
-        if (sm) {
-          const parts = ['读回复多久'];
-          if (base) { const pct = Math.round((sm.readPeak - base.bpm) / base.bpm * 100); parts.push(`峰值比平静${pct >= 0 ? '高' : '低'} <b>${Math.abs(pct)}%</b>`); }
-          else parts.push('峰值');
-          if (sm.writeSec) parts.push('这条写了多久');
-          setHtml(el.sees, `${parts.join('、')}，${modeTxt}。`);
-        } else { seesMut = true; setHtml(el.sees, '还没有数据，角色回复后开始记。'); }
+        const said = seesParts(c2.text);
+        if (said.length) setHtml(el.sees, `${said.join('、')}；${MODE_HINT[mode] || MODE_HINT.author}。`);
+        else { seesMut = true; setHtml(el.sees, '还没有数据，角色回复后开始记。'); }
         if (!el.ptext.hidden) el.ptext.textContent = c2.text;
       }
       el.sees.className = 'sees' + (seesMut ? ' mut' : '');
@@ -6377,13 +7032,13 @@ button.dh:hover{background:var(--hover)}
       el.sig.textContent = sig ? `“${sig.text}”` : '';
     }
     el.modeHint.textContent = MODE_HINT[mode] || MODE_HINT.author;
-    el.injSw.setAttribute('aria-checked', String(state.injectEnabled !== false));
+    const wearNow = effectiveWear();
     // 玩具页
     const pol = hapticsPolicy();
     el.vibSw.setAttribute('aria-checked', String(!!state.haptics.enabled));
     el.sets.forEach((b) => {
       const [key, val] = b.getAttribute('data-set').split(':');
-      const cur = key === 'mode' ? mode : key === 'profile' ? pol.profile : String(state.haptics.maxIntensity);
+      const cur = key === 'mode' ? mode : key === 'profile' ? pol.profile : key === 'wear' ? wearNow : String(state.haptics.maxIntensity);
       b.setAttribute('aria-pressed', String(cur === val));
     });
     const intiOn = state.intifaceStatus === 'connected'; const wasmOn = WASM.status === 'connected';
@@ -6505,7 +7160,8 @@ button.dh:hover{background:var(--hover)}
       bpm: state.lastSample ? state.lastSample.bpm : null, fresh: HeartlinkCore.isFresh(state.lastSample, now),
       baseline: baselineInfo(), mode: getMode(), modeSource: modeSource(), cardHints: cardHints(), chatId: chatId(),
       events: state.events.length, samples: state.samples.length,
-      device: state.deviceName, deviceInfo: state.deviceInfo, battery: state.battery, lastSignal: lastSignal(), compat: state.compat || null, tbc: tbcSources(), prior: state.prior || null, meta: sourceMeta(), bridge: { up: !!state.bridgeUp, info: state.bridgeInfo || null }, guideSync: state.guideSync || null,
+      device: state.deviceName, deviceInfo: state.deviceInfo, battery: state.battery, lastSignal: lastSignal(),
+      wear: effectiveWear(), wearSource: state.wearClass ? 'user' : 'guess', contact: contactOffNow(now) ? false : (state.contactSupported ? true : null), waitingForDevice: !!state.waitingForDevice, rest: restState(now), compat: state.compat || null, tbc: tbcSources(), prior: state.prior || null, meta: sourceMeta(), bridge: { up: !!state.bridgeUp, info: state.bridgeInfo || null }, guideSync: state.guideSync || null,
     };
   }
   function destroy() {
@@ -6517,6 +7173,7 @@ button.dh:hover{background:var(--hover)}
     try { stopWasm(); } catch (_) {}
     try { stopAdvertisementWatch(); } catch (_) {}
     try { if (natTimer) host.clearInterval(natTimer); } catch (_) {}
+    try { cancelRestBaseline(true); stopSlowRetry(); } catch (_) {}
     while (disposers.length) { try { disposers.pop()(); } catch (_) {} }
     try { if (metaSave.pending) saveMetaNow(); } catch (_) {}   // 重新初始化前没等到宿主保存的聊天变量，交给宿主的防抖保存
     try { hostEl && hostEl.remove(); } catch (_) {}
@@ -6534,9 +7191,14 @@ button.dh:hover{background:var(--hover)}
   const api = {
     version: VERSION, spec: HeartlinkCore.SPEC_VERSION, form: FORM, state, CONFIG,
     getState, preview: () => compose().text, getHistory: () => history().slice(), getLastSignal: lastSignal,
+    // v0.4 草案开关：打开后块首行写 v="0.4"，相位行带 act 段、必要时带 clean 行，平静心率排除驱动秒
+    setDraft: (on) => { state.v04 = !!on; saveSettings(); render(); return !!state.v04; },
+    getDraft: () => !!state.v04,
     getMode, setMode, toggleMode,
     connect, disconnect, setManualBaseline, clearManualBaseline,
-    injectContext, exportCsv, setPrior, diagnostics, exportDiagnostics, setExposure, ensureGuideWorldbook,
+    // 静坐 3 分钟记平静心率（前 1 分钟不算）；设备戴在哪（'wrist' | 'chest' | null = 自动猜）
+    startRestBaseline, cancelRestBaseline: () => cancelRestBaseline(), getRest: () => restState(), setWear, getWear: effectiveWear,
+    injectContext, exportCsv, setPrior, diagnostics, exportDiagnostics, setExposure, getExposure: () => ({ inject: state.injectEnabled !== false }), ensureGuideWorldbook,
     getHaptics, setHaptics, actuate: (target, action, opts) => actuators.actuate(target, action, opts), stopHaptics: () => { const r = actuators.stop(); directHaltAll(); return r; }, actOnReply,
     // 按驱动直连（界面另做）：选型号 → 连接 → 断开；微电流与停不下来的自带模式按设备开启
     directModels, directDevices: directState,
@@ -6551,6 +7213,7 @@ button.dh:hover{background:var(--hover)}
   try { if (typeof initializeGlobal === 'function') initializeGlobal('heartlink', api); } catch (_) {}
 
   loadSettings();
+  if (state.migrateInject) { state.migrateInject = false; saveSettings(); console.log(LOG, 'injectEnabled=false in saved settings migrated to true (no UI toggle any more)'); }
   if (!state.chatIdSeen) state.chatIdSeen = chatId();
   if (!history().length) loadHistoryFromChat();
   mountBadge();
@@ -6565,7 +7228,7 @@ button.dh:hover{background:var(--hover)}
   bindHostEvents();
   watchChatForActs();
   scheduleHide();
-  // 0.7.2：能力探测代替版本号（ST 无稳定的版本接口）；缺哪项就降级哪项，见 docs/st-compat-audit-2026-09.md §3
+  // 0.7.2：能力探测代替版本号（ST 无稳定的版本接口）；缺哪项就降级哪项，见 spec 仓库 docs/st-compat-audit-2026-09-zh.md §3
   state.compat = (() => {
     const c = ctx() || {}; const ev = c.eventTypes || {};
     return {

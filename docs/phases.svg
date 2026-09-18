@@ -55,12 +55,12 @@
 
   <!-- 相位名 -->
   <g text-anchor="middle">
-    <text x="180" y="280" fill="#24212c" font-size="16" font-weight="700">gen · 看生成</text>
+    <text x="180" y="280" fill="#24212c" font-size="16" font-weight="700">gen · 生成中</text>
     <text x="460" y="280" fill="#24212c" font-size="16" font-weight="700">read · 读回复</text>
-    <text x="740" y="280" fill="#24212c" font-size="16" font-weight="700">write · 写消息</text>
+    <text x="740" y="280" fill="#24212c" font-size="16" font-weight="700">write · 打字</text>
     <text x="180" y="300" fill="#5d5a68" font-size="13">等它写出来</text>
     <text x="460" y="300" fill="#5d5a68" font-size="13">读它的时候</text>
-    <text x="740" y="300" fill="#5d5a68" font-size="13">打字的时候</text>
+    <text x="740" y="300" fill="#5d5a68" font-size="13">从开始打字到按发送</text>
   </g>
 
   <!-- 归属 -->
@@ -83,6 +83,6 @@
     <line x1="160" y1="420" x2="190" y2="420" stroke="#8a8696" stroke-width="1.5" stroke-dasharray="6 4"/>
     <text x="198" y="425">平静心率：默认按本场安静时段自动算，也可以手动记</text>
     <rect x="620" y="411" width="30" height="18" fill="url(#away)" stroke="#c9c4d3" stroke-width="1"/>
-    <text x="658" y="425">离开（away）：切走页面或久未操作，不计入</text>
+    <text x="658" y="425">离开（away）：切走页面，这段不计入</text>
   </g>
 </svg>
