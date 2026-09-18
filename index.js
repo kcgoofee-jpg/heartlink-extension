@@ -1,4 +1,4 @@
-// heartlink v0.21.1 — SillyTavern 扩展：心率注入 + 触觉输出（Tavern Bio-Context 参考实现）。构建产物。
+// heartlink v0.21.2 — SillyTavern 扩展：心率注入 + 触觉输出（Tavern Bio-Context 参考实现）。构建产物。
 // https://github.com/kcgoofee-jpg/heartlink-extension
 // heartlink core — 纯函数层。没有 DOM、没有蓝牙、没有酒馆 API，Node 和浏览器都能跑。
 // 运行时（runtime.js）和单元测试共用这一份。构建时与 runtime.js 拼成 dist/heartlink.js。
@@ -353,13 +353,21 @@ const HeartlinkCore = (() => {
     if (streamStart && prevSend && streamStart.t < prevSend.t) streamStart = null;
     let reasoningEnd = replyEnd ? last('reasoning_end', replyEnd.t) : null;
     if (reasoningEnd && ((prevSend && reasoningEnd.t < prevSend.t) || (streamStart && reasoningEnd.t < streamStart.t))) reasoningEnd = null;
+    // F-097：打字按 bout（一段没被删光的打字）切分——len 回到 0 表示删光了，这段作废。
+    //   write 相位从最后一段没被删空的打字开始；发送时输入框是空的（全删了）就没有 write 相位，read 一直算到发送
     const types = ev.filter((e) => e.type === 'type' && (readStart == null || e.t > readStart));
-    const typingStart = types.length ? types[0].t : null;
-    let pauses = 0, deletes = 0, lastLen = null;
+    let boutStart = -1;
     for (let i = 0; i < types.length; i++) {
-      if (i > 0 && types[i].t - types[i - 1].t > CONFIG.PAUSE_MS) pauses++;
-      if (lastLen != null && typeof types[i].len === 'number' && types[i].len < lastLen) deletes++;
-      if (typeof types[i].len === 'number') lastLen = types[i].len;
+      if (types[i].len === 0) boutStart = -1;
+      else if (boutStart < 0) boutStart = i;
+    }
+    const bout = boutStart < 0 ? [] : types.slice(boutStart);
+    const typingStart = bout.length ? bout[0].t : null;
+    let pauses = 0, deletes = 0, lastLen = null;
+    for (let i = 0; i < bout.length; i++) {
+      if (i > 0 && bout[i].t - bout[i - 1].t > CONFIG.PAUSE_MS) pauses++;
+      if (lastLen != null && typeof bout[i].len === 'number' && bout[i].len < lastLen) deletes++;
+      if (typeof bout[i].len === 'number') lastLen = bout[i].len;
     }
     // 离开（协议 v0.4 §6，2026-09-18 第二批）：覆盖整轮，从上一次发送开始；四种类型按 hidden > unfocused > offscreen > idle 取一种、区间不重叠
     //   hidden：页面不可见；unfocused：窗口失焦（runtime 用 document.hasFocus() 排除点进卡片小界面的情况）；
@@ -390,7 +398,7 @@ const HeartlinkCore = (() => {
     const marks = [idleFrom, ...ev.filter((e) => e.t >= idleFrom && e.t <= now && IDLE_BREAKERS.has(e.type)).map((e) => e.t), now].sort((a, b) => a - b);
     for (let i = 1; i < marks.length; i++) if (marks[i] - marks[i - 1] > idleMs) raw.push([marks[i - 1], marks[i], 'idle']);
     const merged = partitionAway(raw);
-    return { now, trigger: trigger || null, prevSend: prevSend && prevSend.t, streamStart: streamStart && streamStart.t, reasoningEnd: reasoningEnd && reasoningEnd.t, replyEnd: replyEnd && replyEnd.t, readStart, readEnd, typingStart, pauses, deletes, typeCount: types.length, lastLen, away: merged };
+    return { now, trigger: trigger || null, prevSend: prevSend && prevSend.t, streamStart: streamStart && streamStart.t, reasoningEnd: reasoningEnd && reasoningEnd.t, replyEnd: replyEnd && replyEnd.t, readStart, readEnd, typingStart, pauses, deletes, typeCount: bout.length, lastLen, away: merged };
   }
   const DISCARDED_TRIGGERS = new Set(['swipe', 'regenerate']);
 
@@ -3257,7 +3265,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
 (function heartlinkRuntime() {
   'use strict';
 
-  const VERSION = '0.21.1';
+  const VERSION = '0.21.2';
   const CONFIG = {
     RUNTIME_KEY: '__HEARTLINK_RUNTIME__',
     PUBLIC_KEY: 'heartlink',
@@ -3310,8 +3318,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     LAB_URL: 'http://127.0.0.1:12346/lab/',   // 设备实验室（device-lab 仓库，npm run sim）
   };
   const LOG = '[heartlink]';
-  const GUIDE_BOOK = [{"name":"00 bio_context 读法","enabled":true,"content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","strategy":{"type":"selective","keys":["<bio_context"]},"position":{"type":"after_character_definition","order":100},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.1"}},{"name":"10 view=backstage 幕后（旧 mode=author）","enabled":true,"content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","strategy":{"type":"selective","keys":["view=\"backstage\"","mode=\"author\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.1"}},{"name":"11 view=in-story 入戏（旧 mode=character）","enabled":true,"content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","strategy":{"type":"selective","keys":["view=\"in-story\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.1"}},{"name":"12 view=device-aware 知情","enabled":true,"content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","strategy":{"type":"selective","keys":["view=\"device-aware\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.1"}},{"name":"20 feedback 读法","enabled":true,"content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","strategy":{"type":"selective","keys":["feedback("]},"position":{"type":"after_character_definition","order":101},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.1"}},{"name":"30 bio_act 写法","enabled":true,"content":"<bio_act_guide>\n块里有 haptics(heartlink): on 时，读者连着玩具并允许剧情驱动。想让设备动，就在回复正文里写动作标签，回复写完后按出现顺序执行：\n<bio_act target=\"*\" output=\"Vibrate\" pattern=\"wave\" intensity=\"0.4\" ms=\"3000\"/>\n- 属性都可省略。target：设备，缺省 * 全部。output：Vibrate / Rotate / Oscillate / Constrict / Position 等，缺省 * 任意输出；Temperature、Estim、Spray 只有点名才会动。pattern：pulse / double / triple / long / heartbeat / wave，缺省 pulse。intensity：0–1，缺省 0.5，0 是停下。ms：毫秒，只对 long / heartbeat / wave 有效。\n- 每条回复最多 3 个（haptics 行的 profile 是 frenzy 或 max 时最多 5 个），多出的不执行。\n- 写在思维链（<think> 等）、代码、HTML 注释里的标签不算动作；标签在显示时会被隐藏。\n- 读者可以随时直接停下，不经过你；停下、跳过、调强调弱会在下一轮的 feedback 行里出现。\n- 什么时候动、动多强，跟着剧情和读者的反馈来。\n</bio_act_guide>","strategy":{"type":"selective","keys":["haptics(heartlink): on"]},"position":{"type":"after_character_definition","order":102},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.1"}}];
-  const GUIDE_BOOK_NATIVE = [{"uid":0,"key":["<bio_context"],"keysecondary":[],"comment":"00 bio_context 读法","content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":100,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":0,"heartlink":"0.21.1"},{"uid":1,"key":["view=\"backstage\"","mode=\"author\""],"keysecondary":[],"comment":"10 view=backstage 幕后（旧 mode=author）","content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":1,"heartlink":"0.21.1"},{"uid":2,"key":["view=\"in-story\""],"keysecondary":[],"comment":"11 view=in-story 入戏（旧 mode=character）","content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":2,"heartlink":"0.21.1"},{"uid":3,"key":["view=\"device-aware\""],"keysecondary":[],"comment":"12 view=device-aware 知情","content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":3,"heartlink":"0.21.1"},{"uid":4,"key":["feedback("],"keysecondary":[],"comment":"20 feedback 读法","content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":101,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":4,"heartlink":"0.21.1"},{"uid":5,"key":["haptics(heartlink): on"],"keysecondary":[],"comment":"30 bio_act 写法","content":"<bio_act_guide>\n块里有 haptics(heartlink): on 时，读者连着玩具并允许剧情驱动。想让设备动，就在回复正文里写动作标签，回复写完后按出现顺序执行：\n<bio_act target=\"*\" output=\"Vibrate\" pattern=\"wave\" intensity=\"0.4\" ms=\"3000\"/>\n- 属性都可省略。target：设备，缺省 * 全部。output：Vibrate / Rotate / Oscillate / Constrict / Position 等，缺省 * 任意输出；Temperature、Estim、Spray 只有点名才会动。pattern：pulse / double / triple / long / heartbeat / wave，缺省 pulse。intensity：0–1，缺省 0.5，0 是停下。ms：毫秒，只对 long / heartbeat / wave 有效。\n- 每条回复最多 3 个（haptics 行的 profile 是 frenzy 或 max 时最多 5 个），多出的不执行。\n- 写在思维链（<think> 等）、代码、HTML 注释里的标签不算动作；标签在显示时会被隐藏。\n- 读者可以随时直接停下，不经过你；停下、跳过、调强调弱会在下一轮的 feedback 行里出现。\n- 什么时候动、动多强，跟着剧情和读者的反馈来。\n</bio_act_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":102,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":5,"heartlink":"0.21.1"}];
+  const GUIDE_BOOK = [{"name":"00 bio_context 读法","enabled":true,"content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","strategy":{"type":"selective","keys":["<bio_context"]},"position":{"type":"after_character_definition","order":100},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.2"}},{"name":"10 view=backstage 幕后（旧 mode=author）","enabled":true,"content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","strategy":{"type":"selective","keys":["view=\"backstage\"","mode=\"author\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.2"}},{"name":"11 view=in-story 入戏（旧 mode=character）","enabled":true,"content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","strategy":{"type":"selective","keys":["view=\"in-story\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.2"}},{"name":"12 view=device-aware 知情","enabled":true,"content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","strategy":{"type":"selective","keys":["view=\"device-aware\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.2"}},{"name":"20 feedback 读法","enabled":true,"content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","strategy":{"type":"selective","keys":["feedback("]},"position":{"type":"after_character_definition","order":101},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.2"}},{"name":"30 bio_act 写法","enabled":true,"content":"<bio_act_guide>\n块里有 haptics(heartlink): on 时，读者连着玩具并允许剧情驱动。想让设备动，就在回复正文里写动作标签，回复写完后按出现顺序执行：\n<bio_act target=\"*\" output=\"Vibrate\" pattern=\"wave\" intensity=\"0.4\" ms=\"3000\"/>\n- 属性都可省略。target：设备，缺省 * 全部。output：Vibrate / Rotate / Oscillate / Constrict / Position 等，缺省 * 任意输出；Temperature、Estim、Spray 只有点名才会动。pattern：pulse / double / triple / long / heartbeat / wave，缺省 pulse。intensity：0–1，缺省 0.5，0 是停下。ms：毫秒，只对 long / heartbeat / wave 有效。\n- 每条回复最多 3 个（haptics 行的 profile 是 frenzy 或 max 时最多 5 个），多出的不执行。\n- 写在思维链（<think> 等）、代码、HTML 注释里的标签不算动作；标签在显示时会被隐藏。\n- 读者可以随时直接停下，不经过你；停下、跳过、调强调弱会在下一轮的 feedback 行里出现。\n- 什么时候动、动多强，跟着剧情和读者的反馈来。\n</bio_act_guide>","strategy":{"type":"selective","keys":["haptics(heartlink): on"]},"position":{"type":"after_character_definition","order":102},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.21.2"}}];
+  const GUIDE_BOOK_NATIVE = [{"uid":0,"key":["<bio_context"],"keysecondary":[],"comment":"00 bio_context 读法","content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":100,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":0,"heartlink":"0.21.2"},{"uid":1,"key":["view=\"backstage\"","mode=\"author\""],"keysecondary":[],"comment":"10 view=backstage 幕后（旧 mode=author）","content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":1,"heartlink":"0.21.2"},{"uid":2,"key":["view=\"in-story\""],"keysecondary":[],"comment":"11 view=in-story 入戏（旧 mode=character）","content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":2,"heartlink":"0.21.2"},{"uid":3,"key":["view=\"device-aware\""],"keysecondary":[],"comment":"12 view=device-aware 知情","content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":3,"heartlink":"0.21.2"},{"uid":4,"key":["feedback("],"keysecondary":[],"comment":"20 feedback 读法","content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":101,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":4,"heartlink":"0.21.2"},{"uid":5,"key":["haptics(heartlink): on"],"keysecondary":[],"comment":"30 bio_act 写法","content":"<bio_act_guide>\n块里有 haptics(heartlink): on 时，读者连着玩具并允许剧情驱动。想让设备动，就在回复正文里写动作标签，回复写完后按出现顺序执行：\n<bio_act target=\"*\" output=\"Vibrate\" pattern=\"wave\" intensity=\"0.4\" ms=\"3000\"/>\n- 属性都可省略。target：设备，缺省 * 全部。output：Vibrate / Rotate / Oscillate / Constrict / Position 等，缺省 * 任意输出；Temperature、Estim、Spray 只有点名才会动。pattern：pulse / double / triple / long / heartbeat / wave，缺省 pulse。intensity：0–1，缺省 0.5，0 是停下。ms：毫秒，只对 long / heartbeat / wave 有效。\n- 每条回复最多 3 个（haptics 行的 profile 是 frenzy 或 max 时最多 5 个），多出的不执行。\n- 写在思维链（<think> 等）、代码、HTML 注释里的标签不算动作；标签在显示时会被隐藏。\n- 读者可以随时直接停下，不经过你；停下、跳过、调强调弱会在下一轮的 feedback 行里出现。\n- 什么时候动、动多强，跟着剧情和读者的反馈来。\n</bio_act_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":102,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":5,"heartlink":"0.21.2"}];
   // 1.0：同一份源码构建两种形态——'script' 酒馆助手全局脚本（旧），'extension' 酒馆扩展
   const FORM = 'extension';
   // 开发者工具（设备模拟器按钮等）：发布版关闭
@@ -3364,6 +3372,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     rhythm: state.rhythm || [], gates: state.gates || null,
     tone: state.tone || 'auto',   // 配色：'auto' 跟随酒馆 / 'dark' / 'light'（§3.7）
     idleDetect: state.idleDetect || false, idleCtl: state.idleCtl || null,   // 更准的离开判断（§3.5）
+    panelAutoClose: state.panelAutoClose !== false,   // 点面板外面时收起（F-099，缺省开）
   });
   if (previous && typeof previous.destroy === 'function') {
     try { previous.destroy(); } catch (err) { console.warn(LOG, 'destroy previous runtime failed', err); }
@@ -3396,6 +3405,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
       if (s.gates && typeof s.gates === 'object') state.gates = normalizeGates(s.gates);   // 手动改的门槛
       if (s.tone === 'dark' || s.tone === 'light') state.tone = s.tone;   // 配色（缺省 auto 跟随酒馆）
       if (s.idleDetect === true) state.idleDetect = true;   // 更准的离开判断；实际是否重新启动看权限（reArmIdle）
+      if (typeof s.panelAutoClose === 'boolean') state.panelAutoClose = s.panelAutoClose;
     } catch (err) { console.warn(LOG, 'loadSettings failed', err); }
     loadRhythm();
   }
@@ -3426,7 +3436,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
   }
   function learnedGates() { return HeartlinkCore.learnGates(state.rhythm || []); }
   function gatesArg() { return { learned: learnedGates(), manual: state.gates || null }; }
-  // 清除学到的习惯（“更多设置”里的按钮，§3.9 隐私）
+  // 清除学到的习惯（设置页里的按钮，§3.9 隐私）
   function clearRhythm() { state.rhythm = []; saveRhythm(); toast('info', '已清除学到的阅读习惯，下次从常见值重新学'); render(); }
   // 手动设 / 改回自动一个门槛
   function setGate(key, value) {
@@ -3458,7 +3468,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
     return sw.words.some((w) => w && t.includes(w));
   }
   function saveSettings() {
-    try { host.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify({ manualBaseline: state.manualBaseline, modes: state.modes, deviceName: state.deviceName, prior: state.prior || null, privacyAck: !!state.privacyAck, haptics: state.haptics, badgePos: state.badgePos || null, badgeHidden: !!state.badgeHidden, settingsFolded: !!state.settingsFolded, playSeen: !!state.playSeen, guideWrote: state.guideWrote || null, v04: !!state.v04, wearClass: state.wearClass || null, gates: state.gates || null, tone: state.tone || 'auto', idleDetect: !!state.idleDetect })); }
+    try { host.localStorage.setItem(CONFIG.STORAGE_KEY, JSON.stringify({ manualBaseline: state.manualBaseline, modes: state.modes, deviceName: state.deviceName, prior: state.prior || null, privacyAck: !!state.privacyAck, haptics: state.haptics, badgePos: state.badgePos || null, badgeHidden: !!state.badgeHidden, settingsFolded: !!state.settingsFolded, playSeen: !!state.playSeen, guideWrote: state.guideWrote || null, v04: !!state.v04, wearClass: state.wearClass || null, gates: state.gates || null, tone: state.tone || 'auto', idleDetect: !!state.idleDetect, panelAutoClose: state.panelAutoClose !== false })); }
     catch (err) { console.warn(LOG, 'saveSettings failed', err); }
   }
   // 提示合并（0.18，手机上一串提示会盖住面板）：4 秒内的新提示替换上一条，两条合成一条；同样的话不重复弹
@@ -5549,7 +5559,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
       state.lastSendT = p.t; state.lastTrigger = kind;
       pushEvent('send', { kind }, p.t);
     } else if (kind === 'continue' || kind === 'impersonate') state.lastTrigger = kind;
-    state.round = { t: p.t, kind, acts: ACT_KINDS.has(kind), snapshot: replySig(lastReply()) };
+    // minId：本轮回复可能出现的最早消息下标。swipe 复用最后一条消息；regenerate 时旧消息在 GENERATION_AFTER_COMMANDS 之前已被移除，也用 ch.length（F-096）
+    const ch0 = (ctx() || {}).chat || [];
+    state.round = { t: p.t, kind, acts: ACT_KINDS.has(kind), snapshot: replySig(lastReply()), minId: kind === 'swipe' ? ch0.length - 1 : ch0.length };
   }
   function bindTavernEvents() {
     const c = ctx();
@@ -5623,6 +5635,30 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkD
       state.backgroundGen = state.bgGens.length > 0;
     };
     const endRound = (via, messageId) => {
+      // 迟到 / 旁路事件（变量框架写回旧消息、后台生成插入的消息）不能结束本轮（F-096）
+      if (state.generating && state.round) {
+        if (via === 'received' || via === 'rendered') {
+          const id = Number(messageId);
+          if (Number.isInteger(id)) {
+            const ch = (ctx() || {}).chat || [];
+            const m = ch[id];
+            const tooOld = typeof state.round.minId === 'number' && id < state.round.minId;
+            if (tooOld || (m && !isRoundReply(m, state.round))) {
+              console.log(LOG, `${via} for message ${id} is not this round's reply; round continues`);
+              return;
+            }
+          }
+        }
+        // 流式出字中途来的 ENDED 不是本轮的（本轮真正的结束以 MESSAGE_RECEIVED 为准，宿主先发 RECEIVED 再发 ENDED）
+        if (via === 'ended' && state.streamStarted && REPLY_KINDS.has(state.genKind)) {
+          const r = lastReply();
+          const fin = r && tsOf(r.m.gen_finished);
+          if (!(fin != null && fin >= state.round.t - 1000)) {
+            console.log(LOG, 'GENERATION_ENDED while the reply is still streaming; round continues');
+            return;
+          }
+        }
+      }
       if (state.generating) {
         const round = state.round;
         const updated = roundReplyUpdated(round);
@@ -6159,8 +6195,7 @@ button.dh:hover{background:var(--hover)}
 .facts b{color:var(--ink);font-weight:600}
 .sheet .acts{display:flex;gap:8px;margin-top:14px}
 .sheet .acts .sbtn{flex:1;height:34px}
-/* 更多设置弹层（设置方案 §4） */
-.mstat{color:var(--muted);font:12px/1 var(--font)}
+/* 设置页（设置方案 §4，F-098 起从弹层改为顶部第三个标签页） */
 .mgroup{margin-top:12px;padding-top:10px;border-top:1px solid var(--hair)}
 .mgroup:first-of-type{border-top:0}
 .mgh{font:600 12px/1 var(--font);color:var(--muted);letter-spacing:.02em;margin-bottom:6px}
@@ -6238,6 +6273,7 @@ button.dh:hover{background:var(--hover)}
     <div class="tabs" role="tablist">
       <button role="tab" data-tab="hr"><span class="lb">健康设备</span><i class="d6" data-f="hrBadge"></i></button>
       <button role="tab" data-tab="toy"><span class="lb">玩具</span><i class="d6" data-f="toyBadge"></i></button>
+      <button role="tab" data-tab="settings"><span class="lb">设置</span></button>
       <button class="x" data-close title="收起" aria-label="收起">${X_SVG}</button>
     </div>
     <div data-pane="toy">
@@ -6302,7 +6338,6 @@ button.dh:hover{background:var(--hover)}
         <div class="set"><span>模式</span><div class="segctl" role="group" aria-label="模式"><button data-set="mode:author">幕后</button><button data-set="mode:character">入戏</button><button data-set="mode:aware">知情</button></div></div>
         <div class="meaning" data-f="modeHint"></div>
         <div class="set" data-f="wearRow"><span>设备戴在</span><div class="segctl" role="group" aria-label="设备戴在"><button data-set="wear:wrist">手腕</button><button data-set="wear:chest">胸前</button></div></div>
-        <button class="conn" data-act="moreSettings"><span>更多设置</span><span class="r"><span class="mstat" data-f="moreStatHr">自动</span>${CV_SVG}</span></button>
         <div><button class="textbtn" data-act="disconnect" data-f="hrTools">断开设备</button></div>
       </div>
     </div>
@@ -6338,10 +6373,11 @@ button.dh:hover{background:var(--hover)}
         <div class="pick" data-f="pick" hidden></div>
         <div class="wait" data-f="wait" hidden></div>
         <div class="devs" data-f="devs"></div>
-        <button class="conn" data-act="moreSettings"><span>更多设置</span><span class="r"><span class="mstat" data-f="moreStatToy">自动</span>${CV_SVG}</span></button>
       </div>
     </div>
   </section>
+
+  <section data-pane="settings" hidden></section>
   </div>
 
   <div class="foot">
@@ -6369,7 +6405,7 @@ button.dh:hover{background:var(--hover)}
     el = { heart: q('[data-seg="hr"] .disc'), poly: q('.spark path'), sparkRef: q('.spark .ref'), delta: q('.delta'), tag: q('[data-seg="hr"] .mode'), pill: q('.pill'), spark: q('.spark') };
     ['hrFirst', 'hrAgain', 'lastName', 'lastBtn', 'kind', 'sigBars', 'baseRow', 'rest', 'ringWarm', 'ringRec', 'restHint', 'restLeft', 'restMenu', 'wearRow', 'noneAct',
       'bpm', 'tn', 'head', 'fb', 'base', 'hrv', 'last', 'hrvLine', 'dev', 'out', 'sig', 'sigBox', 'foot', 'hrBadge', 'toyBadge', 'hrEmpty', 'hrLive', 'hrDot', 'hrState', 'batt', 'plist', 'pnote', 'baseMenu', 'modeHint', 'hrTools', 'hrFold', 'toyFold', 'hrFoldSec', 'toyFoldSec', 'toyEmpty', 'toyTiles', 'now', 'lastact', 'fbnote', 'devSec', 'dcards', 'wasmState', 'help', 'devs', 'helpBtn', 'sees', 'ptext', 'body', 'play', 'playBtn', 'connRow', 'connTxt', 'connBtns',
-      'pick', 'wait', 'scrim', 'sheet', 'natBanner', 'natLeft', 'natSub', 'natProg', 'live', 'ring', 'ringFg', 'moreStatHr', 'moreStatToy']
+      'pick', 'wait', 'scrim', 'sheet', 'natBanner', 'natLeft', 'natSub', 'natProg', 'live', 'ring', 'ringFg']
       .forEach((f) => { el[f] = q(`[data-f="${f}"]`); });
     el.folds = [...root.querySelectorAll('[data-act="fold"]')];
     el.fbBtns = [...root.querySelectorAll('[data-fb]')];
@@ -6379,6 +6415,7 @@ button.dh:hover{background:var(--hover)}
     el.segsep = q('.psep');
     el.tabs = [...root.querySelectorAll('[data-tab]')];
     el.panes = [...root.querySelectorAll('[data-pane]')];
+    el.settingsPane = q('[data-pane="settings"]');
     el.sets = [...root.querySelectorAll('[data-set]')];
     el.vibSw = q('[data-act="vib"]');
     el.toyBtn = q('[data-act="toy"]'); el.wasmBtn = q('[data-act="direct"]');
@@ -6463,7 +6500,7 @@ button.dh:hover{background:var(--hover)}
         if (act === 'hide') { setBadgeHidden(true); toast('info', '悬浮窗已隐藏，可在魔杖菜单里恢复'); return; }
         if (act === 'halt') { haltAll('button'); return; }
         if (act === 'fold') { state.settingsFolded = !state.settingsFolded; saveSettings(); return render(); }
-        if (act === 'moreSettings') { sheet = { kind: 'more' }; return render(); }
+        if (act === 'togglePanelClose') { state.panelAutoClose = state.panelAutoClose === false; saveSettings(); return render(); }
         if (act === 'gateAdj') {
           const gate = btn.getAttribute('data-gate'); const dir = btn.getAttribute('data-dir') === '-1' ? -1 : 1;
           const g = gatesView();
@@ -6546,7 +6583,7 @@ button.dh:hover{background:var(--hover)}
     const onResize = () => { placeBadge(); render(); };
     host.addEventListener('resize', onResize);
     disposers.push(() => host.removeEventListener('resize', onResize));
-    const closeMenu = (event) => { if (hostEl && !hostEl.contains(event.target)) closePanel(); };
+    const closeMenu = (event) => { if (state.panelAutoClose === false) return; if (hostEl && !hostEl.contains(event.target)) closePanel(); };
     doc.addEventListener('click', closeMenu, true);
     disposers.push(() => doc.removeEventListener('click', closeMenu, true));
   }
@@ -7130,7 +7167,7 @@ button.dh:hover{background:var(--hover)}
     };
   }
   // 确认面板：逐台开启微电流 / 停不下来的自带模式（警告原文照用，§5.9-5）
-  // 门槛现状（给入口行的状态词和更多设置弹层用）
+  // 门槛现状（设置页用）
   function gatesView() {
     const learned = learnedGates();
     const manual = state.gates || {};
@@ -7154,7 +7191,7 @@ button.dh:hover{background:var(--hover)}
     return [['auto', '跟随酒馆'], ['dark', '深色'], ['light', '浅色']]
       .map((o) => '<button data-act="setTone" data-tone="' + o[0] + '"' + (cur === o[0] ? ' aria-pressed="true"' : '') + '>' + o[1] + '</button>').join('');
   }
-  function moreSheetHtml() {
+  function settingsPaneHtml() {
     const g = gatesView();
     const note = g.turns < 5
       ? `还在学你的习惯（${g.turns}/5 轮），先按常见值`
@@ -7164,8 +7201,7 @@ button.dh:hover{background:var(--hover)}
       + `<button class="mstep" data-act="gateAdj" data-gate="${gate}" data-dir="-1" aria-label="调低">−</button>`
       + `<button class="mstep" data-act="gateAdj" data-gate="${gate}" data-dir="1" aria-label="调高">+</button>`
       + (canAuto ? `<button class="mauto" data-act="gateAuto" data-gate="${gate}">改回自动</button>` : '') + '</div></div>';
-    return '<div class="grab" aria-hidden="true"></div><h3>更多设置</h3>'
-      + '<div class="mgroup"><div class="mgh">离开与阅读</div>'
+    return '<div class="mgroup"><div class="mgh">离开与阅读</div>'
       + `<p class="mnote">${note}</p>`
       + row('多久没动算离开', `${Math.round(g.idleMs / 1000)}s`, gateSrcZh(g.idleSrc, g.learned, 'idle'), 'idle', g.idleSrc === 'user')
       + row('读回复多久算太久', `预计阅读的 ${g.mult.toFixed(1)} 倍`, gateSrcZh(g.tlSrc, g.learned, 'toolong'), 'toolong', g.tlSrc === 'user')
@@ -7173,6 +7209,9 @@ button.dh:hover{background:var(--hover)}
       + (HAS_IDLE ? ('<div class="mrow"><div class="ml"><span class="mk">更准的离开判断</span><span class="msub">'
         + (state.idleDetect ? '锁屏算离开；在卡片的小界面里点按不算离开' : '会弹授权；只看有没有人用、是否锁屏') + '</span></div>'
         + `<div class="mc"><button class="switch" role="switch" data-act="toggleIdle" aria-checked="${state.idleDetect ? 'true' : 'false'}" aria-label="更准的离开判断"></button></div></div>`) : '')
+      + '</div>'
+      + '<div class="mgroup"><div class="mgh">面板</div>'
+      + `<div class="mrow"><div class="ml"><span class="mk">点面板外面时收起</span><span class="msub">关着时，用右上 × 或再点一下胶囊收起</span></div><div class="mc"><button class="switch" role="switch" data-act="togglePanelClose" aria-checked="${state.panelAutoClose !== false ? 'true' : 'false'}" aria-label="点面板外面时收起"></button></div></div>`
       + '</div>'
       + '<div class="mgroup"><div class="mgh">外观</div>'
       + '<div class="mrow"><div class="ml"><span class="mk">配色</span><span class="msub">半透明主题或花背景看不清时，手动选深 / 浅</span></div>'
@@ -7206,7 +7245,6 @@ button.dh:hover{background:var(--hover)}
       + (changed ? '<div class="mgroup"><button class="textbtn" data-act="paceReset">改回默认</button></div>' : '');
   }
   function sheetHtml(s) {
-    if (s.kind === 'more') return moreSheetHtml();
     if (s.kind === 'pace') return paceSheetHtml();
     const link = s.link;
     const who = `${esc(modelName(link.driver))} · 只对这一台`;
@@ -7233,12 +7271,12 @@ button.dh:hover{background:var(--hover)}
   }
   function closeSheet() { sheet = null; hostEl.classList.remove('sheet'); render(); }
   function renderSheet() {
-    const open = !!sheet && (sheet.kind === 'more' || sheet.kind === 'pace' || (sheet.link && DIRECT.links.has(sheet.link.id)));
+    const open = !!sheet && (sheet.kind === 'pace' || (sheet.link && DIRECT.links.has(sheet.link.id)));
     if (!open && sheet) sheet = null;
     hostEl.classList.toggle('sheet', open);
     el.scrim.hidden = !open; el.sheet.hidden = !open;
     if (!open) { htmlCache.delete(el.sheet); return; }
-    el.sheet.setAttribute('aria-label', sheet.kind === 'more' ? '更多设置' : sheet.kind === 'pace' ? '节奏细调' : sheet.kind === 'nat' ? '允许自带模式' : '开启微电流');
+    el.sheet.setAttribute('aria-label', sheet.kind === 'pace' ? '节奏细调' : sheet.kind === 'nat' ? '允许自带模式' : '开启微电流');
     const html = sheetHtml(sheet);
     if (htmlCache.get(el.sheet) !== html) {
       setHtml(el.sheet, html);
@@ -7732,9 +7770,13 @@ button.dh:hover{background:var(--hover)}
     if (!hostEl.classList.contains('open')) return;   // 面板收起时不用算后面的
     fitPanel();
     // 面板：标签页（小圆点只表示状态，数字只在胶囊上）
-    const tab = state.badgeTab === 'toy' ? 'toy' : 'hr';   // 默认健康设备
+    const tab = state.badgeTab === 'toy' ? 'toy' : state.badgeTab === 'settings' ? 'settings' : 'hr';   // 默认健康设备
     el.tabs.forEach((b) => b.setAttribute('aria-selected', String(b.getAttribute('data-tab') === tab)));
     el.panes.forEach((pn) => { pn.hidden = pn.getAttribute('data-pane') !== tab; });
+    if (tab === 'settings') {   // 设置页内容由 JS 渲染（与 sheet 同一套 htmlCache diff）
+      const html = settingsPaneHtml();
+      if (htmlCache.get(el.settingsPane) !== html) setHtml(el.settingsPane, html);
+    }
     el.head.className = 'head' + (tab === 'toy' ? ' pad' : '');
     el.hrBadge.hidden = !(state.connected || state.reconnecting || state.waitingForDevice);
     el.hrBadge.className = 'd6' + (state.connected ? '' : ' warn');
@@ -7759,7 +7801,6 @@ button.dh:hover{background:var(--hover)}
     }
     el.hrTools.hidden = !state.connected && !state.reconnecting && !state.waitingForDevice;
     el.wearRow.hidden = !state.deviceName;
-    { const st = gatesView().status; if (el.moreStatHr) el.moreStatHr.textContent = st; if (el.moreStatToy) el.moreStatToy.textContent = st; }
     if (hrActive) {
       el.dev.textContent = `${(state.deviceName || '心率设备').split(' ')[0]}${info.model ? ' ' + info.model : ''}`;
       el.hrDot.className = 'sdot ' + (live ? 'ok' : 'warn');
@@ -7786,12 +7827,13 @@ button.dh:hover{background:var(--hover)}
       setHtml(el.hrv, hrvHtml); setHtml(el.last, lastHtml);
       el.hrvLine.hidden = (!hrvHtml && !lastHtml) || !!state.rest;
       // 下次发送时模型会收到什么（审查 U8）：只说块里真有的东西，不重复上面的数字；后半句是模式的含义
+      // F-100：这句是教读者“模型会看到什么”，聊过 3 轮后就不用再提示（整句收起，标题行的“看原文”与块本身保留）
       let seesMut = false;
-      if (state.injectEnabled === false) setHtml(el.sees, '<i>注入已被脚本暂停，模型收不到这些数据；刷新页面即恢复。</i>');
+      if (state.injectEnabled === false) { el.sees.hidden = false; setHtml(el.sees, '<i>注入已被脚本暂停，模型收不到这些数据；刷新页面即恢复。</i>'); }
       else {
         const said = seesParts(c2.text);
-        if (said.length) setHtml(el.sees, `${said.join('、')}；${MODE_HINT[mode] || MODE_HINT.author}。`);
-        else { seesMut = true; setHtml(el.sees, '还没有数据，角色回复后开始记。'); }
+        if (said.length) { el.sees.hidden = hist.length >= 3; setHtml(el.sees, `${said.join('、')}；${MODE_HINT[mode] || MODE_HINT.author}。`); }
+        else { seesMut = true; el.sees.hidden = false; setHtml(el.sees, '还没有数据，角色回复后开始记。'); }
         if (!el.ptext.hidden) el.ptext.textContent = c2.text;
       }
       el.sees.className = 'sees' + (seesMut ? ' mut' : '');
