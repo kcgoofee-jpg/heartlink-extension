@@ -1,4 +1,4 @@
-// heartlink v0.18.0 — SillyTavern 扩展：心率注入 + 触觉输出（Tavern Bio-Context 参考实现）。构建产物。
+// heartlink v0.19.0 — SillyTavern 扩展：心率注入 + 触觉输出（Tavern Bio-Context 参考实现）。构建产物。
 // https://github.com/kcgoofee-jpg/heartlink-extension
 // heartlink core — 纯函数层。没有 DOM、没有蓝牙、没有酒馆 API，Node 和浏览器都能跑。
 // 运行时（runtime.js）和单元测试共用这一份。构建时与 runtime.js 拼成 dist/heartlink.js。
@@ -1032,6 +1032,34 @@ const HeartlinkHaptics = (() => {
   function hideBioActs(text) { return String(text || '').replace(BIO_ACT_TAG_RE, ''); }
 
   // opts.withOffsets：另外返回每个动作 / 错误在原文里的 [起, 止] 位置（acts 与 errors 本身与参考实现逐项相同）
+  // v0.4 §8：自带模式直通（与 spec/tools/bio-act.mjs 的 resolveNative 一致）
+  const NATIVE_PATTERN = 'native';
+  const modesOf = (x) => {
+    const list = Array.isArray(x && x.native) ? x.native : Array.isArray(x && x.nativePatterns) ? x.nativePatterns : null;
+    return list && list.map((m, i) => m && Object.assign({}, m, { n: Number.isInteger(m.n) ? m.n : i + 1 })).filter(Boolean);
+  };
+  function resolveNative(target, output, mode, actuators) {
+    if (!Array.isArray(actuators)) return { error: 'NATIVE_NO_CAPS' };
+    if (mode == null || mode === '') return { error: 'NATIVE_NO_MODE' };
+    const byIndex = /^\d{1,2}$/.test(mode);
+    const pool = actuators.map((x) => ({ x, modes: modesOf(x) })).filter((q) => q.modes && (target === '*' || q.x.id === target));
+    if (!pool.length) return { error: 'NATIVE_UNAVAILABLE' };
+    if (byIndex && target === '*' && pool.filter((q) => q.modes.some((m) => m.enabled !== false)).length > 1) return { error: 'NATIVE_TARGET_AMBIGUOUS' };
+    const native = [];
+    let off = false;
+    for (const q of pool) {
+      const m = q.modes.find((k) => (byIndex ? k.n === Number(mode) : k.name === mode));
+      if (!m) continue;
+      if (m.enabled === false) { off = true; continue; }
+      const outs = Array.isArray(m.outputs) && m.outputs.length ? m.outputs : (q.x.outputs || []);
+      const ok = output === '*' ? outs.some((o) => !RISKY_OUTPUTS.includes(o)) : outs.includes(output);
+      if (!ok) continue;
+      native.push({ id: q.x.id, n: m.n, name: m.name, stoppable: m.stoppable !== false });
+    }
+    if (!native.length) return { error: off ? 'NATIVE_OFF' : 'NATIVE_UNAVAILABLE' };
+    return { native };
+  }
+
   function parseBioActs(text, opts) {
     const limit = opts && Number.isInteger(opts.maxPerReply) ? Math.min(MAX_PER_REPLY_LIMIT, Math.max(0, opts.maxPerReply)) : MAX_PER_REPLY;
     const acts = [];
@@ -1050,7 +1078,15 @@ const HeartlinkHaptics = (() => {
       while ((x = ar.exec(m[1]))) a[x[1]] = x[2];
       const act = { target: a.target || '*', output: a.output || '*', pattern: a.pattern || 'pulse', intensity: num(a.intensity) ?? DEFAULT_INTENSITY, durationMs: num(a.ms) };
       if (!OUTPUTS.includes(act.output)) { errors.push({ code: 'BAD_OUTPUT', value: act.output }); errorOffsets.push(span); continue; }
-      if (!PATTERNS.includes(act.pattern)) { errors.push({ code: 'BAD_PATTERN', value: act.pattern, fallback: 'pulse' }); act.pattern = 'pulse'; }
+      if (act.pattern === NATIVE_PATTERN) {
+        const r = resolveNative(act.target, act.output, a.mode, opts && opts.actuators);
+        if (r.error) { errors.push({ code: r.error, value: a.mode != null ? a.mode : null }); errorOffsets.push(span); continue; }
+        act.mode = a.mode;
+        act.native = r.native;
+      } else if (a.mode != null) {
+        errors.push({ code: 'MODE_IGNORED', value: a.mode });
+      }
+      if (act.pattern !== NATIVE_PATTERN && !PATTERNS.includes(act.pattern)) { errors.push({ code: 'BAD_PATTERN', value: act.pattern, fallback: 'pulse' }); act.pattern = 'pulse'; }
       if (!Number.isFinite(act.intensity) || act.intensity < 0 || act.intensity > 1) { errors.push({ code: 'BAD_INTENSITY', value: a.intensity }); act.intensity = Math.min(1, Math.max(0, Number.isFinite(act.intensity) ? act.intensity : DEFAULT_INTENSITY)); }
       if (act.durationMs != null && (!Number.isFinite(act.durationMs) || act.durationMs <= 0)) { errors.push({ code: 'BAD_MS', value: a.ms }); act.durationMs = null; }
       if (acts.length >= limit) { errors.push({ code: 'TOO_MANY', value: acts.length + 1 }); for (let k = nErr; k < errors.length; k++) errorOffsets.push(span); continue; }
@@ -1066,6 +1102,7 @@ const HeartlinkHaptics = (() => {
     const D = Object.assign({}, DEFAULT_MS, o.defaultMs || {});
     const r = (v) => Math.round(v * 1000) / 1000;
     switch (pattern) {
+      case 'native': { const ms = durationMs || D.long; return [[0, I], [ms, 0]]; }
       case 'double': return [[0, I], [180, 0], [320, I], [500, 0]];
       case 'triple': return [[0, I], [160, 0], [320, I], [480, 0], [640, I], [800, 0]];
       case 'long': { const ms = durationMs || D.long; return [[0, I], [ms, 0]]; }
@@ -1179,9 +1216,14 @@ const HeartlinkHaptics = (() => {
       if (target && target !== '*') { const it = items.get(target); return it && !off.has(target) ? [[target, it]] : []; }
       return [...items.entries()].filter(([id, it]) => !off.has(id) && ((output === '*' || !output) ? !onlyRisky(it.caps) : it.caps.outputs.includes(output)));
     }
+    // 返回 handler 的停止结果（Promise）或 null：驱动直连的停止帧要等回执，失败重试后报 refused: 'stop-failed'（§5.9-9）
     function stopOne(id, it, reason) {
       if (it.run) { it.run.cancel(reason || 'stop'); it.run = null; }
-      try { const r = it.handler({ stop: true }); if (r && r.catch) r.catch(() => {}); } catch (_) {}
+      try {
+        const r = it.handler({ stop: true });
+        if (r && typeof r.then === 'function') return r.then((v) => v || null, (err) => ({ ok: false, refused: 'stop-failed', error: err }));
+      } catch (err) { return Promise.resolve({ ok: false, refused: 'stop-failed', error: err }); }
+      return null;
     }
     function dropQueued(q, reason) {
       T.clearTimeout(q.tid);
@@ -1189,13 +1231,22 @@ const HeartlinkHaptics = (() => {
       report({ type: 'end', source: q.source, act: q.idx, t: now(), how: 'cut', reason, queued: true });
     }
     // reason 缺省 stop（读者全部停止）；设备侧停止由调用方写 disconnected 等
+    // 停止是同步发出的；要回执的执行器（驱动直连）晚一点才知道成没成，失败的再发一条 bio:actuate（refused: 'stop-failed'，§5.9-9）
     function stop(id, reason) {
-      if (id) { const it = items.get(String(id)); if (it) stopOne(String(id), it, reason); }
+      const waits = [];
+      const one = (k, it) => { const p = stopOne(k, it, reason); if (p) waits.push(p.then((r) => (r && r.ok === false && r.refused ? { id: k, ok: false, refused: r.refused } : null))); };
+      if (id) { const it = items.get(String(id)); if (it) one(String(id), it); }
       else {
         for (const q of queue.slice()) dropQueued(q, reason || 'stop');
-        for (const [k, it] of items) stopOne(k, it, reason);
+        for (const [k, it] of items) one(k, it);
       }
       emit('bio:actuate', { t: now(), target: id || '*', action: { stop: true }, results: [], source: 'stop' });
+      if (waits.length) {
+        Promise.all(waits).then((rs) => {
+          const failed = rs.filter(Boolean);
+          if (failed.length) emit('bio:actuate', { t: now(), target: id || '*', action: { stop: true }, results: failed, source: 'stop' });
+        }).catch(() => {});
+      }
     }
 
     async function actuate(target, action, opts) {
@@ -1264,7 +1315,7 @@ const HeartlinkHaptics = (() => {
       if (ok) lastOk = last;
       emit('bio:actuate', last);
       if (actIdx != null) {
-        if (ok) report({ type: 'start', source, act: actIdx, t, ids: group.ids.slice() });
+        if (ok) report({ type: 'start', source, act: actIdx, t, ids: group.ids.slice(), actObj: { pattern: a.pattern, intensity: a.intensity, durationMs: a.durationMs || null, output: a.output } });
         else report({ type: 'refused', source, act: actIdx, t, reason: results[0].refused });
       }
       if (ok) return { ok: true, results };
@@ -1364,6 +1415,10 @@ const HeartlinkHaptics = (() => {
     if (version >= 4) {
       for (const d of Object.values(devices || {})) {
         for (const f of Object.values(d.DeviceFeatures || {})) {
+          // v4 §InputCmd：能读电量的特性单独记下（不是输出，不登记执行器）
+          if (f.Input && f.Input.Battery && (f.Input.Battery.Command || []).includes('Read')) {
+            out.push({ key: `intiface:${d.DeviceIndex}:${f.FeatureIndex}:Battery`, deviceIndex: d.DeviceIndex, featureIndex: f.FeatureIndex, input: 'Battery', name: d.DeviceDisplayName || d.DeviceName });
+          }
           const outs = Object.entries(f.Output || {}).filter(([o]) => OUTPUTS.includes(o) && o !== '*');
           const hasHw = outs.some(([o]) => o === 'HwPositionWithDuration');
           for (const [output, info] of outs) {
@@ -1514,13 +1569,979 @@ const HeartlinkHaptics = (() => {
       setLevel(f, level) { return send(levelMessage(version, ++id, f, level)); },
       setPosition(f, pos, durationMs) { const m = positionMessage(version, ++id, f, pos, durationMs); return m ? send(m) : false; },
       stop(f) { return send(stopMessage(version, ++id, f || null)); },
+      // v4：读电量（InputCmd Read → InputReading）；v3 没有这条消息
+      async readBattery(f) {
+        if (version < 4 || !f || f.input !== 'Battery') return null;
+        const r = await request((mid) => ({ InputCmd: { Id: mid, DeviceIndex: f.deviceIndex, FeatureIndex: f.featureIndex, Type: 'Battery', Command: 'Read' } }));
+        const v = r && r.Reading && r.Reading.Battery && r.Reading.Battery.Value;
+        return Number.isFinite(v) ? Math.max(0, Math.min(100, Math.round(v))) : null;
+      },
       status: () => ({ status, version, features: features.length, url }),
     };
   }
 
-  return { OUTPUTS, PATTERNS, RISKY_OUTPUTS, MAX_PER_REPLY, MAX_PER_REPLY_LIMIT, DEFAULT_MS, PROFILES, DEFAULT_PROFILE, resolveSettings, liftIntensity, BIO_ACT_TAG_RE, stripNonActionText, hideBioActs, parseBioActs, patternFrames, gate, playFrames, createRegistry, featuresFromDeviceList, levelMessage, positionMessage, stopMessage, strokePeriod, createStroker, createIntifaceClient };
+  return { OUTPUTS, PATTERNS, NATIVE_PATTERN, resolveNative, RISKY_OUTPUTS, MAX_PER_REPLY, MAX_PER_REPLY_LIMIT, DEFAULT_MS, PROFILES, DEFAULT_PROFILE, resolveSettings, liftIntensity, BIO_ACT_TAG_RE, stripNonActionText, hideBioActs, parseBioActs, patternFrames, gate, playFrames, createRegistry, featuresFromDeviceList, levelMessage, positionMessage, stopMessage, strokePeriod, createStroker, createIntifaceClient };
 })();
 if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkHaptics;
+
+// heartlink：按 TBC 驱动直连浏览器蓝牙设备（不经 buttplug wasm）。
+// 生成文件，不要手改：改 ../device-lab 之后跑 `node scripts/sync-drivers.mjs`。
+// 源（device-lab，本地仓库）：
+//   engine/driver.mjs  sha256:c645a10fe4a8b2e7b1baa57f1e7a0ebb4db94239db0a564f271c84286c35d118
+//   transports/web-bluetooth/driver-link.mjs  sha256:981d8eea232457da09b22a3fa67f451e882ecc55f2f26178527ed30a67bd406f
+//   transports/tbc-direct/register.mjs  sha256:d6f81bbac52321fd53e4033f52b53244395b9b99ae6fffb497d8b6d1958f77ba
+//   drivers/*.json → DRIVERS（精简成运行时字段；funf-bobobei、svakom-sl278h）
+const HeartlinkDrivers = (() => {
+  'use strict';
+
+  // ===== device-lab/engine/driver.mjs =====
+  // 驱动描述（drivers/*.json）的读取、校验、编码与解码。纯函数，Node 与浏览器都能用。
+  // 帧模板是空格分隔的十六进制字节，占位符：{level} 档位、{mode} 模式、{temp} 温度（℃）、{seq} 序号（每帧递增，设备不校验时解码忽略）、
+  // {cmd} 指令号（只在通知模板里）。
+  // TBC v0.3 §5.9：强度 0 一律发停止帧；档位按强度 × 最大档位向下取整。
+
+  const FORMAT = 'tbc-device-lab/driver@1';
+  const OUTPUTS = ['Vibrate', 'Rotate', 'Oscillate', 'Constrict', 'Spray', 'Temperature', 'Led', 'Position', 'HwPositionWithDuration', 'Estim'];
+  // 缺省视为有风险的输出：`output="*"` 不会驱动它们，必须点名（§5.9-6）
+  const RISKY_OUTPUTS = ['Temperature', 'Estim', 'Spray'];
+  const PATTERNS = ['pulse', 'double', 'triple', 'long', 'heartbeat', 'wave'];
+  const PLACEHOLDERS = ['level', 'mode', 'temp', 'cmd', 'seq'];
+  // 设备外形（没有产品图时画对应线稿，见 assets/shapes/）
+  const SHAPES = ['egg', 'wand', 'rabbit', 'suction', 'plug', 'band', 'stroker', 'prostate'];
+  // 经 Intiface 的状态：official = buttplug 官方配置里有这台；unverified = 模拟器暴露了，但官方配置里没有或字节不同；none = 不支持
+  const INTIFACE_STATUS = ['official', 'unverified', 'none'];
+
+  // 缺省外形：写了 shape 用它；否则按输出猜（往复 + 振动 → 兔耳，只有收缩/吮吸 → 吮吸，男用 → 飞机杯），猜不出用按摩棒
+  function guessShape(d) {
+    if (d && SHAPES.includes(d.shape)) return d.shape;
+    const outs = new Set(((d && d.parts) || []).map((p) => p.output));
+    if (d && d.group === '男用') return 'stroker';
+    if (outs.has('Oscillate') && outs.has('Vibrate')) return 'rabbit';
+    if (outs.size && [...outs].every((o) => o === 'Constrict')) return 'suction';
+    return 'wand';
+  }
+
+  function normUuid(u) {
+    const s = String(u || '').toLowerCase();
+    return /^[0-9a-f]{4}$/.test(s) ? `0000${s}-0000-1000-8000-00805f9b34fb` : s;
+  }
+
+  function parseTemplate(t) {
+    return String(t).trim().split(/\s+/).map((tok) => {
+      const m = /^\{(\w+)\}$/.exec(tok);
+      if (m) {
+        if (!PLACEHOLDERS.includes(m[1])) throw new Error(`未知占位符 ${tok}`);
+        return { ph: m[1] };
+      }
+      if (!/^[0-9a-fA-F]{2}$/.test(tok)) throw new Error(`不是十六进制字节：${tok}`);
+      return { lit: parseInt(tok, 16) };
+    });
+  }
+
+  function toHex(bytes) {
+    return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join(' ');
+  }
+  function fromHex(s) {
+    return Uint8Array.from(String(s).trim().split(/\s+/).map((x) => parseInt(x, 16)));
+  }
+
+  // 握手：旧格式是帧数组（只预留）；新格式 { frames, delayMs, expectNotify, timeoutMs }
+  function handshakeOf(d) {
+    const h = d && d.handshake;
+    if (!h || Array.isArray(h)) return { frames: (h || []).slice(), delayMs: 0, expectNotify: 0, timeoutMs: 0, replyEveryMs: 0, required: false };
+    return {
+      frames: (h.frames || []).slice(),
+      delayMs: h.delayMs || 0,
+      expectNotify: h.expectNotify || 0,
+      timeoutMs: h.timeoutMs || 0,
+      replyEveryMs: h.replyEveryMs ?? 100,
+      required: h.required !== false && (h.frames || []).length > 0,
+    };
+  }
+  // 连接特性（§5.9-7、-8）与写入节奏
+  function connectionOf(d) {
+    const c = (d && d.connection) || {};
+    return { exclusive: !!c.exclusive, stopsOnDisconnect: !!c.stopsOnDisconnect, writeGapMs: c.writeGapMs || 0, ackTimeoutMs: c.ackTimeoutMs || 3000, officialApp: c.officialApp || '官方 App' };
+  }
+  function intifaceStatus(d) {
+    const t = d && d.transports && d.transports.intiface;
+    return (t && t.status) || 'unverified';
+  }
+  // {seq} 计数器：从 start 起，到 max 后回到 start
+  function createSeq(d) {
+    const s = (d && d.seq) || {};
+    const start = s.start ?? 1;
+    const max = s.max ?? 255;
+    let cur = start;
+    return {
+      next() { const v = cur; cur = cur >= max ? start : cur + 1; return v; },
+      peek: () => cur,
+      reset() { cur = start; },
+    };
+  }
+
+  function fill(tokens, vals) {
+    return Uint8Array.from(tokens.map((x) => (x.lit != null ? x.lit : (vals[x.ph] ?? 0) & 0xff)));
+  }
+  const seqDefault = (d) => (d.seq && d.seq.start != null ? d.seq.start : 1);
+
+  // 只含字面值与 {seq} 的帧（握手、停止帧）
+  function literalFrame(d, template, seq) {
+    return fill(parseTemplate(template), { seq: seq ?? seqDefault(d) });
+  }
+  function handshakeFrames(d, seq) {
+    return handshakeOf(d).frames.map((f, i) => literalFrame(d, f, typeof seq === 'function' ? seq() : (seq ?? seqDefault(d)) + i));
+  }
+  // 按模板比对：占位符不比（记下取值）；skip 里的字面字节也不比（严格字节另判）
+  function matchTokens(tokens, b, skip) {
+    if (tokens.length !== b.length) return null;
+    const got = {};
+    for (let i = 0; i < tokens.length; i++) {
+      const x = tokens[i];
+      if (x.lit == null) { got[x.ph] = b[i]; continue; }
+      if (skip && skip.has(i)) continue;
+      if (x.lit !== b[i]) return null;
+    }
+    return got;
+  }
+  function isHandshake(d, bytes) {
+    const b = [...bytes];
+    return handshakeOf(d).frames.some((f) => matchTokens(parseTemplate(f), b) != null);
+  }
+
+  function checkNative(where, n, output, need) {
+    if (!n || typeof n !== 'object') { need(false, `${where}: 应为对象`); return; }
+    if (n.mode != null) need(Number.isInteger(n.mode) || typeof n.mode === 'string', `${where}: mode 应为整数或字符串`);
+    if (n.stoppable === false) {
+      need(Number.isInteger(n.maxDurationMs) && n.maxDurationMs > 0, `${where}: 停不下来的自带模式必须写 maxDurationMs（设备自身的最长运行时间，§5.9-5）`);
+      need(!RISKY_OUTPUTS.includes(output), `${where}: ${output} 是有风险的输出，它的自带模式必须能被 0 停下（§5.9-5）`);
+    }
+  }
+
+  // 返回错误数组；空数组 = 合格
+  function validateDriver(d) {
+    const errors = [];
+    const need = (cond, msg) => { if (!cond) errors.push(msg); };
+    need(d && d.format === FORMAT, `format 应为 ${FORMAT}`);
+    if (!d) return errors;
+    need(typeof d.id === 'string' && /^[a-z0-9-]+$/.test(d.id), 'id 只能用小写字母、数字、连字符');
+    need(d.ble && d.ble.service && d.ble.write, 'ble.service 与 ble.write 必填');
+    need(Array.isArray(d.parts) && d.parts.length > 0, 'parts 至少一个');
+    if (d.shape != null) need(SHAPES.includes(d.shape), `shape 只能是 ${SHAPES.join(' / ')}`);
+    const sourceIds = new Set((d.sources || []).map((s) => s.id));
+    const srcOk = (where, list) => { for (const s of list || []) need(sourceIds.has(s), `${where}: 来源 ${s} 没有在 sources 里登记`); };
+    let usesSeq = false;
+    const tpl = (where, t, allowed) => {
+      try {
+        const toks = parseTemplate(t);
+        if (toks.some((x) => x.ph === 'seq')) usesSeq = true;
+        need(toks.every((x) => x.lit != null || allowed.includes(x.ph)), /停止帧$/.test(where) ? `${where}不能有占位符（{seq} 除外）` : `${where}: 占位符只能用 ${allowed.map((a) => `{${a}}`).join(' ')}`);
+        return toks;
+      } catch (e) { errors.push(`${where}: ${e.message}`); return null; }
+    };
+    // 握手
+    if (d.handshake != null && !Array.isArray(d.handshake)) {
+      const h = d.handshake;
+      need(Array.isArray(h.frames) && h.frames.length > 0, 'handshake.frames 至少一帧');
+      (h.frames || []).forEach((f, i) => tpl(`handshake.frames[${i}]`, f, ['seq']));
+      if (h.expectNotify != null) need(Number.isInteger(h.expectNotify) && h.expectNotify >= 0, 'handshake.expectNotify 应为非负整数');
+      if (h.expectNotify) need(Number.isInteger(h.timeoutMs) && h.timeoutMs > 0, 'handshake.timeoutMs 必填（等通知要有超时）');
+      if (h.delayMs != null) need(Number.isInteger(h.delayMs) && h.delayMs >= 0, 'handshake.delayMs 应为非负整数');
+      srcOk('handshake', h.sources);
+    } else (d.handshake || []).forEach((f, i) => tpl(`handshake[${i}]`, f, ['seq']));
+    if (d.connection != null) {
+      const c = d.connection;
+      for (const k of ['exclusive', 'stopsOnDisconnect']) if (c[k] != null) need(typeof c[k] === 'boolean', `connection.${k} 应为 true / false`);
+      for (const k of ['writeGapMs', 'ackTimeoutMs']) if (c[k] != null) need(Number.isInteger(c[k]) && c[k] >= 0, `connection.${k} 应为非负整数`);
+      srcOk('connection', c.sources);
+    }
+    if (d.transports && d.transports.intiface) {
+      need(INTIFACE_STATUS.includes(d.transports.intiface.status), `transports.intiface.status 只能是 ${INTIFACE_STATUS.join(' / ')}`);
+      srcOk('transports.intiface', d.transports.intiface.sources);
+    }
+    const ids = new Set();
+    for (const p of d.parts || []) {
+      const where = `parts.${p.id}`;
+      need(p.id && !ids.has(p.id), `${where}: id 缺失或重复`);
+      ids.add(p.id);
+      need(OUTPUTS.includes(p.output), `${where}: output 不是 TBC 输出类型`);
+      need(Number.isInteger(p.steps) && p.steps >= 1, `${where}: steps 应为正整数`);
+      const t = tpl(where, p.template, ['level', 'mode', 'temp', 'seq']);
+      const s = tpl(`${where}: 停止帧`, p.stop, ['seq']);
+      if (t) need(t.some((x) => x.ph === 'level' || x.ph === 'temp'), `${where}: 模板里要有 {level} 或 {temp}`);
+      if (t && s) need(s.length === t.length, `${where}: 停止帧与模板长度不同`);
+      if (p.mode) need(Array.isArray(p.mode.range) && p.mode.range.length === 2, `${where}: mode.range 应为 [最小, 最大]`);
+      if (RISKY_OUTPUTS.includes(p.output)) need(Number.isInteger(p.maxDurationMs) && p.maxDurationMs > 0, `${where}: ${p.output} 必须写 maxDurationMs（§5.9）`);
+      if (p.risky) need(RISKY_OUTPUTS.includes(p.output), `${where}: 标了 risky，但 ${p.output} 不在 ${RISKY_OUTPUTS.join(' / ')} 里——只有这三类会被要求点名（§5.9-6）`);
+      if (p.keepaliveMs != null) need(Number.isInteger(p.keepaliveMs) && p.keepaliveMs > 0, `${where}: keepaliveMs 应为正整数`);
+      if (p.nativePatterns != null) {
+        for (const [k, n] of Object.entries(p.nativePatterns)) {
+          need(PATTERNS.includes(k), `${where}.nativePatterns: ${k} 不是抽象模式（${PATTERNS.join(' / ')}）`);
+          checkNative(`${where}.nativePatterns.${k}`, n, p.output, need);
+          srcOk(`${where}.nativePatterns.${k}`, n && n.sources);
+        }
+      }
+      for (const [i, n] of (p.nativeModes || []).entries()) {
+        checkNative(`${where}.nativeModes[${i}]`, n, p.output, need);
+        srcOk(`${where}.nativeModes[${i}]`, n && n.sources);
+      }
+      for (const q of p.stopClears || []) need((d.parts || []).some((x) => x.id === q), `${where}: stopClears 里的 ${q} 不是部件`);
+      srcOk(where, p.sources);
+    }
+    if (usesSeq) need(d.seq && Number.isInteger(d.seq.start) && Number.isInteger(d.seq.max) && d.seq.max >= d.seq.start, '模板用了 {seq}，要写 seq: { start, max }');
+    return errors;
+  }
+
+  function part(d, id) {
+    const p = d.parts.find((x) => x.id === id);
+    if (!p) throw new Error(`驱动 ${d.id} 没有部件 ${id}`);
+    return p;
+  }
+
+  // 强度 0–1 → 字节帧；opts：{ mode, seq }
+  function encode(d, partId, level, opts) {
+    const p = part(d, partId);
+    const o = opts || {};
+    const L = Math.max(0, Math.min(1, Number(level) || 0));
+    const value = Math.floor(L * p.steps + 1e-9);
+    const seq = o.seq ?? seqDefault(d);
+    if (value === 0) return literalFrame(d, p.stop, seq);
+    const mode = o.mode ?? (p.mode ? p.mode.default : 0);
+    return fill(parseTemplate(p.template), { level: value, mode, temp: (p.temp && p.temp.celsius) || 0, seq });
+  }
+
+  // 字节帧 → { part, value, level, mode, stop, seq? } 或 { error }
+  function decode(d, bytes) {
+    const b = [...bytes];
+    for (const p of d.parts) {
+      const stop = parseTemplate(p.stop);
+      const got = matchTokens(stop, b);   // 占位符（{seq}）不比
+      if (got) return Object.assign({ part: p.id, value: 0, level: 0, mode: 0, stop: true }, got.seq != null ? { seq: got.seq } : {});
+    }
+    for (const p of d.parts) {
+      const t = parseTemplate(p.template);
+      if (t.length !== b.length) continue;
+      const strictIdx = new Set((p.strict || []).map((s) => s.index));
+      // 严格字节单独判断：其它字节都对上、只有它不对时，报 strict（设备会整帧忽略）
+      const got = matchTokens(t, b, strictIdx);
+      if (!got) continue;
+      for (const s of p.strict || []) if (b[s.index] !== s.equals) return { error: 'strict', part: p.id, reason: s.reason };
+      const seqExtra = got.seq != null ? { seq: got.seq } : {};
+      if (p.mode && got.mode != null && got.level) {
+        const [lo, hi] = p.mode.range;
+        if (got.mode < lo || got.mode > hi) return { error: 'mode-range', part: p.id, reason: `模式 ${got.mode} 超出 ${lo}–${hi}` };
+      }
+      if (got.temp != null) return Object.assign({ part: p.id, value: got.temp ? 1 : 0, level: got.temp ? 1 : 0, temp: got.temp, stop: !got.temp }, seqExtra);
+      const value = got.level ?? 0;
+      if (value > p.steps) return { error: 'level-range', part: p.id, reason: `档位 ${value} 超出 0–${p.steps}` };
+      return Object.assign({ part: p.id, value, level: value / p.steps, mode: got.mode ?? 0, stop: value === 0 }, seqExtra);
+    }
+    return { error: 'unknown-frame' };
+  }
+
+  // 设备状态通知帧（没有通知模板时返回 null）
+  function notifyFrame(d, partId, mode, value) {
+    if (!d.notify) return null;
+    const cmd = parseTemplate(part(d, partId).template)[1];
+    return fill(parseTemplate(d.notify.template), { cmd: cmd && cmd.lit != null ? cmd.lit : 0, mode: mode || 0, level: value || 0 });
+  }
+
+  // 模板里占位符所在的字节位置（页面加粗显示）
+  function placeholderIndexes(template) {
+    return parseTemplate(template).flatMap((x, i) => (x.ph ? [i] : []));
+  }
+
+  // 状态通知帧 → { part, mode, value } 或 null（对不上模板）
+  function decodeNotify(d, bytes) {
+    if (!d.notify) return null;
+    const got = matchTokens(parseTemplate(d.notify.template), [...bytes]);
+    if (!got) return null;
+    const p = d.parts.find((x) => { const c = parseTemplate(x.template)[1]; return c && c.lit === got.cmd; });
+    return { part: p ? p.id : null, mode: got.mode ?? 0, value: got.level ?? 0 };
+  }
+
+  // 给 TBC 执行器能力用的自带模式表（§5.9-5）：只收能被 0 停下的；allowUnstoppable 为 true 时也收停不下来的（用户逐台开启后）
+  function nativePatternCaps(p, allowUnstoppable) {
+    const out = {};
+    for (const [k, n] of Object.entries(p.nativePatterns || {})) {
+      if (n.stoppable === false && !allowUnstoppable) continue;
+      out[k] = n.mode ?? k;
+    }
+    return out;
+  }
+
+  // ===== device-lab/transports/web-bluetooth/driver-link.mjs =====
+  // 按驱动描述连一台网页蓝牙设备（真 navigator.bluetooth 或 transports/web-bluetooth-mock 的假货都行）。
+  // 这是 heartlink 以后“按驱动直连”要做的事的参考实现：
+  //   1. requestOptions(driver)：按名字前缀过滤；optionalServices 只放控制服务与标准服务，永远不放 forbidden（固件升级口）
+  //   2. connectDriver(driver, device, { onHandshake })：连接 → 订阅通知 → 等 delayMs → 发握手帧 → 等 expectNotify 条通知（超时就断开并报 HANDSHAKE_TIMEOUT）
+  //      onHandshake 可选，进度回调：({ phase: 'sent'|'notify'|'ready'|'timeout', got, need }) => void，不抛也不影响握手；
+  //      超时错误上也带 err.got / err.need，UI 可以说“只收到 2/4”
+  //   3. link.write(bytes)：按驱动的写法（带 / 不带回执）逐帧串行发，帧间隔 writeGapMs，回执超时 ackTimeoutMs
+  //      bytes 也可以是函数：轮到它发时才调用取字节（调用方用它合并同一部件还没发出的帧）
+  //   4. 独占设备连不上时报 EXCLUSIVE_BUSY（“先断开官方 App”），不自动重试抢占（§5.9-7）
+  // 错误一律是 LinkError { code, message }：EXCLUSIVE_BUSY / OUT_OF_RANGE / CONNECT_FAILED / HANDSHAKE_TIMEOUT / ACK_TIMEOUT / WRITE_FAILED / NOT_CONNECTED
+
+  class LinkError extends Error {
+    constructor(code, message, cause) { super(message); this.name = 'LinkError'; this.code = code; if (cause) this.cause = cause; }
+  }
+
+  function requestOptions(driver) {
+    const b = driver.ble;
+    const forbidden = new Set((b.forbidden || []).map(normUuid));
+    const services = [b.service, ...(b.extraServices || []).map((s) => s.service)].map(normUuid).filter((u) => !forbidden.has(u));
+    const filter = driver.namePrefix ? { namePrefix: driver.namePrefix } : { services: [normUuid(b.service)] };
+    return { filters: [filter], optionalServices: services };
+  }
+
+  function timersOf(o) {
+    return o.timers || { setTimeout: (f, ms) => setTimeout(f, ms), clearTimeout: (id) => clearTimeout(id) };
+  }
+
+  async function connectDriver(driver, device, opts) {
+    const o = opts || {};
+    const T = timersOf(o);
+    const hs = handshakeOf(driver);
+    const conn = connectionOf(driver);
+    const seq = o.seq || createSeq(driver);
+    const gapMs = o.writeGapMs ?? conn.writeGapMs;
+    const ackTimeoutMs = o.ackTimeoutMs ?? conn.ackTimeoutMs;
+    const sleep = (ms) => (ms > 0 ? new Promise((r) => T.setTimeout(r, ms)) : Promise.resolve());
+    const emitHandshake = (info) => { if (o.onHandshake) { try { o.onHandshake(info); } catch (_) {} } };
+    const onNotify = new Set();
+    const onDown = new Set();
+    const b = driver.ble;
+    const withResponse = b.writeWithoutResponse === false;
+    let server;
+    try {
+      server = await device.gatt.connect();
+    } catch (e) {
+      const msg = String((e && e.message) || e);
+      if (/no longer in range/i.test(msg)) throw new LinkError('OUT_OF_RANGE', `连不上 ${driver.model}：设备不在范围内或没开机。`, e);
+      if (conn.exclusive || (e && e.lab && e.lab.code === 'busy')) {
+        throw new LinkError('EXCLUSIVE_BUSY', `连不上 ${driver.model}：这台设备同时只接受一个连接。先断开${conn.officialApp}（在手机上彻底退出，或关掉手机蓝牙），再点连接；不会自动重试抢占。`, e);
+      }
+      throw new LinkError('CONNECT_FAILED', `连不上 ${driver.model}：${msg}`, e);
+    }
+    let alive = true;
+    const handleDown = () => {
+      if (!alive) return;
+      alive = false;
+      for (const fn of [...onDown]) { try { fn(); } catch (_) {} }
+    };
+    device.addEventListener('gattserverdisconnected', handleDown);
+    let tx;
+    let rx = null;
+    try {
+      const svc = await server.getPrimaryService(normUuid(b.service));
+      tx = await svc.getCharacteristic(normUuid(b.write));
+      if (b.notify) {
+        rx = await svc.getCharacteristic(normUuid(b.notify));
+        rx.addEventListener('characteristicvaluechanged', (ev) => {
+          const v = ev.target.value;
+          const bytes = new Uint8Array(v.buffer, v.byteOffset || 0, v.byteLength);
+          for (const fn of [...onNotify]) fn(bytes);
+        });
+        await rx.startNotifications();   // 不要手动写 0x2902
+      }
+    } catch (e) {
+      try { device.gatt.disconnect(); } catch (_) {}
+      throw new LinkError('CONNECT_FAILED', `${driver.model} 的服务或特征拿不到：${(e && e.message) || e}`, e);
+    }
+
+    // ---------- 串行写入 ----------
+    let chain = Promise.resolve();
+    let lastAt = 0;
+    const now = o.now || (() => Date.now());
+    function rawWrite(bytes) {
+      const p = withResponse ? tx.writeValueWithResponse(bytes) : tx.writeValueWithoutResponse(bytes);
+      if (!withResponse) return p;
+      return new Promise((resolve, reject) => {
+        const id = T.setTimeout(() => reject(new LinkError('ACK_TIMEOUT', `${ackTimeoutMs / 1000} 秒没收到回执，放弃这一帧：${toHex(bytes)}`)), ackTimeoutMs);
+        p.then((v) => { T.clearTimeout(id); resolve(v); }, (e) => { T.clearTimeout(id); reject(e); });
+      });
+    }
+    function write(bytesOrFn) {
+      const job = chain.then(async () => {
+        if (!alive) throw new LinkError('NOT_CONNECTED', `${driver.model} 已断开`);
+        const wait = lastAt ? gapMs - (now() - lastAt) : 0;
+        if (wait > 0) await sleep(wait);
+        const bytes = typeof bytesOrFn === 'function' ? bytesOrFn() : bytesOrFn;
+        try { await rawWrite(bytes); } catch (e) {
+          if (e instanceof LinkError) throw e;
+          throw new LinkError(/disconnected/i.test(String(e && e.message)) ? 'NOT_CONNECTED' : 'WRITE_FAILED', `写入失败（${toHex(bytes)}）：${(e && e.message) || e}`, e);
+        } finally { lastAt = now(); }
+      });
+      chain = job.catch(() => {});
+      return job;
+    }
+
+    // ---------- 握手 ----------
+    if (hs.frames.length) {
+      await sleep(hs.delayMs);
+      let got = 0;
+      let done;
+      const ready = new Promise((r) => { done = r; });
+      const count = () => { got++; emitHandshake({ phase: 'notify', got, need: hs.expectNotify }); if (got >= hs.expectNotify) done(true); };
+      onNotify.add(count);
+      try {
+        for (const f of hs.frames) await write(literalFrame(driver, f, seq.next()));
+      } catch (e) {
+        onNotify.delete(count);
+        try { device.gatt.disconnect(); } catch (_) {}
+        throw e;
+      }
+      emitHandshake({ phase: 'sent', got, need: hs.expectNotify });
+      if (hs.expectNotify) {
+        const timer = T.setTimeout(() => done(false), hs.timeoutMs);
+        const ok = await ready;
+        T.clearTimeout(timer);
+        onNotify.delete(count);
+        if (!ok) {
+          try { device.gatt.disconnect(); } catch (_) {}
+          emitHandshake({ phase: 'timeout', got, need: hs.expectNotify });
+          const err = new LinkError('HANDSHAKE_TIMEOUT', `握手超时：已发初始化帧，${hs.timeoutMs / 1000} 秒内只收到 ${got}/${hs.expectNotify} 条设备通知。可能是${conn.officialApp}还连着、固件不同，或设备没开机。已断开，不会自动重试。`);
+          err.got = got;
+          err.need = hs.expectNotify;
+          throw err;
+        }
+        emitHandshake({ phase: 'ready', got, need: hs.expectNotify });
+      } else onNotify.delete(count);
+    }
+
+    async function readBattery() {
+      try {
+        const s = await server.getPrimaryService(normUuid('180f'));
+        const c = await s.getCharacteristic(normUuid('2a19'));
+        const v = await c.readValue();
+        return v.getUint8(0);
+      } catch (_) { return null; }
+    }
+
+    const encodeP = (partId, level, eo) => encode(driver, partId, level, Object.assign({}, eo, { seq: seq.next() }));
+    const writePart = (partId, level, eo) => write(encodeP(partId, level, eo));
+    return {
+      driver,
+      device,
+      seq,
+      get connected() { return alive; },
+      withResponse,
+      encode: encodeP,
+      write,
+      writePart,
+      // 每个部件发一次停止帧（驱动的 stopAll.order；没写就按部件顺序）
+      async stopAll() {
+        const order = (driver.stopAll && driver.stopAll.order) || driver.parts.map((p) => p.id);
+        const failed = [];
+        for (const id of order) { try { await writePart(id, 0); } catch (e) { failed.push({ part: id, error: e }); } }
+        return { ok: !failed.length, failed };
+      },
+      readBattery,
+      onNotify(fn) { onNotify.add(fn); return () => onNotify.delete(fn); },
+      onDisconnect(fn) { onDown.add(fn); return () => onDown.delete(fn); },
+      disconnect() { try { device.gatt.disconnect(); } catch (_) {} handleDown(); },
+    };
+  }
+
+  // ===== device-lab/transports/tbc-direct/register.mjs =====
+  // 把一份驱动的部件直接登记成 TBC 执行器（不经 Intiface）。这是 TBC v0.3 §5.9 的参考做法：
+  //   - 强度 0 发停止帧；帧结束或取消时一定发停止
+  //   - keepaliveMs：动着的时候按间隔重发最后一帧
+  //   - group：同组同时只驱动一个，动之前先停同组其它部件
+  //   - maxDurationMs：到点强制停止（加热 / 电刺激类必须有）
+  //   - nativePatterns（§5.9-5）：抽象模式有对应的设备自带模式时直接发自带模式；停不下来的（stoppable:false）只有用户逐台开启才用
+  //   - 写入逐帧排队：同一部件还没发出的帧只留最新的；停止越过排队（§5.9-9），需要回执的设备等回执，失败重试，最后报 refused
+  //   - 断线（§5.9-8）：stopsOnDisconnect 不为 true 时，断线前在动的部件记为“可能仍在动”；重连后第一件事是全部停止
+  // write(bytes, info) 由调用方提供：可以是虚拟设备、网页蓝牙链接（transports/web-bluetooth/driver-link.mjs 的 link.write）或别的传输。
+  //   同步返回 undefined / { ok: true } 算成功，返回 false 或 { ack: false } 算失败；返回 Promise 时等它（拒绝算失败）。
+
+  function driverActuators(driver, write, opts) {
+    const o = opts || {};
+    // 包一层：浏览器里把 setTimeout 当成别的对象的方法调用会报 Illegal invocation
+    const T = o.timers || { setTimeout: (f, ms) => setTimeout(f, ms), clearTimeout: (id) => clearTimeout(id), setInterval: (f, ms) => setInterval(f, ms), clearInterval: (id) => clearInterval(id) };
+    const conn = connectionOf(driver);
+    const include = o.include || null;   // 部件 id 列表；缺省 = expose 不为 false 的部件
+    const retries = o.stopRetries ?? 2;  // 停止失败后再试几次
+    const allowUnstoppable = new Set(o.allowUnstoppable || []);   // 用户逐台开启“停不下来的自带模式”的部件（§5.9-5）
+    const seq = o.seq || createSeq(driver);
+    const enc = o.encode || ((id, level, eo) => encode(driver, id, level, Object.assign({}, eo, { seq: seq.next() })));
+    const onStopFailed = o.onStopFailed || (() => {});
+    const onState = o.onState || (() => {});
+    const byId = Object.fromEntries(driver.parts.map((p) => [p.id, p]));
+    const running = {};                  // partId → { cancel }
+    const state = Object.fromEntries(driver.parts.map((p) => [p.id, { level: 0, maybeRunning: false, native: null }]));
+    const queue = [];                    // { part, level, mode, kind: 'frame' | 'stop', tries, resolve }
+    let inflight = null;
+    let online = true;
+    const out = [];
+    const parts = driver.parts.filter((p) => (include ? include.includes(p.id) : p.expose !== false));
+
+    // ---------- 写入队列 ----------
+    function finish(it, err, sync) {
+      if (inflight === it) inflight = null;
+      if (err && it.kind === 'stop' && online && it.tries < retries) {
+        it.tries++;
+        const k = queue.findIndex((x) => x.kind !== 'stop');
+        queue.splice(k < 0 ? queue.length : k, 0, it);
+      } else if (err) {
+        if (it.kind === 'stop') { onStopFailed({ part: it.part.id, tries: it.tries + 1, error: err }); it.resolve({ ok: false, refused: 'stop-failed', error: err }); }
+        else it.resolve({ ok: false, error: err });
+      } else {
+        if (it.kind === 'stop') { state[it.part.id].maybeRunning = false; state[it.part.id].native = null; }
+        it.resolve({ ok: true });
+      }
+      if (!sync) pump();
+    }
+    function pump() {
+      while (!inflight && online && queue.length) {
+        const it = queue.shift();
+        const bytes = enc(it.part.id, it.level, Number.isInteger(it.mode) ? { mode: it.mode } : undefined);
+        let r;
+        try { r = write(bytes, { part: it.part.id, kind: it.kind }); } catch (e) { r = Promise.reject(e); }
+        if (r && typeof r.then === 'function') {
+          inflight = it;
+          r.then((v) => finish(it, v === false || (v && v.ack === false) ? new Error('no-ack') : null, false), (e) => finish(it, e || new Error('write failed'), false));
+          return;
+        }
+        finish(it, r === false || (r && r.ack === false) ? new Error((r && r.error) || 'no-ack') : null, true);
+      }
+    }
+    function drop(partId, framesOnly) {
+      for (let i = queue.length - 1; i >= 0; i--) {
+        const x = queue[i];
+        if (x.part.id === partId && (!framesOnly || x.kind !== 'stop')) { queue.splice(i, 1); x.resolve({ ok: false, superseded: true }); }
+      }
+    }
+    function enqueue(p, level, kind, mode) {
+      return new Promise((resolve) => {
+        const it = { part: p, level, kind, mode, tries: 0, resolve };
+        if (kind === 'stop') {
+          drop(p.id, false);
+          const k = queue.findIndex((x) => x.kind !== 'stop');   // 停止排在所有待发帧前面（别的停止之后）
+          queue.splice(k < 0 ? queue.length : k, 0, it);
+        } else {
+          drop(p.id, true);                                       // 同一部件只留最新的一帧
+          queue.push(it);
+        }
+        pump();
+      });
+    }
+
+    function stopPart(p) {
+      const r = running[p.id];
+      if (r) { r.cancel(); delete running[p.id]; }
+      state[p.id].level = 0;
+      return enqueue(p, 0, 'stop');
+    }
+    function send(p, level, mode) {
+      if (level > 0 && p.group) for (const q of driver.parts) if (q !== p && q.group === p.group && running[q.id]) stopPart(q);
+      state[p.id].level = level;
+      return enqueue(p, level, level > 0 ? 'frame' : 'stop', mode);
+    }
+    function nativeFor(p, job) {
+      const pat = job.action && job.action.pattern;
+      const n = pat && p.nativePatterns && p.nativePatterns[pat];
+      if (!n) return null;
+      if (n.stoppable === false && !allowUnstoppable.has(p.id)) return null;
+      return Object.assign({ pattern: pat }, n);
+    }
+
+    for (const p of parts) {
+      const caps = {
+        outputs: [p.output],
+        levels: p.steps > 1,
+        maxIntensity: 1,
+        minIntervalMs: 0,
+        device: `${driver.brand} ${driver.model} ${p.name}`.slice(0, 64),
+        via: o.via || 'other',
+        exclusive: conn.exclusive,
+        stopsOnDisconnect: conn.stopsOnDisconnect,
+      };
+      if (p.maxDurationMs) caps.maxDurationMs = p.maxDurationMs;
+      if (p.keepaliveMs) caps.keepaliveMs = p.keepaliveMs;
+      if (p.group) caps.group = p.group;
+      const np = nativePatternCaps(p, allowUnstoppable.has(p.id));
+      if (Object.keys(np).length) caps.nativePatterns = np;
+      const handler = (job) => {
+        if (job.stop) return stopPart(p);
+        if (running[p.id]) running[p.id].cancel();
+        const ids = [];
+        let lastLevel = 0;
+        let lastMode;
+        let ka = null;
+        let finishJob;
+        const done = new Promise((r) => { finishJob = r; });
+        const cancel = () => { ids.forEach((x) => T.clearTimeout(x)); if (ka) T.clearInterval(ka); ka = null; finishJob(); };
+        running[p.id] = { cancel };
+        const sendL = (level, mode) => { lastLevel = level; lastMode = mode; send(p, level, mode); };
+        const end = job.frames[job.frames.length - 1][0];
+        const nat = nativeFor(p, job);
+        if (nat) {
+          const peak = Math.max(...job.frames.map((f) => f[1]));
+          state[p.id].native = { pattern: nat.pattern, mode: nat.mode, stoppable: nat.stoppable !== false, until: nat.stoppable === false ? Date.now() + nat.maxDurationMs : null };
+          ids.push(T.setTimeout(() => sendL(peak, Number.isInteger(nat.mode) ? nat.mode : undefined), 0));
+        } else for (const [at, level] of job.frames) ids.push(T.setTimeout(() => sendL(level), at));
+        if (p.keepaliveMs) ka = T.setInterval(() => { if (lastLevel > 0 && online) enqueue(p, lastLevel, 'frame', lastMode); }, p.keepaliveMs);
+        const limit = p.maxDurationMs ? Math.min(end, p.maxDurationMs) : end;
+        ids.push(T.setTimeout(() => {
+          if (running[p.id] && running[p.id].cancel === cancel) delete running[p.id];
+          cancel();
+          state[p.id].level = 0;
+          enqueue(p, 0, 'stop');
+        }, limit + 1));
+        if (typeof job.bindCancel === 'function') job.bindCancel(() => { if (running[p.id] && running[p.id].cancel === cancel) delete running[p.id]; cancel(); stopPart(p); });
+        return done;
+      };
+      out.push({ id: `${o.idPrefix || 'lab'}:${driver.id}:${p.id}`, caps, handler, part: p.id, native: p.nativePatterns || null });
+    }
+
+    function status() {
+      return {
+        online,
+        queued: queue.length,
+        parts: Object.fromEntries(driver.parts.map((p) => [p.id, { level: state[p.id].level, running: !!running[p.id], maybeRunning: state[p.id].maybeRunning, native: state[p.id].native }])),
+        maybeRunning: driver.parts.filter((p) => state[p.id].maybeRunning).map((p) => p.id),
+      };
+    }
+    // 全部停止：越过排队，按驱动的 stopAll.order（没写就按部件顺序）每个部件发一次停止帧
+    function stopAll() {
+      for (const id of Object.keys(running)) { running[id].cancel(); delete running[id]; }
+      for (const x of queue.splice(0)) x.resolve({ ok: false, superseded: true });
+      const order = ((driver.stopAll && driver.stopAll.order) || driver.parts.map((p) => p.id)).map((id) => byId[id]).filter(Boolean);
+      return Promise.all(order.map((p) => { state[p.id].level = 0; return enqueue(p, 0, 'stop').then((r) => Object.assign({ part: p.id }, r)); }))
+        .then((rs) => { const failed = rs.filter((r) => !r.ok); onState(status()); return { ok: !failed.length, failed }; });
+    }
+    return {
+      actuators: out,
+      register(tbc) { for (const a of out) tbc.registerActuator(a.id, a.caps, a.handler); return out.map((a) => a.id); },
+      stopAll,
+      status,
+      // 传输层断开了：不再写；断线前在动的部件记为“可能仍在动”（除非驱动确定断线即停）
+      disconnected() {
+        online = false;
+        for (const p of driver.parts) {
+          const st = state[p.id];
+          if (st.level > 0 || running[p.id]) { if (conn.stopsOnDisconnect) st.level = 0; else st.maybeRunning = true; }
+        }
+        for (const id of Object.keys(running)) { running[id].cancel(); delete running[id]; }
+        for (const x of queue.splice(0)) x.resolve({ ok: false, error: new Error('offline') });
+        inflight = null;   // 在途的写入由传输层拒绝；结果到了也不会再重试
+        onState(status());
+      },
+      // 重连成功：先全部停止，再恢复排队
+      reconnected() {
+        online = true;
+        return stopAll();
+      },
+    };
+  }
+
+  // ===== device-lab/drivers/*.json（精简） =====
+  const DRIVERS = [
+    {
+      "format": "tbc-device-lab/driver@1",
+      "id": "funf-bobobei",
+      "brand": "繁野 FUNF",
+      "model": "啵啵贝（SOSEXY）",
+      "shape": "egg",
+      "namePrefix": "SOSEXY",
+      "match": "name",
+      "chips": 1,
+      "ble": {
+        "service": "ee01",
+        "write": "ee03",
+        "notify": "ee02",
+        "writeWithoutResponse": false,
+        "forbidden": [
+          "ae00",
+          "ae01",
+          "ae02"
+        ],
+        "extraServices": [
+          {
+            "service": "180f",
+            "read": [
+              "2a19"
+            ]
+          }
+        ]
+      },
+      "seq": {
+        "start": 1,
+        "max": 255
+      },
+      "handshake": {
+        "frames": [
+          "{seq} 01 00 01 00 c8 11 01"
+        ],
+        "delayMs": 500,
+        "expectNotify": 4,
+        "timeoutMs": 2000,
+        "replyEveryMs": 100
+      },
+      "connection": {
+        "exclusive": true,
+        "stopsOnDisconnect": false,
+        "writeGapMs": 60,
+        "ackTimeoutMs": 3000,
+        "officialApp": "FUNF App"
+      },
+      "parts": [
+        {
+          "id": "suction",
+          "name": "吮吸",
+          "output": "Constrict",
+          "steps": 100,
+          "template": "{seq} 01 00 02 00 07 11 {level} 00 08 11 {mode}",
+          "stop": "{seq} 01 00 02 00 07 11 00 00 08 11 01",
+          "mode": {
+            "default": 1,
+            "range": [
+              1,
+              4
+            ]
+          }
+        },
+        {
+          "id": "vibrate",
+          "name": "振动",
+          "output": "Vibrate",
+          "steps": 100,
+          "template": "{seq} 01 00 02 00 01 11 {level} 00 02 11 {mode}",
+          "stop": "{seq} 01 00 02 00 01 11 00 00 02 11 01",
+          "mode": {
+            "default": 1,
+            "range": [
+              1,
+              4
+            ]
+          }
+        },
+        {
+          "id": "estim",
+          "name": "微电流",
+          "output": "Estim",
+          "steps": 100,
+          "template": "{seq} 01 00 02 00 03 11 {level} 00 04 11 {mode}",
+          "stop": "{seq} 01 00 02 00 03 11 00 00 04 11 01",
+          "mode": {
+            "default": 1,
+            "range": [
+              1,
+              4
+            ]
+          },
+          "maxDurationMs": 30000
+        }
+      ],
+      "stopAll": {
+        "order": [
+          "suction",
+          "vibrate",
+          "estim"
+        ]
+      },
+      "transports": {
+        "intiface": {
+          "status": "none"
+        }
+      },
+      "sources": [
+        {
+          "id": "sosexy-ble-control",
+          "url": "https://github.com/51enuxu/sosexy-ble-control",
+          "license": "MIT"
+        },
+        {
+          "id": "funf-pro-relay",
+          "url": "https://github.com/zaoan0/funf-pro-relay",
+          "license": "MIT"
+        },
+        {
+          "id": "funf-sosexy-mcp",
+          "url": "https://github.com/ktktktkt1234/funf-sosexy-mcp",
+          "license": "MIT"
+        },
+        {
+          "id": "toy-relay-sosexy",
+          "url": "https://github.com/tutu-kitty/Toy-Relay-AI-mcp-SOSEXY",
+          "license": "MIT"
+        },
+        {
+          "id": "buttplug-config",
+          "url": "https://github.com/buttplugio/buttplug/blob/master/crates/buttplug_server_device_config/build-config/buttplug-device-config-v5.json",
+          "license": "BSD-3-Clause"
+        },
+        {
+          "id": "funf-app",
+          "url": "https://itunes.apple.com/lookup?id=6744308742&country=cn",
+          "license": "公开元数据"
+        },
+        {
+          "id": "smzdm-review",
+          "url": "https://post.smzdm.com/talk/p/ak850z88/",
+          "license": "只引用事实"
+        },
+        {
+          "id": "sina-review",
+          "url": "https://www.sina.cn/news/detail/5315084823039226.html",
+          "license": "只引用事实（单一测评）"
+        }
+      ],
+      "status": "community"
+    },
+    {
+      "format": "tbc-device-lab/driver@1",
+      "id": "svakom-sl278h",
+      "brand": "司沃康 SVAKOM",
+      "model": "SL278H",
+      "shape": "rabbit",
+      "namePrefix": "SL278",
+      "match": "name",
+      "chips": 1,
+      "ble": {
+        "service": "ffe0",
+        "write": "ffe1",
+        "notify": "ffe2",
+        "writeWithoutResponse": true,
+        "forbidden": [
+          "ae00",
+          "ae01"
+        ]
+      },
+      "handshake": [],
+      "connection": {
+        "exclusive": false,
+        "stopsOnDisconnect": false,
+        "writeGapMs": 60,
+        "ackTimeoutMs": 3000,
+        "officialApp": "SVAKOM App"
+      },
+      "parts": [
+        {
+          "id": "vibrate",
+          "name": "振动",
+          "output": "Vibrate",
+          "expose": true,
+          "steps": 10,
+          "template": "55 03 00 00 {mode} {level} 00",
+          "stop": "55 03 00 00 00 00 00",
+          "mode": {
+            "default": 1,
+            "range": [
+              1,
+              10
+            ]
+          },
+          "group": "motor",
+          "nativePatterns": {
+            "long": {
+              "mode": 1,
+              "stoppable": true
+            }
+          }
+        },
+        {
+          "id": "auto",
+          "name": "自动模式",
+          "output": "Vibrate",
+          "expose": false,
+          "steps": 255,
+          "template": "55 04 00 00 01 {level} aa",
+          "stop": "55 04 00 00 00 00 aa",
+          "group": "motor",
+          "keepaliveMs": 1500,
+          "selfStopMs": 2000,
+          "stopClears": [
+            "vibrate"
+          ],
+          "nativePatterns": {
+            "long": {
+              "mode": "auto",
+              "stoppable": true
+            }
+          }
+        },
+        {
+          "id": "tap",
+          "name": "拍打",
+          "output": "Oscillate",
+          "expose": true,
+          "steps": 7,
+          "template": "55 07 00 00 {level} 00 00",
+          "stop": "55 07 00 00 00 00 00"
+        },
+        {
+          "id": "thrust",
+          "name": "伸缩",
+          "output": "Oscillate",
+          "expose": true,
+          "steps": 7,
+          "template": "55 08 00 00 {level} 00 00",
+          "stop": "55 08 00 00 00 00 00",
+          "strict": [
+            {
+              "index": 5,
+              "equals": 0,
+              "reason": "第 6 字节非 0 时整帧无效"
+            }
+          ]
+        },
+        {
+          "id": "heat",
+          "name": "加热",
+          "output": "Temperature",
+          "expose": true,
+          "steps": 1,
+          "template": "55 05 01 {temp} 00 00 00",
+          "stop": "55 05 00 00 00 00 00",
+          "maxDurationMs": 60000,
+          "temp": {
+            "celsius": 55
+          }
+        }
+      ],
+      "stopAll": {
+        "order": [
+          "vibrate",
+          "auto",
+          "tap",
+          "thrust",
+          "heat"
+        ]
+      },
+      "notify": {
+        "template": "55 fe {cmd} {mode} {level} 00 00"
+      },
+      "transports": {
+        "intiface": {
+          "status": "unverified"
+        }
+      },
+      "sources": [
+        {
+          "id": "sl278h-doc",
+          "url": "https://github.com/wozibile5555-max/SL278H--wodefakeya.md/blob/main/SL278H--wodefakeya.md",
+          "license": "文末声明 MIT，无 LICENSE 文件；只引用事实"
+        },
+        {
+          "id": "svakom-ble-ai",
+          "url": "https://github.com/vickyldr/svakom-ble-ai",
+          "license": "无许可证；只引用事实"
+        },
+        {
+          "id": "buttplug-config",
+          "url": "https://github.com/buttplugio/buttplug/blob/master/crates/buttplug_server_device_config/build-config/buttplug-device-config-v5.json",
+          "license": "BSD-3-Clause"
+        }
+      ],
+      "status": "community"
+    }
+  ];
+
+  return { validateDriver, encode, decode, normUuid, toHex, connectionOf, handshakeOf, requestOptions, connectDriver, driverActuators, LinkError, RISKY_OUTPUTS, nativePatternCaps, DRIVERS };
+})();
+if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkDrivers;
 
 // heartlink runtime — 酒馆助手（JS-Slash-Runner）全局脚本的接线层。依赖前面拼接进来的 HeartlinkCore。
 // 遵循 Tavern Bio-Context 0.3（协议仓库 ../spec）：<bio_context> 块、聊天变量 bio、页面事件 bio:*。
@@ -1548,7 +2569,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
 (function heartlinkRuntime() {
   'use strict';
 
-  const VERSION = '0.18.0';
+  const VERSION = '0.19.0';
   const CONFIG = {
     RUNTIME_KEY: '__HEARTLINK_RUNTIME__',
     PUBLIC_KEY: 'heartlink',
@@ -1585,15 +2606,17 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     // 0.10：触觉输出（TBC v0.3 §5）。默认关；玩具经 Intiface Central
     // profile：null = 用户还没选（按慢热执行，开振动时请用户选）；custom：用户对档位参数的覆盖（TBC v0.3 §5.8）
     // safeWords：可选，缺省关（兴奋时的“受不了”也会被拦，2026-09-17 实测）；词表可自定义
-    HAPTICS: { enabled: false, maxIntensity: 1, fromReplies: true, off: [], profile: null, custom: {}, safeWords: { enabled: false, words: ['停下', '停一下', '先停', '停止', '快停', '别动了', '不要动'] }, intiface: { enabled: false, url: 'ws://127.0.0.1:12345' } },
+    HAPTICS: { enabled: false, maxIntensity: 1, fromReplies: true, off: [], profile: null, custom: {}, safeWords: { enabled: false, words: ['停下', '停一下', '先停', '停止', '快停', '别动了', '不要动'] }, intiface: { enabled: false, url: 'ws://127.0.0.1:12345' },
+      // 按驱动直连：remember 记住连过的型号与名字（不存地址）；estimOn / allowUnstoppable 按设备逐项开启，缺省关
+      direct: { remember: [], estimOn: [], allowUnstoppable: [] } },
     // 玩具本身没有间隔要求，间隔交给档位（§5.8）
     TOY_CAPS: { levels: true, maxIntensity: 1, maxDurationMs: 30000, minIntervalMs: 0, via: 'intiface' },
     ACTUATION_LINE_MS: 10 * 60 * 1000,
     LAB_URL: 'http://127.0.0.1:12346/lab/',   // 设备实验室（~/dev/tbc/device-lab，npm run sim）
   };
   const LOG = '[heartlink]';
-  const GUIDE_BOOK = [{"name":"00 bio_context 读法","enabled":true,"content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","strategy":{"type":"selective","keys":["<bio_context"]},"position":{"type":"after_character_definition","order":100},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.18.0"}},{"name":"10 view=backstage 幕后（旧 mode=author）","enabled":true,"content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","strategy":{"type":"selective","keys":["view=\"backstage\"","mode=\"author\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.18.0"}},{"name":"11 view=in-story 入戏（旧 mode=character）","enabled":true,"content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","strategy":{"type":"selective","keys":["view=\"in-story\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.18.0"}},{"name":"12 view=device-aware 知情","enabled":true,"content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","strategy":{"type":"selective","keys":["view=\"device-aware\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.18.0"}},{"name":"20 feedback 读法","enabled":true,"content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","strategy":{"type":"selective","keys":["feedback("]},"position":{"type":"after_character_definition","order":101},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.18.0"}}];
-  const GUIDE_BOOK_NATIVE = [{"uid":0,"key":["<bio_context"],"keysecondary":[],"comment":"00 bio_context 读法","content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":100,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":0,"heartlink":"0.18.0"},{"uid":1,"key":["view=\"backstage\"","mode=\"author\""],"keysecondary":[],"comment":"10 view=backstage 幕后（旧 mode=author）","content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":1,"heartlink":"0.18.0"},{"uid":2,"key":["view=\"in-story\""],"keysecondary":[],"comment":"11 view=in-story 入戏（旧 mode=character）","content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":2,"heartlink":"0.18.0"},{"uid":3,"key":["view=\"device-aware\""],"keysecondary":[],"comment":"12 view=device-aware 知情","content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":3,"heartlink":"0.18.0"},{"uid":4,"key":["feedback("],"keysecondary":[],"comment":"20 feedback 读法","content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":101,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":4,"heartlink":"0.18.0"}];
+  const GUIDE_BOOK = [{"name":"00 bio_context 读法","enabled":true,"content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","strategy":{"type":"selective","keys":["<bio_context"]},"position":{"type":"after_character_definition","order":100},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.19.0"}},{"name":"10 view=backstage 幕后（旧 mode=author）","enabled":true,"content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","strategy":{"type":"selective","keys":["view=\"backstage\"","mode=\"author\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.19.0"}},{"name":"11 view=in-story 入戏（旧 mode=character）","enabled":true,"content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","strategy":{"type":"selective","keys":["view=\"in-story\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.19.0"}},{"name":"12 view=device-aware 知情","enabled":true,"content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","strategy":{"type":"selective","keys":["view=\"device-aware\""]},"position":{"type":"at_depth","role":"system","depth":0,"order":90},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.19.0"}},{"name":"20 feedback 读法","enabled":true,"content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","strategy":{"type":"selective","keys":["feedback("]},"position":{"type":"after_character_definition","order":101},"recursion":{"prevent_incoming":true,"prevent_outgoing":true},"extra":{"heartlink":"0.19.0"}}];
+  const GUIDE_BOOK_NATIVE = [{"uid":0,"key":["<bio_context"],"keysecondary":[],"comment":"00 bio_context 读法","content":"<bio_context_guide>\n对话中可能出现一个 <bio_context> 块（Tavern Bio-Context v0.3）。首行的 view 是视角（backstage 幕后 / in-story 入戏 / device-aware 知情），以它为准；mode 只是兼容旧读者的旧名。块首行还可能带 device / transport / cadence（采样间隔）/ rr（是否有心跳间期）/ trigger（本轮是新消息、重roll、continue 还是 impersonate）；cadence 越粗（30 秒以上）数据越稀疏，trigger 不是 normal 时 read 相位描述的是上一条被重roll或被续写的回复。它记录屏幕前那位真实读者在上一轮到这一轮之间的心率，按页面事件切成相位；数据来自读者佩戴的心率设备，是真实测量，不是剧情设定。\n相位归属（scope 行）：gen、read、read-pos 是读者等待和阅读**上一条回复**时的身体；write、send 是写**这一条消息**时和发送那一刻的身体。不要把 read 的峰值安到本轮新消息里发生的事情上。字段：\n- baseline：本场基线心率（quiet-median = 安静段中位数；p20 = 全场 20 分位；manual = 手动）与安静时 HRV。\n- prior：非实时来源（官方 API / 健康桥）的日级数据，带日期：昨夜恢复分、HRV、静息心率、睡眠时长、皮温。它说明读者今天的底子，不是此刻的反应；日期不是今天时不要当作今天。\n- history：最近几轮“读回复”的峰值、读时长、HRV，按时间顺序，最右是上一轮。看的是趋势：峰值一轮比一轮高说明越来越投入，越来越低说明在冷却。\n- gen：读者看上一条回复生成期间（ttft 等首字、reasoning 思维链、body 正文）的心率。\n- read：读上一条回复的时长、心率走向 [区间]、峰值出现在回复出完后多少秒、rr-loss（心跳间隔缺失率，越高说明手腕在动、数值可信度越低）、hrv。**这是最能反映读者对上一段内容反应的相位**；峰值时刻大致对应读到的位置。带 flag: too-long 的读回复不可当作阅读反应。\n- read-pos：把 read 的峰值时刻按阅读速度换算成大约读到回复的百分比与段落；est 是估计、cal 是按本场历史校准。它只回答“峰值大约对应哪一段”。写 partial 时表示读者读的时间远不够读完这条回复（在跳读或没读完），只给出峰值在读时长里的相对位置，不要当成段落位置。\n- cov：该相位的样本覆盖率，低于 70% 的相位数据不可靠。\n- write：写消息的时长、字数、停顿、删改与心率。手腕在动，只看大趋势。\n- away：页面切走或长时间无操作的区间，其中的心率与对话无关，忽略。\n- send：按下发送时的心率与相对基线的百分比。\n- env：读者所在房间的温湿度最近值，与身体反应无关，只是环境背景。\n- 其它信号行（如 pressure(civet, 100ms): read 7.9→12.3 kPa …）：读者身上别的传感器在同一相位里的走向，单位随行；只看相对变化，不与心率合成结论。\n- device：读者当前连接的设备正在做什么（强度、模式、持续时间），来自设备控制器的登记；它是作者视角的幕后事实，backstage 模式下角色不知道，in-story 模式下只允许角色察觉由它引起的可观察反应、不点名设备，device-aware 模式下角色知道这台设备、可以明说。\n- series：每 10 秒一个点的原始序列。\n判断尺度：baseline 为 n/a 时不做“比刚才 / 比平时快慢”的比较；与 away 重叠、带 flag 或 cov 低于 70% 的相位不据此判断。相对基线 10% 以内是噪声；持续高 20% 以上且出现在 read 相位，才是明确反应。HRV 明显低于安静值说明绷着或亢奋，明显高说明放松。块内没有结论，解释由你完成；块不出现时忽略本说明。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":100,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":0,"heartlink":"0.19.0"},{"uid":1,"key":["view=\"backstage\"","mode=\"author\""],"keysecondary":[],"comment":"10 view=backstage 幕后（旧 mode=author）","content":"<bio_context> 处于幕后模式（backstage，旧名 author）：它是给你这位作者/裁决者的幕后读者反馈，剧情里任何角色都不知道它，{{user}} 角色的身体状态与它无关。只做三件事：\n1. 从 read 与 history 判断读者对上一段的反应走向（被抓住了 / 平淡 / 正在冷却 / 数据不足），据此决定本段的详略、张力与结尾钩子；预设若有推进 / 节奏模式，结构（跳时、转场、新事件）仍按预设，读者反应只调写法。\n2. 反应上升时顺势推进、加深、留悬念；平淡时换手法（换视角、加冲突、加感官细节、缩短铺垫），不要重复上一段的写法；冷却时给一个新钩子。\n3. 不在正文里提及心率、设备、读者或任何数据；不让角色“察觉”读者；不因数据改变既定事实与规则裁决。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":1,"heartlink":"0.19.0"},{"uid":2,"key":["view=\"in-story\""],"keysecondary":[],"comment":"11 view=in-story 入戏（旧 mode=character）","content":"<bio_context> 处于入戏模式（in-story，旧名 character）：读者代入 {{user}}。send 是 {{user}} 此刻的身体状态；read 是 {{user}} 经历上一段情节时的反应（只能对应上一段里发生的事，不能安到本轮新动作上）。让在场角色通过可观察的线索察觉（呼吸、面色、手、声音、姿态），并按各自性格与关系回应。仍然不说数字、不提设备；gen、write、away 的数据不用于角色感知。首行若有 perceiver 属性（卡片指定的感知者），只让这些角色表达察觉，其他在场角色照常行动、不评论 {{user}} 的身体。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":2,"heartlink":"0.19.0"},{"uid":3,"key":["view=\"device-aware\""],"keysecondary":[],"comment":"12 view=device-aware 知情","content":"<bio_context> 处于知情模式（device-aware）：{{user}} 知道自己戴着设备，在场角色也知道，并能看到这份数据。角色可以引用数字（心率、比平静高多少、昨晚睡了多久），可以像教练或伴侣一样指导 {{user}}：提醒放松或屏住呼吸、问现在的感觉、说明接下来要让设备怎么动；haptics 行为 on 时可以用 <bio_act/>，并可以在正文里明说是自己让设备动的。仍然只描述数据、不替 {{user}} 下结论（不说“你一定很兴奋”），不臆断原因；read 只对应上一段发生的事；gen、write、away 的数据只作参考，不当作 {{user}} 对剧情的反应。首行若有 perceiver 属性，只让这些角色看数据、给指导。","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":90,"position":4,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":0,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":3,"heartlink":"0.19.0"},{"uid":4,"key":["feedback("],"keysecondary":[],"comment":"20 feedback 读法","content":"<bio_context_guide>\n块里的 feedback(…) 行是读者对玩具的操作，以及上一条回复里动作的执行结局，只记录不解释：\n- acts N sent 后面的 done / cut / pending / refused 是走完 / 被停或被打断 / 发送时还在排队 / 被拒，只是执行结局，不代表喜好。\n- stop by reader、skip：这一下不对。下一条不要加码，也不要重复同一模式，除非读者要求。\n- stronger、replay：这一下对了，可以顺着来。weaker：方向对，力度过了。pace 后面是读者换到的节奏档位。\n- stop by device（disconnected 断开、deadline 到时、heat-limit 限温、rate-limit 太频繁）是技术原因，不代表喜好。\n- stop by safeword：按用户的设定处理，下一条不写 <bio_act/>。\n- reply -1 是上一条回复，reply -2 是再早一条；act N 是其中第几个动作，Ns in 是动作开始后多久。\n呈现按视角：backstage 只影响写法；in-story 写成角色察觉到的反应，不提按钮；device-aware 角色可以直接说出读者刚才的操作，例如“你刚才按停了”。\n</bio_context_guide>","constant":false,"vectorized":false,"selective":true,"selectiveLogic":0,"addMemo":true,"order":101,"position":1,"disable":false,"excludeRecursion":true,"preventRecursion":true,"delayUntilRecursion":false,"probability":100,"useProbability":true,"depth":4,"group":"","groupOverride":false,"groupWeight":100,"scanDepth":null,"caseSensitive":false,"matchWholeWords":false,"useGroupScoring":null,"automationId":"","role":0,"sticky":0,"cooldown":0,"delay":0,"displayIndex":4,"heartlink":"0.19.0"}];
   // 1.0：同一份源码构建两种形态——'script' 酒馆助手全局脚本（旧），'extension' 酒馆扩展
   const FORM = 'extension';
   // 开发者工具（设备模拟器按钮等）：发布版关闭
@@ -1667,6 +2690,9 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     const x = Object.assign(d, h || {});
     x.intiface = Object.assign({}, CONFIG.HAPTICS.intiface, (h && h.intiface) || {});
     x.safeWords = Object.assign({}, CONFIG.HAPTICS.safeWords, (h && h.safeWords) || {});
+    x.direct = Object.assign({ remember: [], estimOn: [], allowUnstoppable: [] }, (h && h.direct) || {});
+    x.direct.remember = (Array.isArray(x.direct.remember) ? x.direct.remember : []).filter((r) => r && typeof r.driver === 'string' && typeof r.name === 'string').map((r) => ({ driver: r.driver.slice(0, 64), name: r.name.slice(0, 64) })).slice(-8);
+    for (const k of ['estimOn', 'allowUnstoppable']) x.direct[k] = (Array.isArray(x.direct[k]) ? x.direct[k] : []).map((v) => String(v).slice(0, 160)).slice(0, 50);
     if (!Array.isArray(x.safeWords.words)) x.safeWords.words = CONFIG.HAPTICS.safeWords.words.slice();
     x.safeWords.words = x.safeWords.words.map((w) => String(w).trim()).filter(Boolean).slice(0, 50);
     x.custom = x.custom && typeof x.custom === 'object' ? x.custom : {};
@@ -1800,7 +2826,14 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       guideActive: state.guideActive, multiWindow: state.multiWindow, hostOk: !!(typeof injectPrompts === 'function' || (c && typeof c.setExtensionPrompt === 'function')),
       badInput: state.badInput || 0, invalidBlocks: state.invalidBlocks || 0, guideConflict: state.guideConflict || null,
     });
-    try { d.haptics = { enabled: !!state.haptics.enabled, maxIntensity: state.haptics.maxIntensity, actuators: actuators.list().length, intiface: state.intifaceStatus }; } catch (_) {}
+    try {
+      d.haptics = { enabled: !!state.haptics.enabled, maxIntensity: state.haptics.maxIntensity, actuators: actuators.list().length, intiface: state.intifaceStatus };
+      // 诊断里不写设备型号名（用户会把诊断发出来）：只有驱动 id 与状态
+      const direct = directState().map((l) => ({ driver: l.driver, phase: l.phase, status: l.status, error: l.error, exclusive: l.exclusive, stopsOnDisconnect: l.stopsOnDisconnect, actuators: l.actuators.length, maybeRunning: l.maybeRunning, stopFailed: l.stopFailed, native: l.native.length, ackTimeouts: l.ackTimeouts, battery: l.battery }));
+      if (direct.length) d.haptics.direct = direct;
+      const dp = directProblems();
+      if (dp.length) d.haptics.problems = dp;   // TOY_* 代码登记进协议 §4.4 之前不进 problems（那里是封闭枚举）
+    } catch (_) {}
     return d;
   }
   function exportDiagnostics() { return JSON.stringify(diagnostics(), null, 2); }
@@ -2134,6 +3167,10 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       if (name === 'bio:actuators') { try { emit('bio:output-state', outputState()); } catch (_) {} }
       if (name !== 'bio:actuate') return;
       bridgeSend({ event: 'bio:actuate', detail });
+      if (detail.source === 'stop') {
+        const failed = (detail.results || []).filter((r) => r && r.refused === 'stop-failed');
+        if (failed.length) noteStopFailed(failed);
+      }
       const src = String(detail.source || '');
       if (src.startsWith('reply:')) {
         const e = entryBySource(src);
@@ -2151,13 +3188,17 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     log: (...a) => console.warn(LOG, ...a),
   });
   const toyFeatures = new Map();   // key → feature（带 driver：intiface 或 wasm）
+  const toyBattery = new Map();    // `${source}:${deviceIndex}` → 电量 0–100（v4 InputCmd 读到才有）
+  const toyInputs = new Map();     // key → 能读电量的特性（不是输出，不登记执行器）
   const toyLevels = new Map();     // key → 最近一次发出的档位（0–1，设备卡的实时动效只画这个，不代表设备真的执行了）
   let intiface = null;
   // 每个来源（intiface / wasm）各自同步自己的特性，互不影响
   function syncToys(source, driver, features) {
     const keep = new Set(features.map((f) => f.key));
+    for (const [key, f] of [...toyInputs.entries()]) if (f.source === source && !keep.has(key)) { toyInputs.delete(key); toyBattery.delete(`${f.source}:${f.deviceIndex}`); }
     for (const [key, f] of [...toyFeatures.entries()]) if (f.source === source && !keep.has(key)) { toyFeatures.delete(key); toyLevels.delete(key); actuators.unregister(key); }
     for (const f0 of features) {
+      if (f0.input === 'Battery') { toyInputs.set(f0.key, Object.assign({ source }, f0)); continue; }
       if (toyFeatures.has(f0.key)) continue;
       const f = Object.assign({ source }, f0);
       toyFeatures.set(f.key, f);
@@ -2184,11 +3225,29 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     render();
   }
   const intifaceDriver = { alive: () => !!intiface, setLevel: (f, lv) => intiface.setLevel(f, lv), setPosition: (f, p, ms) => intiface.setPosition(f, p, ms), stop: (f) => intiface.stop(f) };
+  // 玩具电量（v4 InputCmd Read）：连上时读一次，之后每 5 分钟一次；读不到就不显示
+  const BATTERY_EVERY_MS = 300000;
+  let batteryTimer = null;
+  async function readToyBattery() {
+    if (!intiface || typeof intiface.readBattery !== 'function' || !toyInputs.size) return;
+    let changed = false;
+    for (const f of [...toyInputs.values()]) {
+      if (f.source !== 'intiface') continue;
+      try {
+        const v = await intiface.readBattery(f);
+        const k = `${f.source}:${f.deviceIndex}`;
+        if (v == null) continue;
+        if (toyBattery.get(k) !== v) { toyBattery.set(k, v); changed = true; }
+      } catch (_) {}
+    }
+    if (changed) render();
+  }
+
   function startIntiface() {
     if (intiface || typeof host.WebSocket !== 'function') return;
     intiface = HeartlinkHaptics.createIntifaceClient({
       WebSocket: host.WebSocket, url: state.haptics.intiface.url, clientName: `heartlink ${VERSION}`, timers: hTimers,
-      onFeatures: (fs) => syncToys('intiface', intifaceDriver, fs),
+      onFeatures: (fs) => { syncToys('intiface', intifaceDriver, fs); readToyBattery(); },
       onStatus: (st, detail) => {
         const was = state.intifaceStatus; state.intifaceStatus = st; state.intifaceDetail = detail || null;
         if (st === 'connected' && was !== 'connected') toast('success', `已连上 Intiface（协议 v${detail && detail.version}）`);
@@ -2198,6 +3257,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       log: (...a) => console.warn(LOG, ...a),
     });
     intiface.connect();
+    if (!batteryTimer) { batteryTimer = hTimers.setInterval(() => { readToyBattery(); }, BATTERY_EVERY_MS); disposers.push(() => { if (batteryTimer) { hTimers.clearInterval(batteryTimer); batteryTimer = null; } }); }
   }
   function stopIntiface() {
     if (!intiface) return;
@@ -2263,11 +3323,331 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     try { if (WASM.client) { await WASM.client.stopAllDevices().catch(() => {}); await WASM.client.disconnect(); } } catch (_) {}
     WASM.client = null; WASM.devices.clear(); syncToys('wasm', wasmDriver, []); WASM.status = 'idle'; render();
   }
+
+  // ---------- 按 TBC 驱动直连（不经 buttplug wasm；引擎与驱动是 ../device-lab 的副本，见 src/drivers.js） ----------
+  // “浏览器直接连”只有一个入口：先选型号（directModels），有 TBC 驱动的型号走 startDirect，其它型号走 startWasm。
+  // 这一段只有连接管理、指令路径、停止、断线与状态；界面（选型号面板、设备卡、自带模式开关）另做。
+  const DRV = typeof HeartlinkDrivers === 'undefined' ? null : HeartlinkDrivers;
+  const DIRECT = { links: new Map(), seq: 0, stopFailed: [] };
+  const ACK_WINDOW_MS = 60000;      // 最近一分钟内的回执超时次数
+  const ACK_PROBLEM_N = 3;
+  const RECONNECT_TRIES = 6;
+  const RECONNECT_GAP_MS = 5000;
+  const DIRECT_ERROR_TEXT = {
+    EXCLUSIVE_BUSY: (l) => `连不上 ${l.driver.model}：这台设备同时只接受一个连接。先在手机上彻底退出 ${DRV.connectionOf(l.driver).officialApp}，或关掉手机蓝牙。`,
+    OUT_OF_RANGE: (l) => `找不到 ${l.driver.model}：确认已开机、离电脑近一些。`,
+    HANDSHAKE_TIMEOUT: (l) => `${l.driver.model} 没回应：可能官方 App 还连着，或者固件不同。`,
+    CONNECT_FAILED: (l) => `这台设备的服务和 ${l.driver.model} 的驱动对不上，可能不是这个型号。`,
+  };
+  // 型号列表：有驱动的型号 + “其它型号”（走 wasm）。只有界面用，这里先把选择逻辑定下来
+  function directModels() {
+    const list = (DRV ? DRV.DRIVERS : []).filter((d) => d.status !== 'lab-only').map((d) => ({
+      kind: 'driver', id: d.id, name: modelName(d), shape: d.shape || null, namePrefix: d.namePrefix || null,
+      outputs: d.parts.filter((p) => p.expose !== false).map((p) => p.name || PART_OUT_ZH[p.output] || p.output),
+      unverified: d.status !== 'verified',
+      intiface: (d.transports && d.transports.intiface && d.transports.intiface.status) || 'unverified',
+      exclusive: DRV.connectionOf(d).exclusive,
+    }));
+    list.push({ kind: 'wasm', id: 'other', name: '其它型号', outputs: [], unverified: true, intiface: 'official', exclusive: false });
+    return list;
+  }
+  // 用户在选型号面板上点了某一项：有驱动走驱动直连，没有就是原来的 wasm 直连
+  function pickDirect(modelId, opts) {
+    const d = DRV && DRV.DRIVERS.find((x) => x.id === modelId);
+    if (!d && !(opts && opts.driver)) return startWasm();
+    return startDirect(modelId, opts);
+  }
+  const directKey = (link) => `${link.driver.id}:${link.name || ''}`;
+  const directList = () => (state.haptics.direct || {});
+  function directHas(list, key) { return (directList()[list] || []).includes(key); }
+  function directSet(list, key, on) {
+    const cur = (directList()[list] || []).filter((x) => x !== key);
+    if (on) cur.push(key);
+    setHaptics({ direct: Object.assign({}, directList(), { [list]: cur }) });
+  }
+  // 微电流缺省不登记（按设备开启一次，§6）
+  const directEstimOn = (link) => directHas('estimOn', directKey(link));
+  // 停不下来的自带模式：按设备 + 部件逐台开启（§5.9-5），默认关，换设备不继承
+  const directAllows = (link) => link.driver.parts.filter((p) => directHas('allowUnstoppable', `${directKey(link)}:${p.id}`)).map((p) => p.id);
+  function setDirectEstim(linkId, on) { const l = DIRECT.links.get(linkId); if (!l) return false; directSet('estimOn', directKey(l), !!on); rebuildLink(l); return true; }
+  function setDirectUnstoppable(linkId, partId, on) {
+    const l = DIRECT.links.get(linkId);
+    if (!l) return false;
+    const p = l.driver.parts.find((x) => x.id === partId);
+    const n = p && p.nativePatterns && Object.values(p.nativePatterns).find((x) => x.stoppable === false);
+    if (on && !(n && n.maxDurationMs > 0)) return false;                       // 没写最长运行时间的不给开（§5.9-5）
+    if (on && DRV.RISKY_OUTPUTS.includes(p.output)) return false;              // 有风险的输出不许停不下来
+    directSet('allowUnstoppable', `${directKey(l)}:${partId}`, !!on);
+    rebuildLink(l);
+    return true;
+  }
+
+  function noteLinkError(link, err) {
+    const code = err && err.code;
+    if (code === 'ACK_TIMEOUT' || code === 'WRITE_FAILED') {
+      link.acks = (link.acks || []).filter((t) => Date.now() - t < ACK_WINDOW_MS);
+      link.acks.push(Date.now());
+    }
+  }
+  function directEncode(link, partId, level, eo) {
+    const raw = Math.max(0, Math.min(1, Number(level) || 0));
+    link.raw[partId] = raw;
+    // 读者调强调弱（§5.12）：把比例乘在编码这一层，保活重发的帧也跟着变
+    const lv = raw > 0 ? Math.max(0, Math.min(1, raw * (link.gain[partId] == null ? 1 : link.gain[partId]))) : 0;
+    const id = link.idOf[partId];
+    if (id) { toyLevels.set(id, lv); devKick(); }
+    return DRV.encode(link.driver, partId, lv, Object.assign({}, eo, link.conn ? { seq: link.conn.seq.next() } : null));
+  }
+  // 登记这台设备的执行器：握手完成之后才登记，模型在此之前的动作只会得到 unknown-target
+  function buildLink(link) {
+    const driver = link.driver;
+    const estim = directEstimOn(link);
+    const include = driver.parts.filter((p) => p.expose !== false && (p.output !== 'Estim' || estim)).map((p) => p.id);
+    link.lab = DRV.driverActuators(driver, (bytes) => {
+      if (!link.conn) return Promise.reject(new DRV.LinkError('NOT_CONNECTED', `${driver.model} 已断开`));
+      return link.conn.write(bytes).catch((err) => { noteLinkError(link, err); throw err; });
+    }, {
+      timers: hTimers, include, allowUnstoppable: directAllows(link), seq: link.conn.seq, via: 'page', idPrefix: 'direct',
+      encode: (partId, level, eo) => directEncode(link, partId, level, eo),
+      onStopFailed: (info) => { link.stopFailed = [...new Set([...(link.stopFailed || []), info.part])]; render(); },
+      onState: () => { syncLinkState(link); render(); },
+    });
+    registerLink(link);
+  }
+  // 换了“微电流 / 自带模式”开关：重建这台设备的执行器（能力要跟着变）
+  function rebuildLink(link) {
+    if (!link.lab || !link.conn) return;
+    unregisterLink(link);
+    try { link.lab.stopAll(); } catch (_) {}
+    buildLink(link);
+  }
+  function registerLink(link) {
+    const n = [...DIRECT.links.values()].filter((l) => l !== link && l.driver.id === link.driver.id).length;
+    const tag = n ? `${link.driver.id}-${n + 1}` : link.driver.id;   // 同一型号连两台：第二台加序号；id 里不含地址与序列号（§2.6）
+    link.ids = []; link.idOf = {};
+    for (const a of link.lab.actuators) {
+      const id = `direct:${tag}:${a.part}`;
+      const caps = Object.assign({}, a.caps);
+      // 有风险的输出每跑一次至少歇同样长（§5.4-3 允许实现更严）：挡住模型连写好几个 30 秒
+      if (caps.outputs.every((o) => DRV.RISKY_OUTPUTS.includes(o)) && caps.maxDurationMs) caps.minIntervalMs = Math.max(caps.minIntervalMs || 0, caps.maxDurationMs);
+      link.idOf[a.part] = id;
+      link.ids.push(id);
+      actuators.register(id, caps, wrapDirect(link, a));
+    }
+    render();
+  }
+  function unregisterLink(link) {
+    for (const id of link.ids || []) { actuators.unregister(id); toyLevels.delete(id); }
+    link.idWas = Object.assign({}, link.idWas, link.idOf);   // 断线后动作列表还要靠它认出是哪一路
+    link.ids = []; link.idOf = {};
+  }
+  function wrapDirect(link, a) {
+    return (job) => {
+      link.gain[a.part] = 1;
+      if (job.stop) return a.handler(job);
+      if (typeof job.onGain === 'function') job.onGain((g) => {
+        link.gain[a.part] = g;
+        const raw = link.raw[a.part] || 0;
+        if (raw > 0 && link.conn) link.conn.write(directEncode(link, a.part, raw)).catch((err) => noteLinkError(link, err));
+      });
+      return a.handler(job);
+    };
+  }
+  function syncLinkState(link) {
+    const st = link.lab ? link.lab.status() : null;
+    link.maybeRunning = st ? st.maybeRunning.slice() : [];
+    // 参考实现一发停止帧就把 native 清掉，但停不下来的自带模式并不因此停下：
+    // 横幅要留到设备自己的计时结束（§5.9-5），所以这里自己记住 until
+    const now = Date.now();
+    const seen = new Map((link.native || []).filter((n) => n.until > now).map((n) => [n.part, n]));
+    if (st) for (const [pid, p] of Object.entries(st.parts)) {
+      if (p.native && p.native.stoppable === false && p.native.until > now) seen.set(pid, { part: pid, id: link.idOf[pid] || (seen.get(pid) || {}).id || null, until: p.native.until });
+    }
+    link.native = [...seen.values()];
+    if (!link.native.length) link.natStopped = false;
+  }
+
+  async function startDirect(driverId, opts) {
+    const o = opts || {};
+    if (!DRV) { toast('error', '这个版本没有带设备驱动'); return null; }
+    const driver = o.driver || DRV.DRIVERS.find((d) => d.id === driverId);
+    if (!driver) { toast('error', `没有这个型号的驱动：${driverId}`); return null; }
+    const bt = o.bluetooth || bluetooth();
+    if (!bt) { toast('error', NO_BT_TEXT); return null; }
+    const link = { id: `drv-${++DIRECT.seq}`, driver, name: null, device: null, conn: null, lab: null, ids: [], idOf: {},
+      phase: 'picking', error: null, hs: { got: 0, need: (driver.handshake && driver.handshake.expectNotify) || 0 },
+      battery: null, maybeRunning: [], native: [], stopFailed: [], gain: {}, raw: {}, acks: [], tries: 0, bt };
+    DIRECT.links.set(link.id, link);
+    render();
+    let device;
+    try {
+      device = await bt.requestDevice(DRV.requestOptions(driver));   // 必须在用户点击的那个处理函数里同步调用，别先 await 别的东西
+    } catch (err) {
+      DIRECT.links.delete(link.id);
+      render();
+      if (err && err.name === 'NotFoundError') { toast('info', `没有选择设备：在浏览器弹出的列表里选名字以 ${driver.namePrefix} 开头的设备；先退出官方 App、离近一点、用电脑或安卓上的 Chrome / Edge。`); return null; }
+      toast('error', `选择设备失败：${(err && err.message) || err}`);
+      return null;
+    }
+    link.device = device;
+    link.name = device.name || driver.model;
+    // 记住型号与名字给重连用（不存地址）
+    const remember = (directList().remember || []).filter((x) => !(x.driver === driver.id && x.name === link.name));
+    remember.push({ driver: driver.id, name: link.name });
+    setHaptics({ direct: Object.assign({}, directList(), { remember: remember.slice(-8) }) });
+    if (driver.status !== 'verified') toast('info', `${driver.brand} ${driver.model} 的指令来自社区资料，我们没有实测过：先用低强度试。`);
+    return connectLink(link);
+  }
+  async function connectLink(link) {
+    link.phase = link.hs.need ? 'handshake' : 'connecting';
+    link.hs.got = 0;
+    link.error = null;
+    render();
+    try {
+      // onHandshake：设备每回一条通知就更新进度，界面显示“正在准备设备 2/4”
+      link.conn = await DRV.connectDriver(link.driver, link.device, {
+        timers: hTimers,
+        onHandshake: (info) => { link.hs.got = info.got || 0; link.hs.need = info.need || link.hs.need; render(); },
+      });
+    } catch (err) {
+      link.conn = null;
+      link.phase = 'error';
+      if (Number.isInteger(err && err.got)) { link.hs.got = err.got; link.hs.need = err.need; }
+      link.error = { code: (err && err.code) || 'CONNECT_FAILED', message: String((err && err.message) || err) };
+      const text = DIRECT_ERROR_TEXT[link.error.code];
+      toast('error', text ? text(link) : link.error.message);   // 独占设备不自动重试抢占（§5.9-7）
+      render();
+      return null;
+    }
+    link.phase = 'ready';
+    link.tries = 0;
+    link.hs.got = link.hs.need;
+    link.conn.onDisconnect(() => onLinkDown(link));
+    link.conn.readBattery().then((v) => { if (v != null) { link.battery = v; render(); } }).catch(() => {});
+    if (!link.lab) buildLink(link);
+    else {
+      const r = await link.lab.reconnected();   // 重连后第一件事：全部停止，成功了才清掉“可能仍在动”（§5.9-8）
+      syncLinkState(link);
+      if (!r.ok) reportStopFailed(link, r.failed);
+      else link.stopFailed = [];
+      registerLink(link);
+    }
+    toast('success', `已连接 ${link.name}`);
+    render();
+    return link;
+  }
+  function onLinkDown(link) {
+    if (!link.conn) return;
+    link.conn = null;
+    link.phase = 'lost';
+    try { link.lab.disconnected(); } catch (_) {}   // 先记下“断线前在动的部件”，再撤登记（顺序反了就记不到）
+    unregisterLink(link);                       // 断线期间不接动作（模型会得到 unknown-target），重连后先停再重新登记
+    syncLinkState(link);
+    if (link.maybeRunning.length) toast('warning', `${link.name} 已断开，可能仍在动：按设备按钮关掉，或取下设备。重新连接后会先全部停止。`);
+    else toast('warning', `${link.name} 已断开`);
+    render();
+    if (!DRV.connectionOf(link.driver).exclusive) scheduleReconnect(link);   // 独占设备不自动重连：断开多半是官方 App 抢走了
+  }
+  function scheduleReconnect(link) {
+    if (link.phase !== 'lost' || link.tries >= RECONNECT_TRIES) return;
+    link.tries++;
+    link.phase = 'reconnecting';
+    render();
+    hTimers.setTimeout(() => {
+      if (!DIRECT.links.has(link.id) || link.conn) return;
+      link.phase = 'lost';
+      connectLink(link).then((l) => { if (!l && DIRECT.links.has(link.id)) { link.phase = 'lost'; scheduleReconnect(link); } });
+    }, RECONNECT_GAP_MS);
+  }
+  // 用户断开：先全部停止（最多等 2 秒），再断开
+  async function stopDirect(linkId) {
+    const link = DIRECT.links.get(linkId);
+    if (!link) return false;
+    if (link.lab && link.conn) {
+      const done = link.lab.stopAll();
+      const r = await Promise.race([done, new Promise((res) => hTimers.setTimeout(() => res(null), 2000))]);
+      syncLinkState(link);
+      if (r && !r.ok) reportStopFailed(link, r.failed);
+    }
+    unregisterLink(link);
+    try { if (link.conn) link.conn.disconnect(); } catch (_) {}
+    link.conn = null;
+    DIRECT.links.delete(link.id);
+    render();
+    return true;
+  }
+  // 全部停止的设备层（§5.9-9）：执行器层停完之后，每台设备按驱动的 stopAll.order 把所有部件都发一遍停止帧，
+  // 包括没登记成执行器的部件（例如 SL278H 的自动模式、没开启的微电流）
+  function directHaltAll() {
+    for (const link of DIRECT.links.values()) {
+      if (!link.lab || !link.conn) continue;
+      link.lab.stopAll().then((r) => {
+        syncLinkState(link);
+        if (!r.ok) reportStopFailed(link, r.failed);
+        else link.stopFailed = [];
+        render();
+      }).catch(() => {});
+    }
+  }
+  function reportStopFailed(link, failed) {
+    const parts = (failed || []).map((f) => f.part);
+    link.stopFailed = [...new Set([...(link.stopFailed || []), ...parts])];
+    const results = parts.map((p) => ({ id: link.idOf[p] || `direct:${link.driver.id}:${p}`, ok: false, refused: 'stop-failed' }));
+    if (results.length) emit('bio:actuate', { t: Date.now(), target: '*', action: { stop: true }, results, source: 'stop' });
+    render();
+  }
+  // 停止失败（执行器层的 stop 也会走到这里）：记一条设备侧反馈 + 诊断，提示只弹一次
+  function noteStopFailed(results) {
+    DIRECT.stopFailed = [...new Set([...DIRECT.stopFailed, ...results.map((r) => r.id)])];
+    recordDeviceStop('other');
+    toast('error', '停止没有成功：按设备按钮关掉，或取下设备。');
+    render();
+  }
+  // 页面卸载：来不及等回执，同步对每台设备的每个部件发一次停止帧（能发出多少算多少）
+  function directPanicStop() {
+    for (const link of DIRECT.links.values()) {
+      if (!link.conn) continue;
+      const order = (link.driver.stopAll && link.driver.stopAll.order) || link.driver.parts.map((p) => p.id);
+      for (const pid of order) { try { link.conn.write(DRV.encode(link.driver, pid, 0, { seq: link.conn.seq.next() })).catch(() => {}); } catch (_) {} }
+    }
+  }
+  function directState() {
+    return [...DIRECT.links.values()].map((l) => (syncLinkState(l), {
+      id: l.id, driver: l.driver.id, model: `${l.driver.brand} ${l.driver.model}`, status: l.driver.status,
+      phase: l.phase, error: l.error ? l.error.code : null, battery: l.battery,
+      exclusive: DRV ? DRV.connectionOf(l.driver).exclusive : false,
+      stopsOnDisconnect: DRV ? DRV.connectionOf(l.driver).stopsOnDisconnect : false,
+      actuators: (l.ids || []).slice(), maybeRunning: (l.maybeRunning || []).slice(),
+      stopFailed: (l.stopFailed || []).slice(),
+      native: (l.native || []).map((n) => ({ id: n.id, until: n.until, stoppable: false })),
+      ackTimeouts: (l.acks || []).filter((t) => Date.now() - t < ACK_WINDOW_MS).length,
+    }));
+  }
+  // 诊断代码（第 9 节）：协议的 problems 取值是封闭枚举，新代码登记进 §4.4 之前先放在 haptics 下面
+  function directProblems() {
+    const out = [];
+    const add = (code, severity, message, hint) => out.push({ code, severity, message, hint });
+    for (const l of DIRECT.links.values()) {
+      syncLinkState(l);
+      const name = `${l.driver.brand} ${l.driver.model}`;
+      if (l.error && l.error.code === 'EXCLUSIVE_BUSY') add('TOY_EXCLUSIVE_BUSY', 'error', `${name} 同时只接受一个连接`, `先在手机上彻底退出 ${DRV.connectionOf(l.driver).officialApp}，或关掉手机蓝牙`);
+      if (l.error && l.error.code === 'HANDSHAKE_TIMEOUT') add('TOY_HANDSHAKE_TIMEOUT', 'error', `${name} 没有回应初始化帧`, '退出官方 App 后重试；仍不行可能是不同固件');
+      if (l.error && l.error.code === 'OUT_OF_RANGE') add('TOY_OUT_OF_RANGE', 'warn', `${name} 不在范围内`, '确认已开机、离电脑近一些');
+      if ((l.acks || []).filter((t) => Date.now() - t < ACK_WINDOW_MS).length >= ACK_PROBLEM_N) add('TOY_ACK_TIMEOUT', 'warn', `${name} 最近有多帧没收到回执`, '靠近一些；设备可能快没电了');
+      if ((l.maybeRunning || []).length) add('TOY_MAYBE_RUNNING', 'warn', `${name} 断开了，可能还在动`, '按设备按钮关掉或取下；重新连接后会先全部停止');
+      if ((l.stopFailed || []).length) add('TOY_STOP_FAILED', 'error', `${name} 的停止帧重试后仍失败`, '按设备按钮关掉，或取下设备');
+      for (const n of l.native || []) add('TOY_NATIVE_UNSTOPPABLE', 'warn', `${name} 的自带模式正在运行，软件可能停不住`, `可拔出或按设备按钮；还剩 ${Math.max(0, Math.round((n.until - Date.now()) / 1000))} 秒`);
+      if (l.conn && l.driver.status !== 'verified') add('TOY_DRIVER_UNVERIFIED', 'info', `${name} 的驱动只有社区资料，没有实测`, '先用低强度试');
+    }
+    if (DIRECT.links.size && doc.visibilityState === 'hidden') add('TOY_PAGE_HIDDEN', 'warn', '直连设备时酒馆页在后台', '让酒馆页保持在前台，安卓上页面切走会断开');
+    return out;
+  }
   function setHaptics(patch) {
     const pt = patch || {};
     const next = normalizeHaptics(Object.assign({}, state.haptics, pt, {
       intiface: Object.assign({}, state.haptics.intiface, pt.intiface || {}),
       safeWords: Object.assign({}, state.haptics.safeWords, pt.safeWords || {}),
+      direct: Object.assign({}, state.haptics.direct, pt.direct || {}),
       custom: pt.custom === null ? {} : Object.assign({}, state.haptics.custom, pt.custom || {}),
     }));
     const urlChanged = next.intiface.url !== state.haptics.intiface.url;
@@ -2283,16 +3663,27 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
   function outputState() {
     const set = hapticsPolicy();
     const off = new Set(state.haptics.off || []);
-    return {
+    const out = {
       enabled: !!state.haptics.enabled, maxIntensity: state.haptics.maxIntensity,
       profile: set.profile, profileChosen: !!state.haptics.profile,
       settings: { floor: set.floor, defaultMs: set.defaultMs, minIntervalMs: set.minIntervalMs, maxPerReply: set.maxPerReply },
       fromReplies: state.haptics.fromReplies !== false,
       actuators: actuators.list().filter((a) => !off.has(a.id)).length,
     };
+    // 直连设备的额外状态（§5.11）：停不下来的自带模式还剩多久、断线后哪几路可能仍在动
+    const native = [];
+    const maybeRunning = [];
+    for (const l of DIRECT.links.values()) {
+      syncLinkState(l);
+      for (const n of l.native || []) if (n.id) native.push({ id: n.id, until: n.until, stoppable: false });
+      for (const p of l.maybeRunning || []) maybeRunning.push(l.idOf[p] || `direct:${l.driver.id}:${p}`);
+    }
+    if (native.length) out.native = native;
+    if (maybeRunning.length) out.maybeRunning = maybeRunning;
+    return out;
   }
   function getHaptics() {
-    return Object.assign(JSON.parse(JSON.stringify(state.haptics)), { settings: hapticsPolicy(), timers: hTimers.kind, intifaceStatus: state.intifaceStatus, wasmStatus: WASM.status, actuators: actuators.list(), last: actuators.last(), replyLog: (state.replyLog || []).filter((x) => x.chatId === chatId()) });
+    return Object.assign(JSON.parse(JSON.stringify(state.haptics)), { settings: hapticsPolicy(), timers: hTimers.kind, intifaceStatus: state.intifaceStatus, wasmStatus: WASM.status, direct: directState(), actuators: actuators.list(), last: actuators.last(), replyLog: (state.replyLog || []).filter((x) => x.chatId === chatId()) });
   }
   // 块里的 haptics 行（§5.8）：开着时写上限与档位；关着但有设备时写 off
   function hapticsLine() {
@@ -2406,7 +3797,25 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     recordFeedback(Object.assign({ t, from: 'device', type: 'stop', reason }, act ? { act } : {}));
   }
   // 登记表报来的动作结局 → 回复记录的 outcome；设备侧的停止记成反馈
+  // 开发模式：动作开始时给本机设备实验室发一条注解，时间线就不用按帧时序猜（tbc-device-lab/annotate@1）
+  // 只在 DEV_TOOLS 构建里存在；失败静默（实验室没开就当没有）；不带任何身份信息
+  function labAnnotate(ev) {
+    if (!DEV_TOOLS || typeof host.fetch !== 'function') return;
+    const act = ev && ev.actObj;
+    if (!act) return;
+    const body = {
+      format: 'tbc-device-lab/annotate@1', client: 'heartlink', source: String(ev.source || '').slice(0, 64),
+      pattern: act.pattern, intensity: act.intensity, durationMs: act.durationMs || null, output: act.output || '*',
+    };
+    try {
+      host.fetch(new URL('api/annotate', CONFIG.LAB_URL).href, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), keepalive: true,
+      }).catch(() => {});
+    } catch (_) {}
+  }
+
   function onActEvent(ev) {
+    if (ev.type === 'start') labAnnotate(ev);
     const e = entryBySource(ev.source);
     const own = e && String(ev.source).startsWith('reply:') && Number.isInteger(ev.act) && e.outcome && ev.act < e.outcome.length;
     if (own) {
@@ -2604,7 +4013,8 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
       diagnostics, getExposure: () => ({ inject: state.injectEnabled !== false }), setExposure,
       registerActuator: actuators.register, unregisterActuator: actuators.unregister,
       actuate: (target, action, opts) => actuators.actuate(target, action, opts),
-      stop: (id) => actuators.stop(id), actuators: actuators.list,
+      // 不点名的停止也要走设备层（§5.9-9：所有输出逐个发停止，包括没登记成执行器的部件）
+      stop: (id) => { const r = actuators.stop(id); if (!id) directHaltAll(); return r; }, actuators: actuators.list,
       outputState, replyActs: () => JSON.parse(JSON.stringify(chatEntries())),
       // §5.12：第三方（遥控器、玩具 App 桥）也可以报反馈；不合规返回 false
       feedback: (ev) => recordFeedback(ev),
@@ -3177,13 +4587,19 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
         if (round) { round.endedAt = Date.now(); if (updated) round.replyId = lastReply().i; }
         if (updated && REPLY_KINDS.has(kind)) { pushEvent('reply_end', { via }); computeReplyMeta(); bridgeState(); }
         state.continueGen = false;
-        const got = via === 'rendered' ? captureReaderSignal(typeof messageId === 'number' ? messageId : undefined) : false;
+        const got = (via === 'rendered' || via === 'received') ? captureReaderSignal(typeof messageId === 'number' ? messageId : undefined) : false;
         if (!got) host.setTimeout(() => captureReaderSignal(), 1500);   // 兜底：非流式/思维链晚到时再试一次（这次只能等下一次宿主保存）
       } else if (via === 'ended' && state.bgGens.length) state.bgGens.shift();
       if (state.userGenActive) clearInject();   // 0.9.4：用户可见生成结束就撤掉，后台请求不会带上
       state.impersonating = false;
       state.backgroundGen = false; state.userGenActive = false;
     };
+    // 回复结束以“消息收到”为准：宿主先发 MESSAGE_RECEIVED 再发 CHARACTER_MESSAGE_RENDERED（script.js:3740-3741、6632-6634），
+    // 渲染前可能还夹着别的扩展的 await（前端卡、变量框架），用收到的时刻记 reply_end 更接近读者真正开始读的时刻
+    bind(events.MESSAGE_RECEIVED, (messageId, type) => {
+      if (type === 'first_message' || type === 'command' || type === 'impersonate') return;
+      endRound('received', messageId);
+    });
     bind(events.CHARACTER_MESSAGE_RENDERED, (messageId, type) => {
       if (type === 'first_message' || type === 'command') return;   // 问候语、斜杠命令插入的消息不是本轮回复
       endRound('rendered', messageId);
@@ -3240,7 +4656,12 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
     disposers.push(() => doc.removeEventListener('visibilitychange', onVis));
     if (doc.visibilityState === 'hidden') pushEvent('hidden');
     // 没有 Worker 计时时，后台页的计时会被浏览器压慢，玩具可能停不下来：页面一藏起来就全停
-    const onHideStop = () => { if (doc.visibilityState === 'hidden' && hTimers.kind === 'page') { try { actuators.stop(undefined, 'other'); } catch (_) {} } };
+    // 页面藏起来：没有 Worker 计时时后台计时会被压慢，玩具可能停不下来；直连设备在安卓上还会直接断线，所以一律先停
+    const onHideStop = () => {
+      if (doc.visibilityState !== 'hidden') return;
+      if (hTimers.kind === 'page') { try { actuators.stop(undefined, 'other'); } catch (_) {} }
+      if (DIRECT.links.size) { try { directHaltAll(); } catch (_) {} }
+    };
     doc.addEventListener('visibilitychange', onHideStop);
     disposers.push(() => doc.removeEventListener('visibilitychange', onHideStop));
   }
@@ -3258,13 +4679,13 @@ if (typeof module !== 'undefined' && module.exports) module.exports = HeartlinkH
   --bg:var(--SmartThemeBlurTintColor,#141517);--ink:var(--SmartThemeBodyColor,#E9E7E3);
   --raise:#1C1D20;--hair:#2A2B2F;--line2:#3A3B40;--ink2:#B3B0AB;--muted:#8E8C88;--faint:#6A6965;
   --track:#222326;--well:#18191C;--hover:rgba(233,231,227,.06);--off:#626368;
-  --heart:#E0564E;--on:#2E9E91;--on-fill:#1E8378;--on-ink:#3DB2A4;--stop:#C4453D;--warn:#D39A3C;--toy:#D0668C;--toy2:#E58BAB;--heat:#E0784E;
+  --heart:#E0564E;--on:#2E9E91;--on-fill:#1E8378;--on-ink:#3DB2A4;--stop:#C4453D;--warn:#D39A3C;--warn-ink:#E3B062;--toy:#D0668C;--toy2:#E58BAB;--heat:#E0784E;
   --gen:#6E8BA8;--read:#C98A4B;--write:#B87A95;--tint:.10;--tint-live:.18;
   --shadow:0 12px 32px rgba(0,0,0,.32),0 0 0 .5px rgba(0,0,0,.4);
   font-family:var(--font);color:var(--ink);font-variant-numeric:tabular-nums}
 :host(.light){--raise:#FFFFFF;--hair:#E4E1DB;--line2:#D6D2CA;--ink2:#54514C;--muted:#6F6C66;--faint:#8A867F;
   --track:#E9E7E3;--well:#EDEBE7;--hover:rgba(28,27,25,.05);--off:#8A867F;
-  --heart:#C8423A;--on:#1E8378;--on-fill:#1E8378;--on-ink:#1B7A6F;--stop:#C0392F;--warn:#96590F;--toy:#B34D73;--toy2:#C9658B;--heat:#C4582C;
+  --heart:#C8423A;--on:#1E8378;--on-fill:#1E8378;--on-ink:#1B7A6F;--stop:#C0392F;--warn:#96590F;--warn-ink:#7A4E0B;--toy:#B34D73;--toy2:#C9658B;--heat:#C4582C;
   --gen:#56718E;--read:#9A5F24;--write:#985A76;--tint:.09;--tint-live:.16;
   --shadow:0 8px 24px rgba(0,0,0,.10),0 0 0 .5px rgba(0,0,0,.06)}
 :host(.dragging){will-change:transform}
@@ -3329,11 +4750,12 @@ button:focus-visible{outline:2px solid var(--on-ink);outline-offset:2px}
 .d6{width:6px;height:6px;border-radius:50%;display:inline-block;flex:none;background:var(--on)}
 .d6.warn{background:var(--warn)}
 .d6.toy{background:var(--toy)}
+.d6.off{background:var(--faint)}
 .x{margin-left:auto;margin-right:-6px;width:28px;height:28px;border-radius:6px;display:grid;place-items:center;border:0;background:none;padding:0;cursor:pointer;color:var(--muted)}
 .x:hover{background:var(--hover);color:var(--ink)}
 .x svg{width:10px;height:10px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round}
 .sh .x{width:24px;height:24px;margin-right:-7px}
-.stop{display:block;width:100%;height:36px;margin:12px 0 0;border:0;border-radius:8px;background:var(--stop);color:#fff;font:600 13px/20px var(--font);letter-spacing:.04em;cursor:pointer;transition:filter .15s,box-shadow .15s}
+.stop{display:block;width:100%;height:30px;margin:10px 0 0;border:0;border-radius:8px;background:var(--stop);color:#fff;font:600 12px/16px var(--font);letter-spacing:.06em;cursor:pointer;transition:filter .15s,box-shadow .15s}
 :host(.busy) .stop{box-shadow:0 0 0 3px color-mix(in srgb,var(--stop) 22%,transparent)}
 .stop:hover{filter:brightness(1.07)}
 .stop:active{transform:translateY(.5px)}
@@ -3383,7 +4805,8 @@ button:focus-visible{outline:2px solid var(--on-ink);outline-offset:2px}
 .th .m{color:var(--muted);font-size:12px;white-space:nowrap}
 .th .m.w{color:var(--write)}
 .th .m.t{color:var(--toy)}
-.th .m.no{color:var(--warn);white-space:normal}
+.th .m.no{color:var(--warn-ink);white-space:normal}
+.th .m.nw{color:var(--warn-ink);white-space:nowrap}
 .th .r{margin-left:auto;display:flex;align-items:baseline;gap:4px}
 .big{font:600 20px/20px var(--font);letter-spacing:-.01em}
 .tsub{font:12px/16px var(--font);color:var(--muted);margin-top:4px;display:flex;align-items:center;flex-wrap:wrap}
@@ -3448,7 +4871,7 @@ button:focus-visible{outline:2px solid var(--on-ink);outline-offset:2px}
 :host(.devs) .conn .cv{transform:none}
 .devs{display:none;max-height:15em;overflow:auto;padding:0 0 4px}
 :host(.devs) .devs{display:block}
-.devs b{display:block;margin:6px 0 2px;font:600 12px/16px var(--font)}
+.devs b{display:flex;align-items:center;gap:8px;margin:6px 0 2px;font:600 12px/16px var(--font)}
 .devs label{display:flex;gap:8px;align-items:center;cursor:pointer;min-height:24px;font-size:12px}
 .devs label i{font-style:normal;color:var(--muted);font-size:11px}
 .devs input{accent-color:var(--on);margin:0;width:14px;height:14px}
@@ -3477,6 +4900,8 @@ button.dh:hover{background:var(--hover)}
 .art .warm{position:absolute;inset:0;border-radius:9px;opacity:0;background:radial-gradient(circle at 50% 70%,color-mix(in srgb,var(--heat) 40%,transparent),transparent 70%);will-change:opacity}
 .art .cd{position:absolute;right:-2px;bottom:-2px;width:10px;height:10px;border-radius:50%;background:var(--on);box-shadow:0 0 0 2px var(--raise)}
 .dname{flex:1;min-width:0;font:600 13px/18px var(--font);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dbat{flex:none;font:500 11px/16px var(--font);color:var(--dim);font-variant-numeric:tabular-nums}
+.dbat.low{color:var(--warn)}
 .minis{display:flex;align-items:flex-end;gap:2px;height:12px;flex:none}
 .minis i{width:3px;height:12px;border-radius:1.5px;background:var(--faint);transform-origin:50% 100%;transform:scaleY(.35);will-change:transform;transition:background-color .25s}
 .minis i.on{background:var(--toy)}
@@ -3523,10 +4948,123 @@ button.dh:hover{background:var(--hover)}
 .heatv .say.run span{text-shadow:0 0 4px var(--well),0 0 2px var(--well)}
 .fr.on .heatv .say.run{opacity:1}
 .heatv .say.run b{font-weight:600;color:var(--ink);margin-right:2px}
+/* 0.19 浏览器直接连（按 TBC 驱动）：选型号、等浏览器的蓝牙窗口、握手、连不上、断线后可能仍在动、停不下来的自带模式 */
+.pick{margin:4px 0 2px;border:1px solid var(--hair);border-radius:12px;background:var(--raise);overflow:hidden}
+.pick .ph{display:flex;align-items:center;gap:6px;min-height:36px;padding:0 10px;border-bottom:1px solid var(--hair);font:600 12px/16px var(--font)}
+.pick .back{width:24px;height:24px;margin-left:-6px;border:0;border-radius:6px;background:none;display:grid;place-items:center;color:var(--muted);cursor:pointer}
+.pick .back .cv{width:12px;height:12px;margin:0;transform:rotate(90deg)}
+.model{display:flex;align-items:center;gap:10px;width:100%;min-height:52px;padding:6px 10px;border:0;border-top:1px solid var(--hair);background:none;text-align:left;color:var(--ink);cursor:pointer;transition:background-color .15s}
+.model:first-of-type{border-top:0}
+.model:hover{background:var(--hover)}
+.model .mt{flex:1;min-width:0}
+.model b{display:flex;align-items:baseline;gap:0;min-width:0;font:600 13px/18px var(--font)}
+.model b span.n{min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.model .s{display:block;font:11px/15px var(--font);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.model .cv{margin-left:0;transform:rotate(-90deg)}
+.tag{display:inline-block;margin-left:6px;padding:0 5px;border-radius:4px;font:500 10px/15px var(--font);vertical-align:1px;color:var(--warn-ink);background:color-mix(in srgb,var(--warn) 16%,transparent)}
+.pick .ft{padding:8px 10px;border-top:1px solid var(--hair);font:11px/16px var(--font);color:var(--muted)}
+.gen{width:34px;height:34px;flex:none;border-radius:9px;background:var(--well);display:grid;place-items:center;color:var(--ink2)}
+.gen svg{width:18px;height:12px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round}
+.wait{border:1px dashed var(--line2);border-radius:12px;padding:10px 12px;margin:4px 0 2px}
+.wait .wt{display:flex;align-items:center;gap:8px;font:600 12.5px/18px var(--font)}
+.spin2{width:14px;height:14px;flex:none;border-radius:50%;border:2px solid color-mix(in srgb,var(--on-ink) 25%,transparent);border-top-color:var(--on-ink);animation:rot .9s linear infinite}
+@keyframes rot{to{transform:rotate(360deg)}}
+.wait .nm{font-family:var(--mono);font-size:11.5px;padding:0 4px;border-radius:4px;background:var(--track)}
+.wait ul{margin:6px 0 0;padding-left:16px;font:11.5px/17px var(--font);color:var(--ink2)}
+.wait li{margin:1px 0}
+/* 设备卡：连接状态、断线、错误 */
+.dc.lost{border-color:color-mix(in srgb,var(--warn) 60%,transparent)}
+.dc.lost::before,.dc.lost.moving::before{opacity:1;box-shadow:0 0 0 1px color-mix(in srgb,var(--warn) 30%,transparent),0 6px 20px -10px color-mix(in srgb,var(--warn) 55%,transparent)}
+.dc.err{border-color:color-mix(in srgb,var(--stop) 45%,transparent)}
+.dh{min-height:48px;height:auto;padding:6px 10px 6px 8px}
+.dname small{display:block;font:400 11px/15px var(--font);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dname small.w{color:var(--warn-ink);font-weight:500}
+.dname small.e{color:var(--stop);font-weight:500}
+.art svg.shape{width:22px;height:28px;stroke-width:1.6;stroke-linejoin:round}
+.art .cd.warn{background:var(--warn)}
+.art .cd.err{background:var(--stop)}
+.art .cd.pending{background:var(--faint);animation:br 1.2s ease-in-out infinite}
+.lv .mini{border:0;background:none;padding:0;cursor:pointer;color:var(--on-ink);font:500 11px/16px var(--font)}
+.lv .mini:hover{text-decoration:underline;text-underline-offset:2px}
+/* 断线后：斜线底纹 + 断开前的档位 */
+.fr.maybe .viz{background:repeating-linear-gradient(135deg,color-mix(in srgb,var(--warn) 16%,var(--well)) 0 5px,var(--well) 5px 10px)}
+.fr.maybe .viz .say{color:var(--warn-ink);font-weight:500;opacity:1}
+.fr.maybe .viz .chip{padding:0 6px;border-radius:5px;background:var(--well);line-height:16px}
+.fr.maybe .fn{color:var(--ink)}
+.fr.maybe .lv b{color:var(--warn-ink)}
+.fr.maybe .suck .cup,.fr.maybe .suck .core,.fr.maybe .suck .flow{display:none}
+/* 吮吸：左边一个吸口，点阵向它流入 */
+.suck .cup{position:absolute;left:6px;top:3px;width:16px;height:16px;border-radius:50%;border:1.5px solid var(--faint);transition:border-color .25s}
+.suck .core{position:absolute;left:10px;top:7px;width:8px;height:8px;border-radius:50%;background:var(--faint);will-change:transform;transition:background-color .25s}
+.fr.on .suck .cup{border-color:var(--toy)}
+.fr.on .suck .core{background:var(--toy2)}
+.suck .flow{position:absolute;left:28px;right:6px;top:50%;height:4px;margin-top:-2px;overflow:hidden;opacity:.35;transition:opacity .25s;
+  -webkit-mask:linear-gradient(90deg,#000 60%,transparent);mask:linear-gradient(90deg,#000 60%,transparent)}
+.suck .flow i{position:absolute;inset:0 -10px 0 0;background:radial-gradient(circle,var(--faint) 1.2px,transparent 1.5px) 0 50%/10px 4px repeat-x;will-change:transform}
+.fr.on .suck .flow{opacity:1}
+.fr.on .suck .flow i{background-image:radial-gradient(circle,var(--toy) 1.2px,transparent 1.5px)}
+/* 握手进度 */
+.hs{padding:2px 10px 10px 52px}
+.hs .dots{display:flex;gap:4px}
+.hs .dots i{flex:1;height:4px;border-radius:2px;background:var(--track)}
+.hs .dots i.got{background:var(--on)}
+.hs .dots i.now{background:color-mix(in srgb,var(--on) 45%,var(--track));animation:br 1s ease-in-out infinite}
+.hs p{margin:6px 0 0;font:11px/16px var(--font);color:var(--muted)}
+/* 卡内提示（连不上 / 断线 / 停止失败） */
+.cnote{margin:0 10px 10px;padding:8px 10px;border-radius:8px;font:12px/18px var(--font);color:var(--ink)}
+.cnote.e{background:color-mix(in srgb,var(--stop) 10%,transparent)}
+.cnote.w{background:color-mix(in srgb,var(--warn) 12%,transparent)}
+.cnote b{font-weight:600}
+.cnote .acts{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.cnote .acts:first-child{margin-top:0}
+.sbtn{height:28px;padding:0 12px;border-radius:7px;border:1px solid var(--line2);background:var(--raise);font:500 12px/16px var(--font);color:var(--ink);cursor:pointer;transition:filter .15s}
+.sbtn.pri{background:var(--on-fill);border-color:var(--on-fill);color:#fff;font-weight:600}
+.sbtn.danger{border-color:color-mix(in srgb,var(--stop) 70%,transparent);color:var(--stop);font-weight:600}
+.sbtn:hover{filter:brightness(1.05)}
+.sbtn[disabled]{opacity:.6;cursor:default}
+/* 自带模式一行（只有驱动声明了停不下来的自带模式才出现） */
+.nat{display:flex;align-items:center;gap:8px;min-height:36px;border-top:1px solid var(--hair);font:12px/16px var(--font);color:var(--ink)}
+.nat .ns{display:block;font:11px/15px var(--font);color:var(--muted)}
+.nat .switch{margin-left:auto}
+/* 常驻横幅：停不下来的自带模式正在运行 */
+.banner{position:relative;margin-top:8px;border-radius:9px;padding:8px 10px 10px;background:color-mix(in srgb,var(--warn) 14%,var(--bg));border:1px solid color-mix(in srgb,var(--warn) 45%,transparent);overflow:hidden}
+.banner .bt{display:flex;gap:8px;align-items:flex-start}
+.banner .bt>svg{width:14px;height:14px;flex:none;margin-top:3px;fill:none;stroke:var(--warn-ink);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.banner p{margin:0;font:600 12px/18px var(--font);color:var(--ink)}
+.banner .rm{margin-left:auto;flex:none;text-align:right;font:500 11px/14px var(--font);color:var(--warn-ink);white-space:nowrap;padding-top:2px}
+.banner .rm b{display:block;font:650 18px/20px var(--font);letter-spacing:-.01em;white-space:nowrap}
+.banner .rm small{font:500 11px/14px var(--font);margin-left:1px}
+.banner .sub{margin:4px 0 0 22px;font:11.5px/16px var(--font);color:var(--ink2)}
+.banner .prog{margin:8px 0 0 22px;height:3px;border-radius:2px;background:color-mix(in srgb,var(--warn) 22%,transparent);overflow:hidden}
+.banner .prog i{display:block;height:100%;width:100%;background:var(--warn);transform-origin:0 50%;will-change:transform}
+/* 面板里的确认面板（逐台开启微电流 / 自带模式） */
+.scrim{position:absolute;inset:0;z-index:2;background:rgba(8,8,10,.55)}
+:host(.light) .scrim{background:rgba(28,27,25,.28)}
+.sheet{position:absolute;left:0;right:0;bottom:0;z-index:3;background:var(--bg);border-top:1px solid var(--hair);border-radius:14px 14px 13px 13px;padding:6px 14px 14px;box-shadow:0 -10px 30px rgba(0,0,0,.25)}
+:host(.sheet) .card{overflow:hidden}
+.sheet .grab{width:32px;height:4px;border-radius:2px;background:var(--line2);margin:0 auto 10px}
+.sheet h3{margin:0;font:650 14px/20px var(--font)}
+.sheet .who{margin:2px 0 10px;font:12px/16px var(--font);color:var(--muted)}
+.warnbox{display:flex;gap:8px;padding:10px;border-radius:9px;background:color-mix(in srgb,var(--warn) 14%,var(--bg));border:1px solid color-mix(in srgb,var(--warn) 45%,transparent)}
+.warnbox svg{width:16px;height:16px;flex:none;margin-top:1px;fill:none;stroke:var(--warn-ink);stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.warnbox p{margin:0;font:600 12.5px/19px var(--font)}
+.facts{margin:10px 0 0;padding:0;list-style:none;font:12px/18px var(--font);color:var(--ink2)}
+.facts li{position:relative;padding-left:12px;margin:3px 0}
+.facts li::before{content:"";position:absolute;left:2px;top:8px;width:4px;height:4px;border-radius:50%;background:var(--faint)}
+.facts b{color:var(--ink);font-weight:600}
+.sheet .acts{display:flex;gap:8px;margin-top:14px}
+.sheet .acts .sbtn{flex:1;height:34px}
+/* 胶囊：断线后可能仍在动的琥珀点、自带模式的倒计时环 */
+.live.warn{background:var(--warn);box-shadow:0 0 0 2px color-mix(in srgb,var(--warn) 25%,transparent)}
+.ring{display:inline-flex;margin-left:8px;flex:none}
+.ring svg{width:16px;height:16px;transform:rotate(-90deg)}
+.ring circle{fill:none;stroke-width:2.2}
+.ring .bg{stroke:color-mix(in srgb,var(--warn) 25%,transparent)}
+.ring .fg{stroke:var(--warn);stroke-linecap:round}
 @media (prefers-reduced-motion:reduce){
-  .disc.hr.on::after,.live.on,.node.pulse::before,.ntag.pop,:host(.open) .card,.fr.on::before{animation:none!important}
+  .disc.hr.on::after,.live.on,.node.pulse::before,.ntag.pop,:host(.open) .card,.fr.on::before,.spin2,.hs .dots i.now,.art .cd.pending{animation:none!important}
   .disc.hr.on::after{opacity:0}
-  .cv,.switch,.switch::after,.fbtn,.segctl button,.stop,.pill,.btn,.fold,.basemenu button,button.dh,.dc::before,.fr::before,.fn,.lv,.lv b,.viz .say,.osc .range,.osc .kn,.heatv .shim,.heatv .end,.minis i{transition:none!important}
+  .cv,.switch,.switch::after,.fbtn,.segctl button,.stop,.pill,.btn,.fold,.basemenu button,button.dh,.dc::before,.fr::before,.fn,.lv,.lv b,.viz .say,.osc .range,.osc .kn,.heatv .shim,.heatv .end,.minis i,.model,.sbtn,.suck .cup,.suck .core,.suck .flow{transition:none!important}
   .heatv .shim{display:none}
 }
 /* 窄屏（手机）：面板占满宽度、左右各留 8，放在酒馆顶栏下面（top 由 fitPanel 算），避开刘海 */
@@ -3544,6 +5082,16 @@ button.dh:hover{background:var(--hover)}
   const DASH_SVG = '<svg viewBox="0 0 14 2" aria-hidden="true"><line x1="0" x2="14" y1="1" y2="1" style="stroke:var(--faint);stroke-width:1;stroke-dasharray:2 3"/></svg>';
   const RISK_SVG = '<svg viewBox="0 0 9 11" aria-hidden="true"><path d="M4.5 1C5 3 7.8 4.4 7.8 7a3.3 3.3 0 0 1-6.6 0c0-1.3.7-2.1 1.3-2.6.1 1 .6 1.6 1.2 1.8C3.4 4.6 3.9 2.6 4.5 1z"/></svg>';
   const CLOCK_SVG = '<svg viewBox="0 0 12 12" aria-hidden="true"><circle cx="6" cy="6" r="4.5"/><path d="M6 3.6V6l1.6 1"/></svg>';
+  const WARN_SVG = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1.8 15 14H1z"/><path d="M8 6.2v3.6M8 11.9v.2"/></svg>';
+  // 设备线稿（没有产品图时按驱动的 shape 画）：驱动里现有 egg / rabbit，其它一律按摩棒
+  const SHAPE_SVG = {
+    egg: '<path d="M24 6c9 0 15 13 15 25 0 11-7 17-15 17S9 42 9 31C9 19 15 6 24 6z"/><path d="M24 48c0 5 2 8 6 10"/><circle cx="30" cy="58" r="1.5"/>',
+    rabbit: '<path d="M16 60V30c0-12 3-24 8-24s8 12 8 24v30z"/><path d="M32 40c5-2 8-8 9-14 1-4-1-6-3-4-3 3-5 9-6 12"/><path d="M20 48h8"/>',
+    wand: '<path d="M24 6c6 0 10 5 10 11s-4 10-10 10-10-4-10-10S18 6 24 6z"/><path d="M19 27v27a5 5 0 0 0 10 0V27"/>',
+  };
+  const shapeArt = (s) => `<svg class="shape" viewBox="0 0 48 64" aria-hidden="true">${SHAPE_SVG[s] || SHAPE_SVG.wand}</svg>`;
+  // 型号名按读者认得的写法：品牌只留中文那段，型号去掉括号里的英文名（繁野 FUNF 啵啵贝（SOSEXY）→ 繁野 啵啵贝）
+  const modelName = (d) => `${String(d.brand || '').split(' ')[0]} ${String(d.model || '').replace(/[（(][^）)]*[）)]/g, '').trim()}`.trim();
   // 反馈按钮：[类型, 按钮字, 按下后约 2 秒的确认字]
   const FB_BTNS = [['weaker', '弱一点', '已调弱'], ['stronger', '强一点', '已调强'], ['replay', '再来一次', '已重放'], ['skip', '跳过', '已跳过']];
   const FB_BY = Object.fromEntries(FB_BTNS.map((b) => [b[0], b]));
@@ -3568,6 +5116,11 @@ button.dh:hover{background:var(--hover)}
     </div>
     <div data-pane="toy">
       <button class="stop" data-act="halt" title="立即停止所有玩具（也可用 /hl-stop 或 Alt+Shift+S）">全部停止</button>
+      <div class="banner" data-f="natBanner" role="status" hidden>
+        <div class="bt">${WARN_SVG}<p>自带模式运行中，软件可能停不住，可拔出或按设备按钮</p><span class="rm">还剩<b><span data-f="natLeft">0</span><small>秒</small></b></span></div>
+        <div class="sub" data-f="natSub"></div>
+        <div class="prog"><i data-f="natProg"></i></div>
+      </div>
       <div class="fb" data-f="fb" role="group" aria-label="调整正在动的动作">${fbBtns}</div>
     </div>
   </div>
@@ -3638,9 +5191,11 @@ button.dh:hover{background:var(--hover)}
         <button class="conn" data-act="devs" data-f="connRow"><span>连接设备</span><span class="r"><i class="d6"></i><span data-f="connTxt">已连接</span>${CV_SVG}</span></button>
         <div class="row2" data-f="connBtns">
           <button class="btn" data-act="toy" title="先装好 Intiface Central、点 Start Server 并在里面连上玩具">通过 Intiface<small class="rec" data-f="out">推荐</small></button>
-          <button class="btn" data-act="wasm" title="不装 Intiface：Chrome 直接用蓝牙连玩具（支持的型号与 Intiface 相同）。还没有经过真实设备验证">浏览器直接连<small data-f="wasmState">测试</small></button>
+          <button class="btn" data-act="direct" title="不装 Intiface：Chrome 用蓝牙直接连玩具。点开先选型号">浏览器直接连<small data-f="wasmState">不装软件</small></button>
           ${DEV_TOOLS ? '<button class="btn full" data-act="lab" title="打开设备模拟器小窗口（本机 device-lab，先运行 npm run sim）">设备模拟器</button>' : ''}
         </div>
+        <div class="pick" data-f="pick" hidden></div>
+        <div class="wait" data-f="wait" hidden></div>
         <div class="devs" data-f="devs"></div>
       </div>
     </div>
@@ -3653,6 +5208,8 @@ button.dh:hover{background:var(--hover)}
     <button data-act="hide">隐藏悬浮窗</button>
     <span class="ver">v${VERSION}<span data-f="foot"></span></span>
   </div>
+  <div class="scrim" data-f="scrim" hidden></div>
+  <div class="sheet" data-f="sheet" role="dialog" aria-modal="true" hidden></div>
 </div>
 <div class="pill" part="pill" title="heartlink">
   <span class="seg" data-seg="hr">
@@ -3663,12 +5220,13 @@ button.dh:hover{background:var(--hover)}
     <span class="mode">未连接</span>
   </span>
   <span class="psep"></span>
-  <span class="seg" data-seg="toy"><span class="disc toy">${WAVE_SVG}</span><span class="num" data-f="tn">--</span><span class="unit">路</span><span class="live" title="正在动"></span></span>
+  <span class="seg" data-seg="toy"><span class="disc toy">${WAVE_SVG}</span><span class="num" data-f="tn">--</span><span class="unit">路</span><span class="live" data-f="live" title="正在动"></span><span class="ring" data-f="ring" title="自带模式还在跑" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><circle class="bg" cx="8" cy="8" r="6"/><circle class="fg" data-f="ringFg" cx="8" cy="8" r="6" stroke-dasharray="37.7" stroke-dashoffset="0"/></svg></span></span>
   <span class="seg" data-seg="none"><span class="disc hr off">${HEART_SVG}</span><span class="act">连接设备</span></span>
 </div>`;
     const q = (s) => root.querySelector(s);
     el = { heart: q('[data-seg="hr"] .disc'), poly: q('.spark path'), sparkRef: q('.spark .ref'), delta: q('.delta'), tag: q('[data-seg="hr"] .mode'), pill: q('.pill'), spark: q('.spark') };
-    ['bpm', 'tn', 'head', 'fb', 'base', 'hrv', 'last', 'hrvLine', 'dev', 'out', 'sig', 'sigBox', 'foot', 'hrBadge', 'toyBadge', 'hrEmpty', 'hrLive', 'hrDot', 'hrState', 'batt', 'plist', 'pnote', 'baseMenu', 'modeHint', 'hrTools', 'hrFold', 'toyFold', 'hrFoldSec', 'toyFoldSec', 'toyEmpty', 'toyTiles', 'now', 'lastact', 'fbnote', 'devSec', 'dcards', 'wasmState', 'help', 'devs', 'helpBtn', 'sees', 'ptext', 'body', 'play', 'playBtn', 'connRow', 'connTxt', 'connBtns']
+    ['bpm', 'tn', 'head', 'fb', 'base', 'hrv', 'last', 'hrvLine', 'dev', 'out', 'sig', 'sigBox', 'foot', 'hrBadge', 'toyBadge', 'hrEmpty', 'hrLive', 'hrDot', 'hrState', 'batt', 'plist', 'pnote', 'baseMenu', 'modeHint', 'hrTools', 'hrFold', 'toyFold', 'hrFoldSec', 'toyFoldSec', 'toyEmpty', 'toyTiles', 'now', 'lastact', 'fbnote', 'devSec', 'dcards', 'wasmState', 'help', 'devs', 'helpBtn', 'sees', 'ptext', 'body', 'play', 'playBtn', 'connRow', 'connTxt', 'connBtns',
+      'pick', 'wait', 'scrim', 'sheet', 'natBanner', 'natLeft', 'natSub', 'natProg', 'live', 'ring', 'ringFg']
       .forEach((f) => { el[f] = q(`[data-f="${f}"]`); });
     el.folds = [...root.querySelectorAll('[data-act="fold"]')];
     el.fbBtns = [...root.querySelectorAll('[data-fb]')];
@@ -3676,12 +5234,11 @@ button.dh:hover{background:var(--hover)}
     el.body.addEventListener('scroll', () => syncMore(), { passive: true });
     el.seg = { hr: q('[data-seg="hr"]'), toy: q('[data-seg="toy"]'), none: q('[data-seg="none"]') };
     el.segsep = q('.psep');
-    el.live = q('.live');
     el.tabs = [...root.querySelectorAll('[data-tab]')];
     el.panes = [...root.querySelectorAll('[data-pane]')];
     el.sets = [...root.querySelectorAll('[data-set]')];
     el.injSw = q('[data-act="inject"]'); el.vibSw = q('[data-act="vib"]');
-    el.toyBtn = q('[data-act="toy"]'); el.wasmBtn = q('[data-act="wasm"]');
+    el.toyBtn = q('[data-act="toy"]'); el.wasmBtn = q('[data-act="direct"]');
     el.devs.addEventListener('change', (e) => {
       const id = e.target && e.target.getAttribute('data-id');
       if (!id) return;
@@ -3694,6 +5251,7 @@ button.dh:hover{background:var(--hover)}
       const tabBtn = t.closest && t.closest('[data-tab]');
       if (tabBtn) { state.badgeTab = tabBtn.getAttribute('data-tab'); return render(); }
       if (t.closest && t.closest('[data-close]')) { closePanel(); return; }
+      if (sheet && t.closest && t.closest('[data-f="scrim"]')) { closeSheet(); return; }
       const fbBtn = t.closest && t.closest('[data-fb]');
       if (fbBtn) { quickFeedback(fbBtn.getAttribute('data-fb')); return; }
       const devBtn = t.closest && t.closest('[data-devtoggle]');
@@ -3724,7 +5282,38 @@ button.dh:hover{background:var(--hover)}
           else toast('info', hTimers.kind === 'worker' ? '模拟器已在小窗口打开' : '模拟器已打开；这个浏览器切走酒馆页时强度帧会变慢');
           return;
         }
-        if (act === 'wasm') { if (WASM.client) { stopWasm(); toast('info', '已断开浏览器直接连'); } else { toast('info', '测试功能：正在加载直连组件，稍后弹出蓝牙设备选择'); startWasm(); } return; }
+        // 浏览器直接连：先选型号。点型号的这一次点击就是用户手势，所以 pickDirect 里的 requestDevice 必须同步走到（中间不 await 别的）
+        if (act === 'direct') { pickOpen = !pickOpen; return render(); }
+        if (act === 'pickBack') { pickOpen = false; return render(); }
+        if (act === 'pick') {
+          pickOpen = false;
+          const id = btn.getAttribute('data-model');
+          if (id === 'other') { toast('info', '正在加载直连组件，稍后弹出蓝牙设备选择'); startWasm(); } else pickDirect(id);
+          return render();
+        }
+        if (act === 'retry' || act === 'reconnect') { const l = DIRECT.links.get(btn.getAttribute('data-link')); if (l) { l.tries = 0; connectLink(l); } return render(); }
+        if (act === 'swap') { const l = DIRECT.links.get(btn.getAttribute('data-link')); if (l) DIRECT.links.delete(l.id); pickOpen = true; return render(); }
+        if (act === 'restop') { const l = DIRECT.links.get(btn.getAttribute('data-link')); if (l && l.lab) { l.stopFailed = []; l.lab.stopAll().then((r) => { syncLinkState(l); if (r && !r.ok) reportStopFailed(l, r.failed); render(); }).catch(() => {}); } return render(); }
+        if (act === 'dcut') { stopDirect(btn.getAttribute('data-link')); return; }
+        // 微电流 / 停不下来的自带模式：逐台开启，开之前确认一次；关掉不用确认
+        if (act === 'estim') { const l = DIRECT.links.get(btn.getAttribute('data-link')); if (l) { sheet = { kind: 'estim', link: l }; } return render(); }
+        if (act === 'nat') {
+          const l = DIRECT.links.get(btn.getAttribute('data-link'));
+          const part = btn.getAttribute('data-part');
+          if (!l) return;
+          if (btn.getAttribute('aria-checked') === 'true') { setDirectUnstoppable(l.id, part, false); toast('info', '已关掉自带模式'); return render(); }
+          if (!state.haptics.enabled) { toast('warning', '先打开“剧情联动”，再开启自带模式'); return render(); }
+          sheet = { kind: 'nat', link: l, part };
+          return render();
+        }
+        if (act === 'sheetNo') { closeSheet(); return; }
+        if (act === 'sheetYes') {
+          const s = sheet;
+          if (s && s.kind === 'estim') { setDirectEstim(s.link.id, true); toast('warning', '微电流已开启：只有回复里点名才会动'); }
+          else if (s && setDirectUnstoppable(s.link.id, s.part, true)) toast('warning', '已开启自带模式：运行中软件可能停不住');
+          closeSheet();
+          return;
+        }
         if (act === 'inject') { setExposure({ inject: state.injectEnabled === false }); toast('info', state.injectEnabled === false ? '已停止发给模型' : '已恢复发给模型'); return; }
         if (act === 'vib') { const on = !state.haptics.enabled; setHaptics({ enabled: on }); if (on) askProfile(); toast(on ? 'warning' : 'info', on ? '剧情联动已打开' : '剧情联动已关闭，玩具已停'); return; }
         if (act === 'toy') { const on = !state.haptics.intiface.enabled; setHaptics({ intiface: { enabled: on } }); toast('info', on ? '正在连接 Intiface（先在 Intiface Central 里点 Start Server）' : '已断开 Intiface'); return; }
@@ -3753,6 +5342,7 @@ button.dh:hover{background:var(--hover)}
       else { state.badgeTab = 'hr'; hostEl.classList.add('open'); }
       render();
     });
+    root.addEventListener('keydown', (e) => { if (sheet && e && e.key === 'Escape') { e.stopPropagation(); closeSheet(); } });
     doc.body.appendChild(hostEl);
     placeBadge();
     hostEl.classList.toggle('hidden', !!state.badgeHidden);
@@ -3804,7 +5394,10 @@ button.dh:hover{background:var(--hover)}
   function haltAll(via) {
     const had = actuators.list().some((a) => a.busy) || actuators.pending() > 0;
     const cur = had ? activeAct() : null;
+    // 正在跑停不下来的自带模式：停止帧照常发，但横幅不撤，改成“已发送停止”（§5.9-5）
+    for (const l of DIRECT.links.values()) if ((l.native || []).length) l.natStopped = true;
     actuators.stop();
+    directHaltAll();   // 设备层：每台直连设备把所有部件（包括没登记的）都停一遍
     if (had) recordFeedback(Object.assign({ t: Date.now(), from: 'reader', type: 'stop' }, cur && cur.ref ? { act: cur.ref } : {}));
     if (via === 'button') closePanel();
     toast('info', '已停止所有设备');
@@ -3893,7 +5486,8 @@ button.dh:hover{background:var(--hover)}
   function closePanel() {
     if (!hostEl) return;
     const was = hostEl.classList.contains('open');
-    hostEl.classList.remove('open', 'help', 'devs');
+    hostEl.classList.remove('open', 'help', 'devs', 'sheet');
+    sheet = null; pickOpen = false;
     state.badgeTab = null;
     if (was) render();
   }
@@ -4116,6 +5710,178 @@ button.dh:hover{background:var(--hover)}
     htmlCache.set(node, html);
     node.innerHTML = html;
   }
+  // ---------- 0.19：浏览器直接连的界面（效果图 ../docs/driver-direct/mockup.html 十张图，2026-09-18 批准） ----------
+  // 一个“浏览器直接连”按钮 → 选型号（有 TBC 驱动的走 startDirect，其它型号走 buttplug wasm）→ 浏览器自己的蓝牙窗口 →
+  // 握手进度 → 设备卡（吮吸动效、微电流逐台开启、断线“可能仍在动”、停不下来的自带模式逐台开启与常驻横幅）。
+  let pickOpen = false;        // 选型号面板开着
+  let sheet = null;            // 确认面板：{ kind:'estim'|'nat', link, part }
+  let natTimer = 0;            // 自带模式运行中：每秒重画一次（面板收起时胶囊的倒计时环也要走）
+  const PART_OUT_ZH = { Vibrate: '振动', Oscillate: '往复', Rotate: '旋转', Constrict: '吮吸', HwPositionWithDuration: '抽动', Position: '位置', Estim: '微电流', Temperature: '加热', Spray: '喷', Led: '灯' };
+  // 停不下来的自带模式：这一路的 { mode, maxDurationMs }，没有就是 null（现有两份正式驱动都没有，界面自然不出现）
+  function unstoppableOf(p) {
+    const all = Object.values((p && p.nativePatterns) || {}).concat((p && p.nativeModes) || []);
+    return all.find((n) => n && n.stoppable === false && n.maxDurationMs > 0) || null;
+  }
+  function natRunning() {
+    const out = [];
+    for (const l of DIRECT.links.values()) {
+      for (const n of l.native || []) {
+        if (n.until <= Date.now()) continue;
+        const p = l.driver.parts.find((x) => x.id === n.part);
+        const u = unstoppableOf(p);
+        out.push({ link: l, part: n.part, name: (p && p.name) || n.part, device: modelName(l.driver), until: n.until, max: (u && u.maxDurationMs) || 0, stopped: !!l.natStopped });
+      }
+    }
+    return out;
+  }
+  // 横幅与胶囊倒计时环：renderNow 每秒画一次，面板开着时 devFrame 再按帧补平滑
+  function paintNat(n, rm) {
+    const left = Math.max(0, n.until - Date.now());
+    const secs = String(Math.ceil(left / 1000));
+    if (el.natLeft.textContent !== secs) el.natLeft.textContent = secs;
+    const frac = n.max > 0 ? Math.max(0, Math.min(1, left / n.max)) : 0;
+    const step = n.max > 0 ? Math.ceil(left / 1000) / Math.max(1, Math.round(n.max / 1000)) : 0;
+    el.natProg.style.transform = `scaleX(${(rm ? step : frac).toFixed(4)})`;
+    el.ringFg.setAttribute('stroke-dashoffset', (37.7 * (1 - frac)).toFixed(2));
+    const sub = n.stopped ? '已发送停止，设备可能不理会，会一直运行到计时结束。' : `${n.device} · ${n.name}`;
+    if (el.natSub.textContent !== sub) el.natSub.textContent = sub;
+  }
+  function syncNatTimer() {
+    const on = natRunning().length > 0;
+    if (on && !natTimer) natTimer = host.setInterval(() => render(), 1000);
+    else if (!on && natTimer) { host.clearInterval(natTimer); natTimer = 0; }
+  }
+  // 选型号：驱动型号在前（旁边标“未核实”），最后一项“其它型号”走 buttplug wasm
+  function pickerHtml() {
+    const rows = directModels().map((m) => {
+      const art = m.kind === 'driver' ? `<span class="art"><span class="fig">${shapeArt(m.shape)}</span></span>` : `<span class="gen">${WAVE_SVG}</span>`;
+      const tag = m.kind === 'driver' && m.unverified ? '<span class="tag">未核实</span>' : '';
+      const sub = m.kind === 'driver'
+        ? (m.outputs || []).join(' · ') + (m.intiface === 'none' ? ' · 只能直接连' : m.intiface === 'official' ? ' · 也可以用 Intiface' : '')
+        : '和 Intiface 支持的型号一样';
+      return `<button class="model" data-act="pick" data-model="${esc(m.id)}">${art}<span class="mt"><b><span class="n">${esc(m.name)}</span>${tag}</b><span class="s">${esc(sub)}</span></span>${CV_SVG}</button>`;
+    }).join('');
+    return `<div class="ph"><button class="back" data-act="pickBack" aria-label="返回">${CV_SVG}</button>浏览器直接连 · 选型号</div>${rows}`
+      + '<div class="ft">“未核实”：指令来自社区资料，还没有实测。第一次先用低强度试。</div>';
+  }
+  // 等浏览器自己的蓝牙窗口：告诉读者该选哪个名字、连不上先查什么
+  function waitHtml(link) {
+    const conn = DRV.connectionOf(link.driver);
+    const li = [conn.exclusive ? `先在手机上彻底退出 ${esc(conn.officialApp)}` : null, '设备开机，离电脑近一些', '电脑或安卓上的 Chrome / Edge；iPhone 暂不支持'].filter(Boolean);
+    return `<div class="wt"><span class="spin2" aria-hidden="true"></span>在浏览器的列表里选 <span class="nm">${esc(link.driver.namePrefix || link.driver.model)}</span></div>`
+      + `<ul>${li.map((x) => `<li>${x}</li>`).join('')}</ul>`;
+  }
+  // 连不上：说清原因和下一步，由读者点重试（独占设备不自动抢占，§5.9-7）
+  function linkErrorNote(link) {
+    const conn = DRV.connectionOf(link.driver);
+    const e = link.error || {};
+    const again = `<button class="sbtn pri" data-act="retry" data-link="${esc(link.id)}">重试</button>`;
+    const swap = `<button class="sbtn" data-act="swap" data-link="${esc(link.id)}">换型号</button>`;
+    if (e.code === 'EXCLUSIVE_BUSY') return { text: `<b>这台设备同时只接受一个连接。</b>先在手机上彻底退出 ${esc(conn.officialApp)}，或关掉手机蓝牙，再点重试。`, acts: again + swap };
+    if (e.code === 'HANDSHAKE_TIMEOUT') return { text: `<b>设备没回应：只收到 ${link.hs.got}/${link.hs.need} 条回应。</b>可能 ${esc(conn.officialApp)} 还连着，或者固件不同。`, acts: again + swap };
+    if (e.code === 'OUT_OF_RANGE') return { text: '<b>找不到设备。</b>确认已开机、离电脑近一些。', acts: again + swap };
+    return { text: `<b>这台设备的服务和 ${esc(link.driver.model)} 的驱动对不上。</b>可能不是这个型号。`, acts: swap };
+  }
+  // 一台直连设备 → 一张设备卡的数据；握手完成前也有卡片（显示进度），所以不从执行器列表算
+  function directCardModel(link) {
+    const unver = link.driver.status !== 'verified';
+    const lost = link.phase === 'lost' || link.phase === 'reconnecting';
+    const maybe = new Set(link.maybeRunning || []);
+    const failed = new Set(link.stopFailed || []);
+    const estimOn = directEstimOn(link);
+    const now = Date.now();
+    const natOn = new Set((link.native || []).filter((n) => n.until > now).map((n) => n.part));
+    const feats = [];
+    // 连接 / 握手 / 连不上的时候不列部件：那几步读者要看的是进度和下一步，不是档位
+    const showParts = link.phase === 'ready' || lost;
+    for (const p of showParts ? link.driver.parts : []) {
+      if (p.expose === false) continue;
+      const off = p.output === 'Estim' && !estimOn;
+      const stopBad = failed.has(p.id) || (link.natStopped && natOn.has(p.id));
+      const wasOn = !stopBad && maybe.has(p.id);
+      feats.push({
+        id: link.idOf[p.id] || `${link.id}:${p.id}`, link: link.id, part: p.id, label: p.name || p.id,
+        output: p.output, risky: DRV.RISKY_OUTPUTS.includes(p.output), steps: p.steps, frames: true, off,
+        kind: off ? 'none' : p.output === 'Constrict' ? 'suck' : vizKind(p.output),
+        maybeTxt: stopBad ? '已发停止 · 可能仍在动' : null,
+        maybe: wasOn ? Math.round((link.raw[p.id] || 0) * p.steps) : null,
+        maybePct: Math.round((link.raw[p.id] || 0) * 100),
+      });
+    }
+    // 自带模式一行：只有驱动声明了“停不下来”才出现；名字只在有多路时才带上部件
+    const natParts = showParts ? link.driver.parts.filter((p) => p.expose !== false && !DRV.RISKY_OUTPUTS.includes(p.output) && unstoppableOf(p)) : [];
+    const nat = natParts.map((p) => {
+      const u = unstoppableOf(p);
+      const on = directHas('allowUnstoppable', `${directKey(link)}:${p.id}`);
+      const label = natParts.length > 1 ? `${p.name || p.id}的自带模式` : '自带模式';
+      return `<div class="nat"><span>${esc(label)}<span class="ns">启动后最长运行 ${Math.round(u.maxDurationMs / 1000)} 秒</span></span>`
+        + `<button class="switch" role="switch" aria-checked="${on}" aria-label="${esc(label)}" data-act="nat" data-link="${esc(link.id)}" data-part="${esc(p.id)}"></button></div>`;
+    }).join('');
+    let sub = `浏览器直接连${unver ? ' · 未核实' : ''}`;
+    let subCls = ''; let cd = '';
+    if (link.phase === 'picking') { sub = '正在选择设备'; cd = 'pending'; }
+    else if (link.phase === 'connecting') { sub = '正在连接'; cd = 'pending'; }
+    else if (link.phase === 'handshake') { sub = `正在准备设备 ${link.hs.got}/${link.hs.need}`; cd = 'pending'; }
+    else if (link.phase === 'reconnecting') { sub = '重连中'; subCls = 'w'; cd = 'warn'; }
+    else if (link.phase === 'lost') { sub = maybe.size ? '已断开 · 可能仍在动' : '已断开'; subCls = 'w'; cd = 'warn'; }
+    else if (link.phase === 'error') { sub = '连不上'; subCls = 'e'; cd = 'err'; }
+    let note = '';
+    if (link.phase === 'error') { const n = linkErrorNote(link); note = `<div class="cnote e">${n.text}<div class="acts">${n.acts}</div></div>`; }
+    else if (failed.size) note = `<div class="cnote e"><b>停止没有成功。</b>按设备按钮关掉，或取下设备。<div class="acts"><button class="sbtn pri" data-act="restop" data-link="${esc(link.id)}">再停一次</button></div></div>`;
+    else if (lost) {
+      const busy = link.phase === 'reconnecting';
+      const txt = maybe.size ? '按设备按钮关掉，或取下设备。重连后会先全部停止。' : '';
+      note = `<div class="cnote w">${txt}<div class="acts"><button class="sbtn pri" data-act="reconnect" data-link="${esc(link.id)}"${busy ? ' disabled' : ''}>${busy ? '重连中…' : '重新连接'}</button></div></div>`;
+    }
+    return {
+      key: `dl:${link.id}`, name: modelName(link.driver), battery: link.battery,
+      shape: link.driver.shape, sub, subCls, cd, note, nat, feats,
+      lost, err: link.phase === 'error',
+      hs: link.phase === 'handshake' && link.hs.need ? { got: link.hs.got, need: link.hs.need, text: `已发送初始化指令，等设备回应（最多 ${Math.round((DRV.handshakeOf(link.driver).timeoutMs || 2000) / 1000)} 秒）` } : null,
+      sig: JSON.stringify([link.id, link.name, link.battery, sub, subCls, cd, note, nat, link.phase,
+        feats.map((f) => [f.id, f.label, f.kind, f.steps, f.risky, f.off, f.maybe, f.maybeTxt, f.maybePct])]),
+    };
+  }
+  // 确认面板：逐台开启微电流 / 停不下来的自带模式（警告原文照用，§5.9-5）
+  function sheetHtml(s) {
+    const link = s.link;
+    const who = `${esc(modelName(link.driver))} · 只对这一台`;
+    const cancel = '<button class="sbtn" data-act="sheetNo" data-autofocus>取消</button>';
+    const ok = '<button class="sbtn danger" data-act="sheetYes">只对这台开启</button>';
+    if (s.kind === 'nat') {
+      const p = link.driver.parts.find((x) => x.id === s.part);
+      const u = unstoppableOf(p);
+      return '<div class="grab" aria-hidden="true"></div>'
+        + `<h3>允许${esc(p.name || s.part)}的自带模式</h3><p class="who">${who}</p>`
+        + `<div class="warnbox">${WARN_SVG}<p>自带模式运行中，软件可能停不住，可拔出或按设备按钮</p></div>`
+        + `<ul class="facts"><li>自带模式启动后最长运行 <b>${Math.round(u.maxDurationMs / 1000)} 秒</b>。</li>`
+        + '<li>期间“全部停止”照常发送，但设备可能不理会。</li><li>只对这台设备开启，换设备要重新开启。</li></ul>'
+        + `<div class="acts">${cancel}${ok}</div>`;
+    }
+    const p = link.driver.parts.find((x) => x.output === 'Estim');
+    return '<div class="grab" aria-hidden="true"></div>'
+      + `<h3>开启${esc((p && p.name) || '微电流')}</h3><p class="who">${who}</p>`
+      + `<div class="warnbox">${WARN_SVG}<p>这一路的指令来自社区资料，我们没有实测过</p></div>`
+      + `<ul class="facts"><li>只有回复里点名${esc((p && p.name) || '微电流')}才会动。</li>`
+      + `<li>每次最多 <b>${Math.round(((p && p.maxDurationMs) || 30000) / 1000)} 秒</b>，之后自动停，并至少歇同样长。</li>`
+      + '<li>从最低强度开始试；只对这台设备开启。</li></ul>'
+      + `<div class="acts">${cancel}${ok}</div>`;
+  }
+  function closeSheet() { sheet = null; hostEl.classList.remove('sheet'); render(); }
+  function renderSheet() {
+    const open = !!sheet && DIRECT.links.has(sheet.link.id);
+    if (!open && sheet) sheet = null;
+    hostEl.classList.toggle('sheet', open);
+    el.scrim.hidden = !open; el.sheet.hidden = !open;
+    if (!open) { htmlCache.delete(el.sheet); return; }
+    el.sheet.setAttribute('aria-label', sheet.kind === 'nat' ? '允许自带模式' : '开启微电流');
+    const html = sheetHtml(sheet);
+    if (htmlCache.get(el.sheet) !== html) {
+      setHtml(el.sheet, html);
+      const f = el.sheet.querySelector('[data-autofocus]');
+      if (f) try { f.focus(); } catch (_) {}
+    }
+  }
   // ---------- 0.18：玩具页“设备”卡（效果图 docs/toy-device-card-mockup，2026-09-18 批准） ----------
   // 每台设备一张，每一路一行：名字、跟着 heartlink 发出的帧动的小图、当前档位 N/总档。超过两台时每台收成一行。
   // 只放扩展确实知道的：设备名、每一路的输出类型与档数、发出的档位、正在动 / 安静、要点名的输出、加热倒计时（动作时长或全局上限）。
@@ -4137,47 +5903,79 @@ button.dh:hover{background:var(--hover)}
       return Number.isFinite(m) && m >= 1 ? Math.round(m) : null;
     } catch (_) { return null; }
   }
+  // buttplug 的 FeatureDescription 是厂家写的英文（常见几种），能对上就用中文，对不上按输出类型编号
+  const FEAT_ZH = [
+    [/clitoral|clit/i, '阴蒂'], [/insert|internal|shaft/i, '内部'], [/external/i, '外部'], [/suction|suck|air/i, '吮吸'],
+    [/thrust|stroke|piston/i, '伸缩'], [/rotat|spin|bead/i, '转珠'], [/tap|pat|knock/i, '拍打'], [/heat|warm|temp/i, '加热'],
+    [/main|primary/i, '主'], [/second|aux/i, '副'], [/left/i, '左'], [/right/i, '右'], [/tip|head/i, '头部'], [/base|handle/i, '底部'],
+  ];
+  const featZh = (text) => { const t = String(text || ''); for (const [re, zh] of FEAT_ZH) if (re.test(t)) return zh; return null; };
+
   function deviceModel(acts, offSet) {
     const devs = new Map();
     for (const a of acts) {
       if (offSet.has(a.id)) continue;
       const f = toyFeatures.get(a.id);
       const key = f ? `${f.source}:${f.deviceIndex}` : `x:${a.device || a.id}`;
-      if (!devs.has(key)) devs.set(key, { key, name: String((f && f.name) || a.device || a.id), feats: [] });
+      if (!devs.has(key)) devs.set(key, { key, name: String((f && f.name) || a.device || a.id), battery: f ? (toyBattery.get(`${f.source}:${f.deviceIndex}`) ?? null) : null, feats: [] });
       const output = f ? f.output : ((a.outputs || []).find((o) => o !== '*') || 'Vibrate');
-      devs.get(key).feats.push({ id: a.id, output, kind: vizKind(output), steps: featureSteps(f), risky: HeartlinkHaptics.RISKY_OUTPUTS.includes(output), frames: !!f });
+      devs.get(key).feats.push({ id: a.id, output, kind: vizKind(output), steps: featureSteps(f), risky: HeartlinkHaptics.RISKY_OUTPUTS.includes(output), frames: !!f, zh: featZh(f && f.feature) });
     }
     for (const d of devs.values()) {
       const total = {}; const seen = {};
       d.feats.forEach((x) => { total[x.output] = (total[x.output] || 0) + 1; });
-      d.feats.forEach((x) => { seen[x.output] = (seen[x.output] || 0) + 1; const zh = DEV_OUT_ZH[x.output] || x.output; x.label = total[x.output] > 1 ? `${zh} ${seen[x.output]}` : zh; });
+      const zhUsed = {};
+      d.feats.forEach((x) => { if (x.zh) zhUsed[x.zh] = (zhUsed[x.zh] || 0) + 1; });
+      d.feats.forEach((x) => {
+        seen[x.output] = (seen[x.output] || 0) + 1;
+        const zh = DEV_OUT_ZH[x.output] || x.output;
+        // 厂家部件名唯一时直接用（例：吮吸、转珠）；重名或没有就按输出类型编号
+        x.label = x.zh && zhUsed[x.zh] === 1 ? x.zh : total[x.output] > 1 ? `${zh} ${seen[x.output]}` : zh;
+      });
     }
     return [...devs.values()];
   }
   function devRowHtml(f) {
-    const idle = f.risky ? '<span class="say idle">点名才会动</span>' : '';
+    let idle = f.risky ? '<span class="say idle">点名才会动</span>' : '';
+    if (f.maybeTxt) idle = `<span class="say"><span class="chip">${esc(f.maybeTxt)}</span></span>`;
+    else if (f.maybe != null) idle = `<span class="say"><span class="chip">断开前 ${f.maybePct}%</span></span>`;
+    else if (f.off) idle = '<span class="say idle">未开启</span>';
     let viz;
-    if (f.kind === 'osc') viz = `<div class="viz osc"><span class="range"></span><span class="rail"></span><span class="kn tr"></span><span class="kn tr"></span><span class="kn"></span>${idle}</div>`;
+    if (f.kind === 'none') viz = `<div class="viz">${idle}</div>`;
+    else if (f.kind === 'suck') viz = `<div class="viz suck"><span class="cup"></span><span class="core"></span><span class="flow"><i></i></span>${idle}</div>`;
+    else if (f.kind === 'osc') viz = `<div class="viz osc"><span class="range"></span><span class="rail"></span><span class="kn tr"></span><span class="kn tr"></span><span class="kn"></span>${idle}</div>`;
     else if (f.kind === 'spin') viz = `<div class="viz spin"><svg class="wheel" viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="6" style="stroke:var(--line2)"/><circle class="arc" cx="8" cy="8" r="6" stroke-dasharray="12 26" stroke-linecap="round" style="stroke:var(--faint)"/></svg><span class="track"><i></i></span>${idle}</div>`;
     else if (f.kind === 'heat') viz = `<div class="viz heatv"><span class="fill"></span><span class="shim"><i></i></span><span class="end"></span>${idle}<span class="say run">${CLOCK_SVG}<span data-cd></span></span></div>`;
     else viz = `<div class="viz"><canvas aria-hidden="true"></canvas>${idle}</div>`;
-    const lv = f.steps === 1 ? '<b>关</b>' : f.steps ? `<b>0</b>/${f.steps}` : '<b>0</b>%';
-    return `<div class="fr${f.kind === 'heat' ? ' heat' : ''}" data-id="${esc(f.id)}"><span class="fn" title="${esc(f.label)}">${f.risky ? RISK_SVG : ''}${esc(f.label)}</span>${viz}<span class="lv">${lv}</span></div>`;
+    const lv = f.off ? `<button class="mini" data-act="estim" data-link="${esc(f.link)}">开启</button>`
+      : f.maybeTxt ? `<b>?</b>/${f.steps}`
+        : f.maybe != null ? `<b>${f.maybe}</b>/${f.steps}`
+          : f.steps === 1 ? '<b>关</b>' : f.steps ? `<b>0</b>/${f.steps}` : '<b>0</b>%';
+    const cls = `fr${f.kind === 'heat' ? ' heat' : ''}${f.maybe != null || f.maybeTxt ? ' maybe' : ''}`;
+    return `<div class="${cls}" data-id="${esc(f.id)}"><span class="fn" title="${esc(f.label)}">${f.risky ? RISK_SVG : ''}${esc(f.label)}</span>${viz}<span class="lv">${lv}</span></div>`;
   }
   function devCardHtml(d, collapsible, open) {
-    const art = `<span class="art"><span class="warm"></span><span class="fig">${WAVE_SVG}</span><span class="cd"></span></span>`;
-    const name = `<span class="dname" title="${esc(d.name)}">${esc(d.name)}</span>`;
+    const art = `<span class="art"><span class="warm"></span><span class="fig">${d.shape ? shapeArt(d.shape) : WAVE_SVG}</span><span class="cd${d.cd ? ' ' + d.cd : ''}"></span></span>`;
+    const sub = d.sub ? `<small class="${d.subCls || ''}">${esc(d.sub)}</small>` : '';
+    const name = `<span class="dname" title="${esc(d.name)}">${esc(d.name)}${sub}</span>`;
+    const bat = Number.isFinite(d.battery) ? `<span class="dbat${d.battery <= 15 ? ' low' : ''}">${d.battery}%</span>` : '';
     const hd = collapsible
-      ? `<button class="dh" data-devtoggle="${esc(d.key)}" aria-expanded="${open}">${art}${name}<span class="minis" aria-hidden="true">${d.feats.map(() => '<i></i>').join('')}</span>${CV_SVG}</button>`
-      : `<div class="dh">${art}${name}</div>`;
-    return `<div class="dc" data-dev="${esc(d.key)}">${hd}<div class="rows"${open ? '' : ' hidden'}>${d.feats.map(devRowHtml).join('')}</div></div>`;
+      ? `<button class="dh" data-devtoggle="${esc(d.key)}" aria-expanded="${open}">${art}${name}${bat}<span class="minis" aria-hidden="true">${d.feats.map(() => '<i></i>').join('')}</span>${CV_SVG}</button>`
+      : `<div class="dh">${art}${name}${bat}</div>`;
+    const hs = d.hs ? `<div class="hs"><div class="dots">${Array.from({ length: d.hs.need }, (_, i) => `<i class="${i < d.hs.got ? 'got' : i === d.hs.got ? 'now' : ''}"></i>`).join('')}</div><p>${esc(d.hs.text)}</p></div>` : '';
+    const rows = d.feats.length || d.nat ? `<div class="rows"${open ? '' : ' hidden'}>${d.feats.map(devRowHtml).join('')}${d.nat || ''}</div>` : '';
+    return `<div class="dc${d.lost ? ' lost' : ''}${d.err ? ' err' : ''}" data-dev="${esc(d.key)}">${hd}${hs}${rows}${d.note || ''}</div>`;
   }
   function renderDevices(acts, offSet) {
-    const list = deviceModel(acts, offSet);
+    // 直连设备排在前面，并且不再走下面按执行器分组的那一套（握手没完成时还没有执行器）
+    const links = [...DIRECT.links.values()];
+    const linked = new Set(links.flatMap((l) => l.ids || []));
+    // 还停在浏览器的蓝牙窗口上（picking）时不出卡片：那一步上面已经有“在浏览器的列表里选 …”
+    const list = links.filter((l) => l.phase !== 'picking').map(directCardModel).concat(deviceModel(acts.filter((a) => !linked.has(a.id)), offSet));
     el.devSec.hidden = !list.length;
     const many = list.length > 2;
     for (const k of [...devOpen]) if (!list.some((d) => d.key === k)) devOpen.delete(k);
-    const sig = JSON.stringify([many, list.map((d) => [d.key, d.name, many && devOpen.has(d.key), d.feats.map((f) => [f.id, f.label, f.kind, f.steps, f.risky])])]);
+    const sig = JSON.stringify([many, list.map((d) => [d.sig || [d.key, d.name, d.battery, d.feats.map((f) => [f.id, f.label, f.kind, f.steps, f.risky])], many && devOpen.has(d.key)])]);
     if (sig !== devAnim.sig) {
       devAnim.sig = sig;
       el.dcards.innerHTML = list.map((d) => devCardHtml(d, many, !many || devOpen.has(d.key))).join('');
@@ -4196,6 +5994,7 @@ button.dh:hover{background:var(--hover)}
             lvB: row && row.querySelector('.lv b'), canvas: row && row.querySelector('canvas'), say: row && row.querySelector('.say.idle'),
             kn: row ? [...row.querySelectorAll('.kn')] : [], rail: row && row.querySelector('.rail'), wheel: row && row.querySelector('.wheel'), arc: row && row.querySelector('.arc'),
             dots: row && row.querySelector('.track i'), fill: row && row.querySelector('.fill'), shim: row && row.querySelector('.shim i'), cd: row && row.querySelector('[data-cd]'), viz: row && row.querySelector('.viz'),
+            core: row && row.querySelector('.core'), flowEl: row && row.querySelector('.flow i'),
             w: 0, h: 0, railW: 0, vizW: 0, sayText: null, cdText: null,
           };
           st.ctx = st.canvas && typeof st.canvas.getContext === 'function' ? st.canvas.getContext('2d') : null;
@@ -4237,7 +6036,9 @@ button.dh:hover{background:var(--hover)}
   }
   const reducedMotion = () => { try { return !!(host.matchMedia && host.matchMedia('(prefers-reduced-motion: reduce)').matches); } catch (_) { return false; } };
   function devShouldRun() {
-    return !destroyed && !!hostEl && hostEl.classList.contains('open') && state.badgeTab === 'toy' && !doc.hidden && devAnim.visible && devAnim.feats.length > 0 && !el.devSec.hidden;
+    if (destroyed || !hostEl || !hostEl.classList.contains('open') || state.badgeTab !== 'toy' || doc.hidden) return false;
+    if (natRunning().length) return true;   // 自带模式的横幅与倒计时环也靠这个循环走
+    return devAnim.visible && devAnim.feats.length > 0 && !el.devSec.hidden;
   }
   function devKick() {
     if (devAnim.running || !devShouldRun() || typeof host.requestAnimationFrame !== 'function') return;
@@ -4331,6 +6132,8 @@ button.dh:hover{background:var(--hover)}
       let step; let q;
       if (f.steps) { step = Math.round(target * f.steps); if (target > 0 && step === 0) step = 1; q = step / f.steps; }
       else { step = Math.round(target * 100); q = target; }
+      // 断开后“可能仍在动”和没开启的那几路：画面停在断开前的样子，不跟着新的帧走
+      if (f.maybe != null || f.maybeTxt || f.off) continue;
       st.disp += (q - st.disp) * (1 - Math.exp(-dt / (rm ? 0.001 : 0.12)));
       if (Math.abs(q - st.disp) < 0.002) st.disp = q;
       devSetOn(st, step > 0);
@@ -4340,6 +6143,15 @@ button.dh:hover{background:var(--hover)}
       if (f.kind === 'wave') {
         devDrawWave(st, dt, rm, C);
         for (let k = 0; k < DEV_HN && !active; k++) if (st.hist[k] > 0.005) active = true;
+      } else if (f.kind === 'suck' && st.core) {
+        // 吮吸：吸口里的芯按档位收紧，点阵朝吸口流入；减少动态效果时只留收紧的静止比例
+        const pull = rm ? st.disp : st.disp * (0.75 + 0.25 * Math.sin(t * (4 + 8 * st.disp)));
+        st.core.style.transform = `scale(${(1 - 0.55 * pull).toFixed(3)})`;
+        if (!rm && st.flowEl) {
+          st.phase += dt * (8 + 60 * st.disp);
+          st.flowEl.style.transform = `translate3d(${(-(st.phase % 10)).toFixed(2)}px,0,0)`;
+          if (st.disp > 0.002) active = true;
+        }
       } else if (f.kind === 'osc' && st.kn.length === 3) {
         const span = st.railW; let x;
         if (rm) x = span * st.disp;
@@ -4391,7 +6203,7 @@ button.dh:hover{background:var(--hover)}
       let vib = 0; let osc = 0; let hot = 0; let anyOn = false;
       cv.feats.forEach((st, i) => {
         if (st.on) anyOn = true;
-        if (st.f.kind === 'wave') vib = Math.max(vib, st.disp);
+        if (st.f.kind === 'wave' || st.f.kind === 'suck') vib = Math.max(vib, st.disp);
         else if (st.f.kind === 'heat') hot = Math.max(hot, st.disp);
         else osc = Math.max(osc, st.disp);
         const m = cv.minis[i];
@@ -4401,7 +6213,7 @@ button.dh:hover{background:var(--hover)}
           if (m.classList.contains('on') !== st.on) m.classList.toggle('on', st.on);
         }
       });
-      if (cv.moving !== anyOn) { cv.moving = anyOn; cv.el.classList.toggle('moving', anyOn); }
+      if (cv.moving !== anyOn) { cv.moving = anyOn; if (!cv.el.classList.contains('lost')) cv.el.classList.toggle('moving', anyOn); }
       const isHot = hot > 0.01;
       if (cv.hot !== isHot) { cv.hot = isHot; cv.el.classList.toggle('hot', isHot); }
       if (cv.fig) {
@@ -4420,6 +6232,8 @@ button.dh:hover{background:var(--hover)}
         if (cv.warmO !== o) { cv.warmO = o; cv.warm.style.opacity = o; }
       }
     }
+    const nats = natRunning();
+    if (nats.length) { paintNat(nats[0], rm); active = true; }
     // 都安静下来（波形历史也走完）就停，下一次发帧或打开面板时再启动
     if (active) devAnim.raf = host.requestAnimationFrame(devFrame);
     else devAnim.running = false;
@@ -4482,14 +6296,23 @@ button.dh:hover{background:var(--hover)}
     const busy = acts.filter((a) => a.busy);
     const offSet = new Set(state.haptics.off || []);
     const nToy = acts.filter((a) => !offSet.has(a.id)).length;
+    // 玩具段的小点：正在动是粉的；断线 / 停止失败后“可能仍在动”换成琥珀色；停不下来的自带模式换成倒计时环
+    const nats = natRunning();
+    // 断线 / 停止失败后仍可能在动的路数：设备已经撤了登记，但读者要知道还有几路没停下
+    const maybeCount = [...DIRECT.links.values()].reduce((n, l) => n + new Set([...(l.maybeRunning || []), ...(l.stopFailed || [])]).size, 0);
+    const maybeAny = maybeCount > 0;
     const hrActive = state.connected || state.reconnecting || !!state.waitingForDevice || (state.bridgeUp && fresh);
-    const toyActive = nToy > 0 || busy.length > 0;   // 只在真的连上玩具时显示（开了联动但没设备不算）
+    const toyActive = nToy > 0 || busy.length > 0 || maybeAny;   // 只在真的连上玩具时显示（开了联动但没设备不算）
     el.seg.hr.hidden = !hrActive;
     el.seg.toy.hidden = !toyActive;
     el.seg.none.hidden = hrActive || toyActive;
     el.segsep.hidden = !(hrActive && toyActive);
-    el.tn.textContent = String(nToy);
-    el.live.className = 'live' + (busy.length ? ' on' : '');
+    el.tn.textContent = String(nToy || maybeCount);
+    el.live.className = 'live' + (nats.length ? '' : maybeAny ? ' warn on' : busy.length ? ' on' : '');
+    el.live.title = maybeAny ? '可能仍在动' : '正在动';
+    el.ring.hidden = !nats.length;
+    if (nats.length) paintNat(nats[0], reducedMotion());
+    syncNatTimer();
     hostEl.classList.toggle('busy', busy.length > 0);
     const info = state.deviceInfo || {};
     el.pill.title = `heartlink ${VERSION}${state.connected ? ` · ${state.deviceName || ''}${info.firmware ? ' · fw ' + info.firmware : ''}` : ''} · 点一下打开，按住可拖动`;
@@ -4504,8 +6327,9 @@ button.dh:hover{background:var(--hover)}
     el.hrBadge.className = 'd6' + (state.connected ? '' : ' warn');
     el.hrBadge.title = state.connected ? '已连接' : state.reconnecting ? '重连中' : '等设备回来';
     el.toyBadge.hidden = !toyActive;
-    el.toyBadge.className = 'd6' + (busy.length ? ' toy' : '');
-    el.toyBadge.title = busy.length ? '正在动' : '已连接';
+    el.toyBadge.className = 'd6' + (nats.length || maybeAny ? ' warn' : busy.length ? ' toy' : '');
+    el.toyBadge.title = nats.length ? '自带模式运行中' : maybeAny ? '可能仍在动' : busy.length ? '正在动' : '已连接';
+    el.natBanner.hidden = !nats.length;
     // 设置与连接：折叠状态记在设置里
     const folded = !!state.settingsFolded;
     el.folds.forEach((b) => b.setAttribute('aria-expanded', String(!folded)));
@@ -4566,17 +6390,27 @@ button.dh:hover{background:var(--hover)}
     el.out.textContent = { idle: '推荐', connecting: '连接中…', connected: '已连接', disconnected: '重连中…', error: '连不上，Intiface 开了吗' }[state.intifaceStatus] || '推荐';
     el.out.className = state.intifaceStatus === 'idle' ? 'rec' : '';
     el.toyBtn.className = 'btn' + (state.haptics.intiface.enabled ? ' on' : '');
-    el.wasmState.textContent = { idle: '测试', loading: '加载中…', connected: '已连接', error: '连接失败' }[WASM.status] || '测试';
-    el.wasmBtn.className = 'btn' + (WASM.client ? ' on' : '');
+    const directOn = [...DIRECT.links.values()].some((l) => l.phase === 'ready');
+    el.wasmState.textContent = WASM.status === 'loading' ? '加载中…' : WASM.status === 'error' ? '连接失败' : wasmOn || directOn ? '已连接' : '不装软件';
+    el.wasmBtn.className = 'btn' + (WASM.client || DIRECT.links.size ? ' on' : '');
+    // 选型号面板 / 等浏览器的蓝牙窗口；开着时占掉两个连接方式按钮的位置
+    const picking = [...DIRECT.links.values()].find((l) => l.phase === 'picking');
+    el.pick.hidden = !pickOpen || !!picking;
+    if (!el.pick.hidden) setHtml(el.pick, pickerHtml()); else htmlCache.delete(el.pick);
+    el.wait.hidden = !picking;
+    if (picking) setHtml(el.wait, waitHtml(picking)); else htmlCache.delete(el.wait);
+    renderSheet();
     // 连上以后，连接方式收成一行；点开看连接按钮与选择设备
-    const anyDev = acts.length > 0;
+    const anyDev = acts.length > 0 || DIRECT.links.size > 0;
     el.connRow.hidden = !anyDev;
-    el.connBtns.hidden = anyDev && !hostEl.classList.contains('devs');
-    const via = [intiOn && 'Intiface', wasmOn && '浏览器直接连'].filter(Boolean).join('、');
-    el.connTxt.textContent = via ? `${via} · 已连接` : '已连接';
-    el.connDot.className = 'd6' + (busy.length ? ' toy' : '');
-    el.toyEmpty.hidden = nToy > 0;
-    el.toyTiles.hidden = nToy === 0;
+    el.connBtns.hidden = !el.pick.hidden || !el.wait.hidden || (anyDev && !hostEl.classList.contains('devs'));
+    const via = [intiOn && 'Intiface', (wasmOn || directOn) && '浏览器直接连'].filter(Boolean).join('、');
+    const linking = [...DIRECT.links.values()].some((l) => l.phase === 'connecting' || l.phase === 'handshake');
+    el.connTxt.textContent = picking ? '选择设备…' : linking ? '正在连接…' : via ? `${via} · 已连接` : acts.length ? '已连接' : '未连接';
+    el.connDot.className = 'd6' + (picking || linking || !(via || acts.length) ? ' off' : maybeAny ? ' warn' : busy.length ? ' toy' : '');
+    const hasToy = nToy > 0 || [...DIRECT.links.values()].some((l) => l.phase === 'ready' || l.phase === 'lost' || l.phase === 'reconnecting');
+    el.toyEmpty.hidden = hasToy;
+    el.toyTiles.hidden = !hasToy;
     // 反馈按钮：没有设备不显示；有动作在动或排队时四个都在，否则只剩“再来一次”（没有可重放的也不显示）
     const pendingN = actuators.pending();
     const moving = busy.length > 0 || pendingN > 0;
@@ -4602,6 +6436,9 @@ button.dh:hover{background:var(--hover)}
     el.playBtn.hidden = tab !== 'toy' || !el.play.hidden;
     let movingShown = false;
     let skipNums = [];
+    const natIds = new Set(nats.map((n) => (n.link.idOf || {})[n.part] || (n.link.idWas || {})[n.part]).filter(Boolean));
+    const maybeIds = new Set([...DIRECT.links.values()].flatMap((l) => [...(l.maybeRunning || [])].map((x) => (l.idOf || {})[x] || (l.idWas || {})[x])).filter(Boolean));
+    const natStopped = nats.some((n) => n.stopped);
     if (!lastEntry) setHtml(el.lastact, '<div class="node hol"><div class="th"><span class="m">角色写出动作后会列在这里</span></div></div>');
     else {
       const out = lastEntry.outcome || [];
@@ -4617,7 +6454,13 @@ button.dh:hover{background:var(--hover)}
         let cls = 'node'; let c = 'on'; let mid = ''; let right = '';
         if (lastEntry.skipped) { c = 'warn'; right = `<span class="r m no">${esc(SKIP_ZH[lastEntry.skipped] || lastEntry.skipped)}</span>`; }
         else if (skippedByReader) { cls += ' skipped hol'; c = 'faint'; mid = `<span class="ntag skip${pop}">已跳过</span>`; right = okN ? `<span class="r m">${okN} 路</span>` : ''; }
-        else if (st === 'running') { cls += ' pulse toy'; c = 'toy'; mid = '<span class="m t">正在动</span>'; right = `<span class="r m">${okN} 路</span>`; movingShown = true; }
+        else if (natIds.size && r && r.results.some((x) => natIds.has(x.id))) {
+          // 停不下来的自带模式：写清楚它停不住，别让读者以为“全部停止”按下去就完了（§5.9-5）
+          cls += ' pulse'; c = 'warn'; mid = `<span class="m nw">${natStopped ? '已发停止' : '停不住'}</span>`; right = `<span class="r m">${okN} 路</span>`; movingShown = true;
+        } else if (maybeIds.size && r && r.results.some((x) => maybeIds.has(x.id))) {
+          // 断线时被打断的动作：设备没说会自己停，所以不写“已停”
+          c = 'warn'; right = '<span class="r m no">断开时中断</span>';
+        } else if (st === 'running') { cls += ' pulse toy'; c = 'toy'; mid = '<span class="m t">正在动</span>'; right = `<span class="r m">${okN} 路</span>`; movingShown = true; }
         else if (st === 'refused' || (r && !okN)) { c = 'warn'; right = '<span class="r m no">没执行</span>'; }
         else if (st === 'cut') { if (!r) cls += ' hol'; c = 'faint'; right = '<span class="r m">已停</span>'; }
         else if (!r) { cls += ' hol'; c = 'faint'; right = '<span class="r m">排队中</span>'; }
@@ -4637,9 +6480,10 @@ button.dh:hover{background:var(--hover)}
       const OUT_ZH = { Vibrate: '振动', Oscillate: '往复', Rotate: '旋转', Constrict: '收缩', HwPositionWithDuration: '抽动', Position: '位置', Estim: '电刺激', Temperature: '加热' };
       const groups = {};
       for (const a of acts) { const k = (toyFeatures.get(a.id) || {}).name || a.device || a.id; (groups[k] = groups[k] || []).push(a); }
-      const html = Object.keys(groups).length
-        ? Object.entries(groups).map(([name, list]) => `<b>${esc(name)}</b>` + list.map((a) => `<label><input type="checkbox" data-id="${esc(a.id)}"${offSet.has(a.id) ? '' : ' checked'}>${esc(a.outputs.map((o) => OUT_ZH[o] || o).join('/'))} <i>${esc(a.id.split(':').slice(1, 3).join('-'))}</i></label>`).join('')).join('')
-        : '还没有设备。先连接 Intiface 或蓝牙直连。';
+      const cut = [...DIRECT.links.values()].map((l) => `<b>${esc(l.name || l.driver.model)}<button class="link" data-act="dcut" data-link="${esc(l.id)}">断开</button></b>`).join('');
+      const html = (Object.keys(groups).length || cut
+        ? cut + Object.entries(groups).map(([name, list]) => `<b>${esc(name)}</b>` + list.map((a) => `<label><input type="checkbox" data-id="${esc(a.id)}"${offSet.has(a.id) ? '' : ' checked'}>${esc(a.outputs.map((o) => OUT_ZH[o] || o).join('/'))} <i>${esc(a.id.split(':').slice(1, 3).join('-'))}</i></label>`).join('')).join('')
+        : '还没有设备。先连接 Intiface 或蓝牙直连。');
       if (el.devs.getAttribute('data-h') !== html) { el.devs.innerHTML = html; el.devs.setAttribute('data-h', html); }
     }
     // 底部
@@ -4672,6 +6516,7 @@ button.dh:hover{background:var(--hover)}
     try { stopIntiface(); } catch (_) {}
     try { stopWasm(); } catch (_) {}
     try { stopAdvertisementWatch(); } catch (_) {}
+    try { if (natTimer) host.clearInterval(natTimer); } catch (_) {}
     while (disposers.length) { try { disposers.pop()(); } catch (_) {} }
     try { if (metaSave.pending) saveMetaNow(); } catch (_) {}   // 重新初始化前没等到宿主保存的聊天变量，交给宿主的防抖保存
     try { hostEl && hostEl.remove(); } catch (_) {}
@@ -4692,7 +6537,10 @@ button.dh:hover{background:var(--hover)}
     getMode, setMode, toggleMode,
     connect, disconnect, setManualBaseline, clearManualBaseline,
     injectContext, exportCsv, setPrior, diagnostics, exportDiagnostics, setExposure, ensureGuideWorldbook,
-    getHaptics, setHaptics, actuate: (target, action, opts) => actuators.actuate(target, action, opts), stopHaptics: () => actuators.stop(), actOnReply,
+    getHaptics, setHaptics, actuate: (target, action, opts) => actuators.actuate(target, action, opts), stopHaptics: () => { const r = actuators.stop(); directHaltAll(); return r; }, actOnReply,
+    // 按驱动直连（界面另做）：选型号 → 连接 → 断开；微电流与停不下来的自带模式按设备开启
+    directModels, directDevices: directState,
+    startDirect: (modelId, opts) => pickDirect(modelId, opts), stopDirect, setDirectEstim, setDirectUnstoppable,
     // 0.18：与玩具页按钮同一条路径（全部停止 / 弱一点 / 强一点 / 再来一次 / 跳过）；feedbackLine() 是下一次发送会写的 feedback 行
     haltAll: () => haltAll('api'), quickFeedback: (kind) => quickFeedback(kind), feedbackLine: () => safeFeedbackLine(),
     exportEvents: () => JSON.stringify({ version: VERSION, exportedAt: Date.now(), events: state.events, samples: state.samples }),
@@ -4750,7 +6598,7 @@ button.dh:hover{background:var(--hover)}
   }
   bridgeConnect(0);
   if (state.haptics.intiface.enabled) startIntiface();
-  { const onHide = () => { try { actuators.stop(); } catch (_) {} }; host.addEventListener('pagehide', onHide); disposers.push(() => host.removeEventListener('pagehide', onHide)); }
+  { const onHide = () => { try { actuators.stop(); } catch (_) {} try { directPanicStop(); } catch (_) {} }; host.addEventListener('pagehide', onHide); disposers.push(() => host.removeEventListener('pagehide', onHide)); }
   disposers.push(() => { try { state.bridge && state.bridge.close(); } catch (_) {} });
   render();
   adoptExistingConnection().then(() => { if (!state.connected) tryResume(); });
