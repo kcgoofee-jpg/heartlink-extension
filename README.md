@@ -183,3 +183,10 @@ feedback(heartlink): acts 3 sent, 1 done, 1 cut, 1 pending | stronger +20% read 
 ## 许可
 
 AGPL-3.0（见 `LICENSE`）。协议文本见 TBC 仓库（CC BY 4.0）。
+
+## 致谢
+
+- BLE Heart Rate Profile（Bluetooth SIG）、Web Bluetooth（W3C CG）、RMSSD（ESC/NASPE 1996）
+- SillyTavern 与酒馆助手的事件、注入接口；buttplug / Intiface Central（BSD-3-Clause）
+- [HZXXXC/sillytavern-heart-rate-hrv](https://github.com/HZXXXC/sillytavern-heart-rate-hrv)：最接近的现有实现，未复用代码
+- [Enclave0775/Intiface_Central-Sillytavern-plugin](https://github.com/Enclave0775/Intiface_Central-Sillytavern-plugin)：阅读速度模拟的思路来源
