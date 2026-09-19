@@ -6,7 +6,7 @@
   "js": "index.js",
   "css": "style.css",
   "author": "kcgoofee-jpg",
-  "version": "0.24.1",
+  "version": "0.24.2",
   "homePage": "https://github.com/kcgoofee-jpg/heartlink-extension",
   "auto_update": true
 }
