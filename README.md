@@ -1,192 +1,194 @@
 # heartlink
 
-SillyTavern（酒馆）扩展：把你身上的心率送进提示词，并让剧情驱动你自己的玩具。
+中文文档：[README.zh.md](README.zh.md)
 
-它是 [Tavern Bio-Context（TBC）](https://github.com/kcgoofee-jpg/tavern-bio-context) 协议的参考实现，只负责两件事：**连接稳定**和**注入稳定**。怎么理解剧情、写多强的动作，由你自己的模型和预设决定。
+A SillyTavern extension that sends your heart rate into the prompt and lets the story drive your toys.
 
-## 原理
+It is the reference implementation of the [Tavern Bio-Context (TBC)](https://github.com/kcgoofee-jpg/tavern-bio-context) protocol. It only does two things: **connect reliably** and **inject reliably**. How the story is interpreted, and how intense the action gets, is up to your own model and presets.
 
-heartlink 做三件事，**不替你理解剧情**：
+## How it works
 
-1. **把设备数据送进提示词**：浏览器通过蓝牙标准心率服务每秒收一个心率。你按下发送时，它把上一轮的心率按对话相位整理成一段 `<bio_context>`，随提示词发给**你自己配置的模型**。块里只写数值，不写“兴奋”“紧张”这类结论；怎么理解，由自动安装的读法世界书和你的预设决定。
-2. **把模型写的动作变成玩具动作**：模型在回复里写 `<bio_act/>`，回复写完后 heartlink 解析，经过安全关（开关、节奏、间隔、有风险的输出要点名），再交给 Intiface 或浏览器直连去驱动玩具。
-3. **形成闭环**：你身体的反应会进入下一轮的数据里，模型就能知道上一段写得怎么样。
+heartlink does three things, **without interpreting the story for you**:
 
-![一轮对话里发生了什么](docs/flow.png)
+1. **Feeds device data into the prompt**: the browser receives one heart-rate sample per second over the standard Bluetooth Heart Rate Service. When you press send, it packages the last round's heart-rate data by conversation phase into a `<bio_context>` block and sends it to **the model you configured**. The block only contains numbers, not conclusions like "excited" or "nervous"; how to read them is up to the automatically installed reading world book and your presets.
+2. **Turns model-written actions into toy actions**: the model writes `<bio_act/>` in its reply. After the reply finishes generating, heartlink parses it, passes it through safety gates (on/off, rhythm, spacing, risky outputs must be named), and hands it to Intiface or a browser-direct connection to drive the toy.
+3. **Closes the loop**: your body's reaction feeds into the next round's data, so the model can tell how the last passage landed.
 
-### 相位：心率被切成哪几段
+![What happens during one round](docs/flow.png)
 
-![相位](docs/phases.png)
+### Phases: how heart rate is sliced
 
-悬浮窗的健康设备页会实时画出本轮这张图；胶囊上的 +N% 是和平静心率比。
+![Phases](docs/phases.png)
 
-**你不在的时间不算**：从按下发送开始就看你在不在——切到别的标签页或别的程序、窗口失焦、往上翻旧消息、心率带没贴好，这些秒都剔除，不会被当成你的反应（等模型出第一个字时坐着不动不算离开）。“多久没动算离开”“读多久算太久”按你最近几轮的节奏自动校准，块里的 `gates` 行会写明用的是学到的值还是你手动设的。
+The health-device page of the floating panel draws this round's chart in real time; the `+N%` on the capsule is relative to your resting heart rate.
 
-格式由 [Tavern Bio-Context 协议](https://github.com/kcgoofee-jpg/tavern-bio-context) 规定，任何卡片、预设、扩展都可以读。
+**Time you are away does not count**: from the moment you press send, it tracks whether you are present — switching tabs or apps, window losing focus, scrolling up to old messages, or the heart-rate strap not being attached properly are all excluded and will not be treated as your reaction (sitting still while waiting for the model's first token does not count as away). "How long still counts as away" and "how long a reading is too long" are auto-calibrated to the rhythm of your recent rounds; the `gates` line in the block states whether the values used are learned or manually set.
 
-## 安装
+The format is defined by the [Tavern Bio-Context protocol](https://github.com/kcgoofee-jpg/tavern-bio-context); any card, preset, or extension can read it.
 
-酒馆 → 扩展程序 → **安装扩展程序** → 填本仓库地址：
+## Installation
+
+SillyTavern → Extensions → **Install Extension**, paste this repository URL:
 
 ```
 https://github.com/kcgoofee-jpg/heartlink-extension
 ```
 
-装好后页面右下角出现悬浮窗（按住可拖动；不想看到时点面板底部的“隐藏悬浮窗”，之后从左下角魔杖菜单恢复）。不需要酒馆助手；装着酒馆助手里的旧版 heartlink 脚本时，请把脚本关掉。
+After installation a floating panel appears in the bottom-right corner (drag to move; tap "Hide floating panel" at the bottom of the panel to dismiss it, then restore it from the wand menu in the bottom-left). No SillyTavern helper script is required; if you have the old heartlink script inside the helper installed, please turn it off.
 
-## 两类设备，各自单独用
+## Two device types, used separately
 
-点悬浮窗打开面板，分两个标签页；只用哪一类，悬浮窗就只显示哪一类。
+Tap the floating panel to open it; there are two tabs. Only the type you use is shown.
 
-<img src="docs/panel-health.png" alt="健康设备页" width="260"> <img src="docs/panel-toys.png" alt="玩具页" width="260">
+<img src="docs/panel-health.png" alt="Health device page" width="260"> <img src="docs/panel-toys.png" alt="Toy page" width="260">
 
-### 健康设备（心率）
+### Health devices (heart rate)
 
-1. 手环 / 心率带打开“心率广播”（WHOOP、Polar、多数心率带；部分手表在运动健康 App 里开）。
-2. 用电脑或安卓手机上的 **Chrome / Edge** 打开酒馆（iPhone 和 Safari 暂不支持网页蓝牙）。
-3. 悬浮窗 → 健康设备 → **连接设备**，在弹窗里选设备。
-4. 在“设置与连接”里选模式：
+1. Turn on "heart-rate broadcast" on your band / strap (WHOOP, Polar, most heart-rate straps; some watches need it enabled in their workout/health app).
+2. Open SillyTavern in **Chrome / Edge** on a computer or Android phone (iPhone and Safari do not currently support Web Bluetooth).
+3. Floating panel → Health device → **Connect device**, pick the device in the popup.
+4. Choose a mode in "Settings & connection":
 
-| 模式 | 角色知道什么 |
+| Mode | What the character knows |
 |---|---|
-| **幕后**（默认） | 什么都不知道，心率只影响写法 |
-| **入戏** | 能察觉你的身体表现（呼吸、脸色），不提数字和设备 |
-| **知情** | 知道你戴着设备，可以看数据、指导你，也可以明说是自己让玩具动的 |
+| **Behind the scenes** (default) | Nothing; heart rate only affects writing style |
+| **In character** | Can sense your physical reactions (breathing, complexion) without mentioning numbers or devices |
+| **Informed** | Knows you are wearing a device, can look at data, guide you, or explicitly say they made the toy move |
 
-### 设置页
+### Settings page
 
-悬浮窗顶部第三个标签页 **设置**（健康设备 · 玩具 · 设置）：
+The third tab at the top of the floating panel is **Settings** (Health device · Toys · Settings):
 
-| 项 | 说明 |
+| Item | Description |
 |---|---|
-| 门槛 | 看“多久没动算离开”“读多久算太久”现在用的值和来历（估计 / 按你的 N 轮学到 / 你设的），可手动改、改回自动、一键清除学到的习惯（只存在本机） |
-| 面板 | 「点面板外面时收起」开关（默认开）；关掉之后点输入框不收起，用右上 × 或再点一下胶囊收起 |
-| 浅色面板 | 缺省深色；打开这个开关换浅色。不跟酒馆主题自动切换 |
-| 设备实验室 | 本机开着 TBC 设备实验室时才出现，点“打开”在小窗口里用虚拟设备测试 |
-| 这一版 | 当前版本、里程碑和改了什么 |
-| 更准的离开判断 | Chrome / Edge 可选开系统级空闲检测（锁屏算离开，在卡片小界面里点按不算），要浏览器授权，缺省关 |
-| 节奏细调 | 每档的最低强度、一次动多久、两次间隔、每条回复最多几个都能调；块里 `haptics` 行会告诉模型改了哪些 |
-| 试用 | 打开新版数据格式（TBC v0.4 草案：心率滞后、流式出字、派生统计），缺省关 |
+| Thresholds | View the current values for "how long still counts as away" and "how long a reading is too long", plus their source (estimated / learned from your last N rounds / manually set); you can override them, revert to auto, or clear learned habits in one click (stored locally only) |
+| Panel | Toggle "collapse panel when tapping outside" (default on); when off, tapping the input box does not collapse the panel — use the top-right × or tap the capsule again |
+| Light panel | Default is dark; turn this on for a light theme. Does not follow the SillyTavern theme automatically |
+| Device Lab | Appears only when the TBC Device Lab is running locally; tap "Open" to test with virtual devices in a small window |
+| This version | Current version, milestone, and changelog |
+| Better away detection | Chrome / Edge can optionally use system-level idle detection (screen lock counts as away, taps inside card mini-UIs do not); requires browser permission, default off |
+| Rhythm fine-tuning | Minimum intensity per level, duration per pulse, gap between pulses, and max acts per reply can all be adjusted; the `haptics` line tells the model what changed |
+| Trial | Enable the new data format (TBC v0.4 draft: heart-rate lag, streaming tokens, derived statistics), default off |
 
-### 哪些手环 / 手表能用
+### Supported bands / watches
 
-需要设备支持**蓝牙标准心率广播**。下表来自各品牌官方说明（2026-09 整理）；WHOOP 与华为手环 11 已在 Chrome 里实测，其余还没有逐一实测，欢迎反馈。
+The device must support the **standard Bluetooth heart-rate broadcast**. The table below is based on each brand's official documentation (compiled 2026-09); WHOOP and Huawei Band 11 have been tested in Chrome, the rest have not been individually verified yet — feedback welcome.
 
-| 设备 | 支持情况 | 怎么打开 |
+| Device | Support | How to enable |
 |---|---|---|
-| WHOOP 4.0 / 5.0 | 支持（已实测） | App → 设备设置 → 心率广播 |
-| 华为手环 / 手表（多数型号） | 支持（手环 11 已实测 2026-09-18） | 手环上选一个运动模式（如户外步行）开始，心率广播即开，不用手机 App；部分型号在 设置 → 心率广播，开启后会断开运动健康 App |
-| 荣耀手环 / 手表 | 支持 | 手表设置 → 心率广播；部分型号需在锻炼中 |
-| 佳明 Garmin | 支持 | 设置 → 传感器与配件 → 手腕心率 → 广播心率 |
-| 高驰 COROS | 支持 | 工具箱 → 心率广播（广播时手机连接会断开） |
-| Polar 手表 / 心率带 | 支持 | 手表：训练前开启“与其他设备共享心率”；心率带默认广播 |
-| 小米手环 | 部分：较老型号（Band 7 Pro 之前） | 小米运动 / 小米运动健康 App → 设备 → 心率广播 |
-| Amazfit / Zepp | 部分型号 | Zepp App → 设备 → 健康监测 → 心率推送 |
-| 颂拓 Suunto | 部分新型号（新固件） | 以官方说明为准 |
-| Fitbit Charge 6、Pixel Watch 2 及以后 | 部分型号 | 快捷设置 → 与健身器材共享心率 |
-| OPPO / 一加 | 未确认 / 不支持 | — |
-| Apple Watch、三星 Galaxy Watch | 不支持原生广播 | 需要第三方 App，且多经手机转发，暂不推荐 |
-| 智能戒指（Oura、Galaxy Ring 等） | 不支持 | — |
+| WHOOP 4.0 / 5.0 | Supported (tested) | App → Device settings → Heart-rate broadcast |
+| Huawei band / watch (most models) | Supported (Band 11 tested 2026-09-18) | On the band, start a workout mode such as Outdoor Walk; heart-rate broadcast turns on without the phone app. Some models: Settings → Heart-rate broadcast, which will disconnect the Health app |
+| Honor band / watch | Supported | Watch settings → Heart-rate broadcast; some models require being in a workout |
+| Garmin | Supported | Settings → Sensors & Accessories → Wrist Heart Rate → Broadcast Heart Rate |
+| COROS | Supported | Toolbox → Heart-rate broadcast (phone connection will drop while broadcasting) |
+| Polar watch / heart-rate strap | Supported | Watch: enable "Share heart rate with other devices" before training; straps broadcast by default |
+| Xiaomi Band | Partial: older models (before Band 7 Pro) | Mi Fitness / Xiaomi Wear app → Device → Heart-rate broadcast |
+| Amazfit / Zepp | Some models | Zepp app → Device → Health monitoring → Heart-rate push |
+| Suunto | Some newer models (new firmware) | Follow official instructions |
+| Fitbit Charge 6, Pixel Watch 2 and later | Some models | Quick settings → Share heart rate with exercise equipment |
+| OPPO / OnePlus | Unconfirmed / unsupported | — |
+| Apple Watch, Samsung Galaxy Watch | No native broadcast | Requires a third-party app, usually relayed through the phone; not recommended for now |
+| Smart rings (Oura, Galaxy Ring, etc.) | Unsupported | — |
 
-没有标准心率广播的设备，可以按 TBC 协议用“本机桥”或“推送”接入（分钟级数据），见协议仓库的设备对接说明。
+Devices without a standard heart-rate broadcast can be connected via a "local bridge" or "push" following the TBC protocol (minute-level data); see the device integration notes in the protocol repository.
 
-断线会自动重连；走远了，设备回到附近会自动连回来；显示已连接却没有数据时，会自动重新订阅。
+Disconnections are auto-reconnected; walk away and come back and it will reconnect automatically. If it shows connected but has no data, it will resubscribe automatically.
 
-### 玩具
+### Toys
 
-1. 安装并打开 [Intiface Central](https://intiface.com/central/)，点 **Start Server**，在里面连上玩具（支持的型号见 buttplug 设备库）。不想装软件的话跳到下面的“浏览器直接连”。
-2. 悬浮窗 → 玩具 → 打开 **剧情联动**，第一次会让你选节奏：**慢热**（从轻开始）、**持久**（中等强度、动得久）、**狂暴**（高触发、高功率）或 **极限**（几乎一直开满）。
-3. 点 **通过 Intiface**。显示“已连接 · N 路”即成功。
-4. 任何时候点 **全部停止**，或者不打开面板直接停：输入 `/hl-stop`，或按 **Alt+Shift+S**。页面关闭、Intiface 断开也会立即停。
+1. Install and open [Intiface Central](https://intiface.com/central/), tap **Start Server**, and connect your toy inside it (supported models are in the buttplug device library). To skip the software, jump to "Browser-direct connection" below.
+2. Floating panel → Toys → turn on **Story联动**. The first time it will ask you to pick a rhythm: **Slow burn** (starts light), **Endurance** (medium intensity, longer pulses), **Frenzy** (high trigger chance, high power), or **Extreme** (almost always on full).
+3. Tap **Connect via Intiface**. "Connected · N channels" means success.
+4. At any time tap **Stop all**, or stop without opening the panel: type `/hl-stop` in the input, or press **Alt+Shift+S**. The page closing or Intiface disconnecting also stops immediately.
 
-玩具页最上面还有四个按钮，按一下立刻改设备，同时记下来告诉模型：
+The top of the toy page has four buttons; pressing one changes the device immediately and records the action to tell the model:
 
-| 按钮 | 做什么 |
+| Button | What it does |
 |---|---|
-| **弱一点 / 强一点** | 正在动的动作强度 −20 / +20 个百分点（最低到 0，0 就停下这一个）；这条回复里还没开始的动作也按这个量执行 |
-| **再来一次** | 重放最后执行的那个动作（照常受开关和间隔限制，太快会提示稍等） |
-| **跳过** | 停掉正在动的动作，排队的下一个在间隔允许时马上开始 |
+| **Weaker / Stronger** | Lower / raise the intensity of the currently running act by 20 percentage points (minimum 0, at which point this act stops); acts in the current reply that have not started yet are also adjusted by this amount |
+| **Again** | Replay the last executed act (subject to on/off and spacing limits; too soon and it prompts you to wait) |
+| **Skip** | Stop the currently running act; the next queued act starts as soon as spacing allows |
 
-没有动作在动时只剩“再来一次”；按完会显示“✓ 已调强”之类约 2 秒，动作列表上会标出“强 +20%”“已跳过”。
+When no act is running only "Again" remains; after pressing, a message such as "✓ Stronger" appears for about 2 seconds, and the act list marks "Stronger +20%" or "Skipped".
 
-面板里的“设备”一节每台设备一张卡，每一路（振动、往复、旋转、加热……）跟着 heartlink 发出的档位实时动，显示当前档位。它画的是发出的指令，不代表设备真的执行了。超过两台时每台收成一行，点开看每一路。
+The "Devices" section in the panel has one card per device; each channel (vibration, linear, rotation, heating, …) moves in real time to the level heartlink is sending and shows the current level. It displays the command being sent, not whether the device actually executed it. With more than two devices, each collapses to a row; tap to expand and see every channel.
 
-### 浏览器直接连（不装 Intiface）
+### Browser-direct connection (no Intiface)
 
-点 **浏览器直接连**，先选型号：
+Tap **Browser-direct connection**, then choose a model:
 
-| 选项 | 走哪条路 |
+| Option | Path |
 |---|---|
-| **繁野 啵啵贝**（吮吸 · 震动 · 微电流） | heartlink 自带的驱动直接用蓝牙控制。Intiface 不支持这台，只能这样连 |
-| **司沃康 SL278H**（振动 · 拍打 · 伸缩 · 加热） | 同上；这台也可以改用 Intiface |
-| **其它型号** | buttplug 官方的 WebAssembly 版本，能连的型号与 Intiface 相同；首次使用会加载约数 MB 的组件 |
+| **Fanyi Bobo Bei** (suction · vibration · estim) | heartlink's built-in driver controls it directly over Bluetooth. Intiface does not support this model, so this is the only way |
+| **Svakom SL278H** (vibration · tap · stroke · heat) | Same as above; this model can also use Intiface |
+| **Other models** | buttplug's official WebAssembly build; supported models are the same as Intiface. The first use downloads a few MB of components |
 
-只能用一种方式连的型号（比如啵啵贝），连过一次之后，另一个连接按钮会灰掉并写明“这款只能直连”。
+Models that only support one connection method (such as Bobo Bei) will gray out the other button after first connection and show "This model only supports direct connection".
 
-两台带驱动的型号都标着**未核实**：指令来自社区资料，我们没有真机实测过，第一次先用低强度试。
-选完型号后浏览器会弹出自己的蓝牙列表，按面板上写的名字前缀选（啵啵贝是 `SOSEXY`）。用电脑或安卓上的 Chrome / Edge，iPhone 暂不支持。
+Both driver-equipped models are marked **unverified**: the commands come from community sources and we have not tested them on real hardware; start with low intensity the first time.
+After choosing a model, the browser shows its own Bluetooth picker; select by the name prefix shown in the panel (Bobo Bei is `SOSEXY`). Use Chrome / Edge on a computer or Android phone; iPhone is not supported for now.
 
-- **官方 App 占着设备时**：啵啵贝同时只接受一个连接，会显示“这台设备同时只接受一个连接”。先在手机上**彻底退出** FUNF App（后台也要划掉），或者干脆关掉手机蓝牙，再点**重试**。heartlink 不会自动重试去抢连接，断开时也不会自动重连。
-- **设备没回应**：显示“只收到 2/4 条回应”，多半还是官方 App 连着，也可能是固件不同。退出 App 后重试，或点**换型号**。
-- **微电流要逐台开启**：设备卡上这一行缺省是“未开启”，点右边的**开启**，确认一次才登记。开启后仍然只有模型在回复里**点名** `output="Estim"` 才会动，每次最多 30 秒，之后自动停，并且至少歇同样长再能动。换一台设备要重新开启。
-- **断开不等于停下**：这两台都没有声明“断开会自己停”。意外断开后设备卡变琥珀色、写“已断开 · 可能仍在动”，断开前在动的那几路显示断开前的档位。**按设备上的按钮关掉，或者取下设备**；点**重新连接**后，heartlink 做的第一件事就是全部停止。
-- **停不下来的自带模式**：如果某台设备的驱动声明了“启动后由设备自己跑完、软件停不住”的模式，设备卡上会多出一行**自带模式**开关，缺省关着，打开时要**逐台确认**一次。它运行期间，“全部停止”下方会一直显示横幅和剩余秒数——**自带模式运行中，软件可能停不住，可拔出或按设备按钮**；就算你按了全部停止，横幅也不会提前消失，只会改成“已发送停止，设备可能不理会”。目前随扩展发布的两份驱动都没有这种模式，所以这一行不会出现。
+- **When the official app holds the device**: Bobo Bei only accepts one connection at a time, and you will see "This device only accepts one connection at a time". First **force-quit** the FUNF app on your phone (also swipe it away from recents), or simply turn off Bluetooth on the phone, then tap **Retry**. heartlink will not auto-retry to steal the connection, nor auto-reconnect after disconnect.
+- **Device not responding**: "Only received 2/4 responses" usually means the official app is still connected, or the firmware differs. Quit the app and retry, or tap **Change model**.
+- **Estim must be enabled per device**: on the device card this row defaults to "Off"; tap **Enable** on the right and confirm once to register. Even after enabling, it only moves when the model explicitly names `output="Estim"` in a reply, lasts at most 30 seconds, then stops automatically, and must rest for at least as long before it can move again. Enabling must be repeated for each device.
+- **Disconnecting does not mean stopping**: neither of these two models advertises "stops on disconnect". After an unexpected disconnect the device card turns amber and reads "Disconnected · may still be running"; channels that were running show the level before disconnect. **Turn it off on the device itself, or remove the device**; when you tap **Reconnect**, the first thing heartlink does is stop all channels.
+- **Unstoppable built-in modes**: if a device driver declares a mode that "starts a pattern the device itself runs to completion and software may not be able to stop", the device card gains a **Built-in mode** switch, default off, which requires per-device confirmation to turn on. While it runs, a banner and remaining seconds are shown below "Stop all" — **Built-in mode running, software may not be able to stop it; remove or use device button**; even if you press Stop all, the banner will not disappear early, it only changes to "Stop sent, device may ignore". Neither of the two drivers shipped with the extension has such a mode, so this row will not appear.
 
-## 模型怎么让设备动
+## How the model makes devices move
 
-模型在回复里写：
+The model writes in its reply:
 
 ```
 <bio_act pattern="wave" intensity="0.6" ms="5000"/>
 ```
 
-回复生成完后，heartlink 按你选的节奏执行。动作有 `pulse` `double` `triple` `long` `heartbeat` `wave`。不写 `output` 时驱动所有普通输出；加热、电刺激这类有风险的输出必须写明。详见 TBC 协议 §5。
+After the reply finishes generating, heartlink executes it according to your chosen rhythm. Patterns are `pulse`, `double`, `triple`, `long`, `heartbeat`, `wave`. When `output` is omitted, all ordinary outputs are driven; risky outputs such as heat or estim must be named explicitly. See TBC protocol §5.
 
-每轮注入的 `<bio_context>` 里有一行 `haptics(heartlink): on | cap 100% | profile frenzy`，卡片和预设可以据此决定要不要写动作。
+Each injected `<bio_context>` contains a line `haptics(heartlink): on | cap 100% | profile frenzy`, which cards and presets can use to decide whether to write actions.
 
-### 模型会收到你的反馈
+### The model receives your feedback
 
-上一轮有动作执行过，或者你按过上面的按钮、全部停止、换过节奏，下一次发送时块里会多一行（TBC 协议 §5.12）：
+If any act executed in the last round, or if you pressed one of the buttons above, Stop all, or changed rhythm, the next send adds one line (TBC protocol §5.12):
 
 ```
 feedback(heartlink): acts 3 sent, 1 done, 1 cut, 1 pending | stronger +20% read @41s (reply -1, act 2, 2.4s in) | skip read @55s (reply -1, act 3)
 ```
 
-- `acts …`：上一条回复里的动作结局——走完 / 被停或被打断 / 发送时还在排队 / 被拒。
-- 后面每段是一次操作：谁（你、安全词、设备自己）、做了什么、在哪个阶段（`gen` 生成中、`read` 读回复、`write` 打字、`send` 发送那一刻）第几秒、对应哪条回复的第几个动作。设备断开、到时自动停这类技术原因写成 `stop by device (disconnected)`。
-- 读法世界书会告诉模型：停止、跳过是“这一下不对”，调强、再来一次是“对了”，调弱是“方向对、力度过了”，设备原因不代表喜好。
-- 反馈只是记录，**不会自己触发新动作**；新的动作只来自模型的下一条回复。重新生成（swipe）时这一行照常带上，正常发送后清空。聊天变量 `bio.feedback.turn` 里也有同样的内容。
+- `acts …`: the fate of each act in the last reply — completed / stopped or interrupted / still queued at send time / rejected.
+- Each subsequent segment is one operation: who (you, safeword, device itself), what they did, at which phase (`gen` while generating, `read` while reading the reply, `write` while typing, `send` at the moment of sending) and second, and which reply/act it corresponds to. Technical reasons such as device disconnect or auto-timeout are written as `stop by device (disconnected)`.
+- The reading world book tells the model: stop and skip mean "that one was wrong", stronger and again mean "right", weaker means "right direction but too much", and device reasons do not indicate preference.
+- Feedback is just a record, **it does not trigger new actions by itself**; new actions only come from the model's next reply. Regenerating a reply (swipe) carries this line as usual, and it is cleared after a normal send. The chat variable `bio.feedback.turn` contains the same content.
 
-## 兼容提示
+## Compatibility notes
 
-- 读法世界书靠酒馆的“世界书扫描深度”触发（默认 2）。设成 0 时，模型收得到数据，但收不到读法说明。
-- 用 Claude、Gemini 时，酒馆会把对话中间的系统消息改成用户消息发送。注入块内容不变，只是不算系统指令。
+- The reading world book relies on SillyTavern's "World Info scan depth" to trigger (default 2). When set to 0, the model still receives the data but not the reading instructions.
+- With Claude and Gemini, SillyTavern turns mid-conversation system messages into user messages before sending. The injected block content is unchanged; it is just no longer treated as a system instruction.
 
-## 安全
+## Safety
 
-- 剧情联动默认关，你打开才会动。
-- “全部停止”随时可用；停止不经过模型。面板被别的插件盖住时，用 `/hl-stop` 或 Alt+Shift+S。
-- 安全词（消息里出现就全停）是可选功能，默认关。
+- Story联动 is off by default; it only moves after you turn it on.
+- Stop all is always available; stopping does not go through the model. If the panel is covered by another plugin, use `/hl-stop` or Alt+Shift+S.
+- Safewords (stop everything when the word appears in a message) are optional and off by default.
 
-## 隐私
+## Privacy
 
-心率会作为一段文字随提示词发给**你自己配置的模型服务商**，不会发到别处。不想发送时，断开心率设备（胶囊 → 健康设备 → 设置与连接 → 断开设备），或者停用扩展。
+Your heart rate is sent as a text block to **the model provider you configured**, and nowhere else. To stop sending it, disconnect the heart-rate device (capsule → Health device → Settings & connection → Disconnect device), or disable the extension.
 
-## 开发者接口
+## Developer API
 
-页面上有 `window.tbc`（TBC 总线）与 `window.heartlink`。给角色助手 / 卡片用的只读接口：`tbc.outputState()`、`tbc.replyActs()`（每条记录带 `feedback`）、`tbc.feedbackLog()`，事件 `bio:output-state`、`bio:reply-acts`、`bio:feedback`。遥控器、玩具 App 桥等可以用 `tbc.feedback({ t, from, type, … })` 报反馈（格式见协议 §5.12，不合规会被拒收）。
+The page exposes `window.tbc` (TBC bus) and `window.heartlink`. Read-only APIs for character helpers / cards: `tbc.outputState()`, `tbc.replyActs()` (each record includes `feedback`), `tbc.feedbackLog()`, and events `bio:output-state`, `bio:reply-acts`, `bio:feedback`. Remotes, toy app bridges, etc. can report feedback via `tbc.feedback({ t, from, type, … })` (format is in protocol §5.12; malformed submissions are rejected).
 
-## 反馈
+## Feedback
 
-用你自己的设备测过？欢迎按 TBC 仓库的 [设备实测说明](https://github.com/kcgoofee-jpg/tavern-bio-context/blob/main/docs/device-test-reports-zh.md) 提交结果。
+Tested with your own device? Feedback is welcome following the TBC repository's [device testing guide](https://github.com/kcgoofee-jpg/tavern-bio-context/blob/main/docs/device-test-reports-zh.md).
 
-## 许可
+## License
 
-AGPL-3.0（见 `LICENSE`）。协议文本见 TBC 仓库（CC BY 4.0）。
+AGPL-3.0 (see `LICENSE`). Protocol text is in the TBC repository (CC BY 4.0).
 
-## 致谢
+## Acknowledgments
 
-- BLE Heart Rate Profile（Bluetooth SIG）、Web Bluetooth（W3C CG）、RMSSD（ESC/NASPE 1996）
-- SillyTavern 与酒馆助手的事件、注入接口；buttplug / Intiface Central（BSD-3-Clause）
-- [HZXXXC/sillytavern-heart-rate-hrv](https://github.com/HZXXXC/sillytavern-heart-rate-hrv)：最接近的现有实现，未复用代码
-- [Enclave0775/Intiface_Central-Sillytavern-plugin](https://github.com/Enclave0775/Intiface_Central-Sillytavern-plugin)：阅读速度模拟的思路来源
+- BLE Heart Rate Profile (Bluetooth SIG), Web Bluetooth (W3C CG), RMSSD (ESC/NASPE 1996)
+- SillyTavern and the SillyTavern helper script events / injection APIs; buttplug / Intiface Central (BSD-3-Clause)
+- [HZXXXC/sillytavern-heart-rate-hrv](https://github.com/HZXXXC/sillytavern-heart-rate-hrv): the closest existing implementation; no code reused
+- [Enclave0775/Intiface_Central-Sillytavern-plugin](https://github.com/Enclave0775/Intiface_Central-Sillytavern-plugin): source of the reading-speed simulation idea
